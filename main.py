@@ -386,6 +386,10 @@ class ManyChatFollowUpPayload(BaseModel):
     subscriber_id: str
 
 
+class AutomationModePayload(BaseModel):
+    automation_mode: str  # "auto" | "supervised" | "disabled"
+
+
 class PlaygroundPayload(BaseModel):
     messages: list  # list of {role: str, content: str}
     calendly_url: Optional[str] = None
@@ -473,26 +477,43 @@ async def webhook(
             )
         print(f"[webhook] STOP_AGENT triggered username={payload.subscriber_id}")
 
-    new_history = messages + [{"role": "assistant", "content": reply, "timestamp": now_iso()}]
+    automation_mode = (contact.get("automation_mode") or "supervised") if contact else "supervised"
+    sent = automation_mode == "auto"
+
+    assistant_entry = {
+        "role": "assistant",
+        "content": reply,
+        "timestamp": now_iso(),
+        "sent": sent,
+        "ignored": False,
+    }
+    new_history = messages + [assistant_entry]
     if len(new_history) > MAX_HISTORY_TURNS * 2:
         new_history = new_history[-(MAX_HISTORY_TURNS * 2):]
 
-    # Mettre à jour Supabase
+    patch_data: dict = {
+        "message": payload.message,
+        "response": reply,
+        "history": new_history,
+        "status": "en_cours",
+    }
+    if automation_mode == "supervised":
+        patch_data["pending_message"] = reply
+        patch_data["pending_message_at"] = now_iso()
+    elif automation_mode == "auto":
+        patch_data["pending_message"] = None
+        patch_data["pending_message_at"] = None
+
     async with httpx.AsyncClient() as http:
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
             params={"username": f"eq.{payload.subscriber_id}"},
-            json={
-                "message": payload.message,
-                "response": reply,
-                "history": new_history,
-                "status": "en_cours",
-            },
+            json=patch_data,
         )
     res.raise_for_status()
 
-    if MANYCHAT_API_KEY:
+    if automation_mode == "auto" and MANYCHAT_API_KEY:
         await send_manychat_message(payload.subscriber_id, reply)
     print(f"[webhook] REPLY username={payload.subscriber_id} agent_active={contact.get('agent_active') if contact else True}")
     return {"agent_response": reply}
@@ -527,7 +548,7 @@ async def get_conversation_summaries(
             params={
                 "order": "created_at.desc",
                 "limit": 500,
-                "select": "id,created_at,username,display_name,message,status,agent_active",
+                "select": "id,created_at,username,display_name,message,status,agent_active,automation_mode,pending_message,pending_message_at",
             },
             timeout=10.0,
         )
@@ -666,6 +687,62 @@ async def update_status(
         )
         res.raise_for_status()
     return {"status": "updated"}
+
+
+@app.patch("/conversations/{conversation_id}/automation-mode")
+async def update_automation_mode(
+    conversation_id: str,
+    payload: AutomationModePayload,
+    x_dashboard_secret: Optional[str] = Header(default=None),
+):
+    require_dashboard_secret(x_dashboard_secret)
+    if payload.automation_mode not in ("auto", "supervised", "disabled"):
+        raise HTTPException(status_code=400, detail="Invalid automation_mode")
+    async with httpx.AsyncClient() as http:
+        res = await http.patch(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=minimal"},
+            params={"id": f"eq.{conversation_id}"},
+            json={"automation_mode": payload.automation_mode},
+        )
+        res.raise_for_status()
+    return {"success": True}
+
+
+@app.post("/conversations/{conversation_id}/ignore-pending")
+async def ignore_pending(
+    conversation_id: str,
+    x_dashboard_secret: Optional[str] = Header(default=None),
+):
+    require_dashboard_secret(x_dashboard_secret)
+    conversation = await get_conversation_by_id(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    history = conversation.get("history") or []
+    updated = False
+    for msg in reversed(history):
+        if msg.get("role") == "assistant" and not msg.get("sent") and not msg.get("ignored"):
+            msg["ignored"] = True
+            updated = True
+            break
+
+    patch_data: dict = {
+        "pending_message": None,
+        "pending_message_at": None,
+    }
+    if updated:
+        patch_data["history"] = history
+
+    async with httpx.AsyncClient() as http:
+        res = await http.patch(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=minimal"},
+            params={"id": f"eq.{conversation_id}"},
+            json=patch_data,
+        )
+        res.raise_for_status()
+    return {"success": True}
 
 
 @app.delete("/conversations/{conversation_id}")
