@@ -390,6 +390,11 @@ class AutomationModePayload(BaseModel):
     automation_mode: str  # "auto" | "supervised" | "disabled"
 
 
+class RefineMessagePayload(BaseModel):
+    instruction: str
+    original_message: str
+
+
 class PlaygroundPayload(BaseModel):
     messages: list  # list of {role: str, content: str}
     calendly_url: Optional[str] = None
@@ -743,6 +748,85 @@ async def ignore_pending(
         )
         res.raise_for_status()
     return {"success": True}
+
+
+@app.post("/conversations/{conversation_id}/refine-pending")
+async def refine_pending(
+    conversation_id: str,
+    payload: RefineMessagePayload,
+    x_dashboard_secret: Optional[str] = Header(default=None),
+):
+    require_dashboard_secret(x_dashboard_secret)
+    if client is None:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+
+    conversation = await get_conversation_by_id(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    history = conversation.get("history") or []
+    display_name = conversation.get("display_name") or conversation.get("username", "le prospect")
+    active_prompt = await get_active_prompt()
+
+    history_text = "\n".join([
+        f"{'Prospect' if m.get('role') == 'user' else 'Angelos'} : {m.get('content', '')}"
+        for m in history[-10:]
+    ])
+
+    refine_prompt = (
+        f"Tu es Angelos, l'agent setter Instagram de TrainToRehab.\n"
+        f"Tu as généré ce message pour le prospect @{display_name} :\n"
+        f"<message_original>\n{payload.original_message}\n</message_original>\n\n"
+        f"Voici le contexte récent de la conversation :\n"
+        f"<historique>\n{history_text}\n</historique>\n\n"
+        f"Thomas te demande d'affiner le message avec cette instruction :\n"
+        f"<instruction>\n{payload.instruction}\n</instruction>\n\n"
+        f"Réécris uniquement le message affiné, sans explication, sans guillemets, "
+        f"sans introduction. Juste le message final tel qu'il sera envoyé."
+    )
+
+    try:
+        refined = generate_claude_reply(
+            [{"role": "user", "content": refine_prompt}],
+            active_prompt,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+
+    refined = refined.strip()
+
+    updated_history = []
+    patched = False
+    for msg in reversed(history):
+        if not patched and msg.get("role") == "assistant" and not msg.get("sent") and not msg.get("ignored"):
+            updated_msg = dict(msg)
+            updated_msg["generated_content"] = payload.original_message
+            updated_msg["content"] = refined
+            updated_msg["edited"] = True
+            updated_msg["refinement_instruction"] = payload.instruction
+            updated_history.insert(0, updated_msg)
+            patched = True
+        else:
+            updated_history.insert(0, msg)
+
+    patch_data: dict = {
+        "pending_message": refined,
+        "pending_message_at": now_iso(),
+    }
+    if patched:
+        patch_data["history"] = updated_history
+
+    async with httpx.AsyncClient() as http:
+        res = await http.patch(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=minimal"},
+            params={"id": f"eq.{conversation_id}"},
+            json=patch_data,
+        )
+        res.raise_for_status()
+
+    print(f"[refine-pending] conversation_id={conversation_id} instruction={payload.instruction!r}")
+    return {"refined_message": refined}
 
 
 @app.delete("/conversations/{conversation_id}")
