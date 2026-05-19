@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from anthropic import Anthropic
@@ -7,6 +7,7 @@ from config import load_config
 from prompts import build_system_prompt, build_analysis_prompt, build_follow_up_prompt
 import hmac
 import httpx
+import jwt as pyjwt
 import json
 import os
 import re
@@ -65,6 +66,29 @@ def require_dashboard_secret(x_dashboard_secret: Optional[str]) -> None:
         raise HTTPException(status_code=500, detail="DASHBOARD_SECRET is not configured")
     if not x_dashboard_secret or not hmac.compare_digest(x_dashboard_secret, DASHBOARD_SECRET):
         raise HTTPException(status_code=401, detail="Invalid dashboard secret")
+
+
+def require_jwt(authorization: Optional[str] = Header(default=None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not config.supabase_jwt_secret:
+        raise HTTPException(status_code=500, detail="SUPABASE_JWT_SECRET is not configured")
+    try:
+        payload = pyjwt.decode(
+            token,
+            config.supabase_jwt_secret,
+            algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token: no sub")
+        return user_id
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except pyjwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 
 def extract_agent_links(prompt: str) -> dict:
@@ -430,6 +454,7 @@ async def webhook(
                     "status": "nouveau",
                     "agent_active": True,
                     "history": [],
+                    "user_id": config.owner_user_id,
                 },
             )
 
@@ -528,14 +553,14 @@ async def webhook(
 
 @app.get("/conversations")
 async def get_conversations(
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     async with httpx.AsyncClient() as http:
         res = await http.get(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Accept": "application/json"},
-            params={"order": "created_at.desc", "limit": 500},
+            params={"order": "created_at.desc", "limit": 500, "user_id": f"eq.{user_id}"},
         )
         res.raise_for_status()
         return res.json()
@@ -543,9 +568,9 @@ async def get_conversations(
 
 @app.get("/conversations/summary")
 async def get_conversation_summaries(
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     async with httpx.AsyncClient() as http:
         res = await http.get(
             SUPABASE_CONVERSATIONS_URL,
@@ -553,6 +578,7 @@ async def get_conversation_summaries(
             params={
                 "order": "created_at.desc",
                 "limit": 500,
+                "user_id": f"eq.{user_id}",
                 "select": "id,created_at,username,display_name,message,status,agent_active,automation_mode,pending_message,pending_message_at",
             },
             timeout=10.0,
@@ -564,14 +590,14 @@ async def get_conversation_summaries(
 @app.get("/conversations/{conversation_id}")
 async def get_conversation(
     conversation_id: str,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     async with httpx.AsyncClient() as http:
         res = await http.get(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Accept": "application/json"},
-            params={"id": f"eq.{conversation_id}", "limit": "1"},
+            params={"id": f"eq.{conversation_id}", "limit": "1", "user_id": f"eq.{user_id}"},
             timeout=10.0,
         )
         res.raise_for_status()
@@ -584,9 +610,9 @@ async def get_conversation(
 @app.post("/activate")
 async def activate(
     payload: AgentControlPayload,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     contact = await get_contact(payload.username)
     history = (contact.get("history") or []) if contact else []
     patch_data: dict = {"agent_active": True}
@@ -606,9 +632,9 @@ async def activate(
 @app.post("/deactivate")
 async def deactivate(
     payload: AgentControlPayload,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     async with httpx.AsyncClient() as http:
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
@@ -632,9 +658,9 @@ async def deactivate(
 @app.post("/conversations/{conversation_id}/activate")
 async def activate_conversation(
     conversation_id: str,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     async with httpx.AsyncClient() as http:
         res = await http.get(
             SUPABASE_CONVERSATIONS_URL,
@@ -662,9 +688,9 @@ async def activate_conversation(
 @app.post("/conversations/{conversation_id}/deactivate")
 async def deactivate_conversation(
     conversation_id: str,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     async with httpx.AsyncClient() as http:
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
@@ -680,9 +706,9 @@ async def deactivate_conversation(
 async def update_status(
     conversation_id: str,
     payload: StatusPayload,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     async with httpx.AsyncClient() as http:
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
@@ -698,9 +724,9 @@ async def update_status(
 async def update_automation_mode(
     conversation_id: str,
     payload: AutomationModePayload,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     if payload.automation_mode not in ("auto", "supervised", "disabled"):
         raise HTTPException(status_code=400, detail="Invalid automation_mode")
     async with httpx.AsyncClient() as http:
@@ -717,9 +743,9 @@ async def update_automation_mode(
 @app.post("/conversations/{conversation_id}/ignore-pending")
 async def ignore_pending(
     conversation_id: str,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     conversation = await get_conversation_by_id(conversation_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -754,9 +780,9 @@ async def ignore_pending(
 async def refine_pending(
     conversation_id: str,
     payload: RefineMessagePayload,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
 
@@ -832,9 +858,9 @@ async def refine_pending(
 @app.delete("/conversations/{conversation_id}")
 async def delete_conversation(
     conversation_id: str,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     async with httpx.AsyncClient() as http:
         res = await http.delete(
             SUPABASE_CONVERSATIONS_URL,
@@ -849,9 +875,9 @@ async def delete_conversation(
 
 @app.get("/follow-ups/due")
 async def get_due_follow_ups(
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     async with httpx.AsyncClient() as http:
         res = await http.get(
             SUPABASE_CONVERSATIONS_URL,
@@ -859,6 +885,7 @@ async def get_due_follow_ups(
             params={
                 "order": "created_at.desc",
                 "limit": "500",
+                "user_id": f"eq.{user_id}",
                 "select": "id,created_at,username,display_name,message,status,agent_active,history",
             },
             timeout=10.0,
@@ -874,9 +901,9 @@ async def get_due_follow_ups(
 @app.post("/follow-ups/preview")
 async def preview_follow_up(
     payload: FollowUpPreviewPayload,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
 
@@ -898,9 +925,9 @@ async def preview_follow_up(
 @app.post("/follow-ups/manychat-auto-23h")
 async def manychat_auto_23h_follow_up(
     payload: ManyChatFollowUpPayload,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     subscriber_id = payload.subscriber_id.strip()
     if not subscriber_id:
         return {"ok": False, "message": "", "reason": "subscriber_id is required"}
@@ -952,9 +979,9 @@ async def manychat_auto_23h_follow_up(
 @app.post("/follow-ups/{conversation_id}/send-auto-23h")
 async def send_auto_23h_follow_up(
     conversation_id: str,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     if not MANYCHAT_API_KEY:
         raise HTTPException(status_code=500, detail="MANYCHAT_API_KEY is not configured")
 
@@ -1014,9 +1041,9 @@ async def send_auto_23h_follow_up(
 @app.post("/playground")
 async def playground(
     payload: PlaygroundPayload,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
     system_prompt = await get_active_prompt()
@@ -1038,9 +1065,9 @@ async def playground(
 @app.post("/feedback-loop")
 async def run_feedback_loop(
     payload: FeedbackLoopPayload = FeedbackLoopPayload(),
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
 
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
@@ -1057,6 +1084,7 @@ async def run_feedback_loop(
                     "status": "neq.nouveau",
                     "order": "created_at.desc",
                     "limit": str(n * 3),  # marge pour filtrer côté client
+                    "user_id": f"eq.{user_id}",
                 },
                 timeout=15.0,
             )
@@ -1147,10 +1175,10 @@ async def run_feedback_loop(
 @app.post("/preview-prompt")
 async def preview_prompt(
     payload: PreviewPromptPayload,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
     """Génère un diff de prévisualisation SANS modifier la base."""
-    require_dashboard_secret(x_dashboard_secret)
+
 
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
@@ -1204,10 +1232,10 @@ async def preview_prompt(
 @app.post("/apply-prompt")
 async def apply_prompt(
     payload: ApplyPromptPayload,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
     """Applique un prompt déjà construit par /preview-prompt."""
-    require_dashboard_secret(x_dashboard_secret)
+
 
     # 1. Désactiver tous les prompts actifs
     try:
@@ -1263,9 +1291,9 @@ async def apply_prompt(
 
 @app.get("/prompt-versions")
 async def get_prompt_versions(
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     try:
         async with httpx.AsyncClient() as http:
             res = await http.get(
@@ -1286,9 +1314,9 @@ async def get_prompt_versions(
 @app.post("/prompt-versions/{version_id}/restore")
 async def restore_prompt_version(
     version_id: str,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     try:
         async with httpx.AsyncClient() as http:
             res = await http.patch(
@@ -1319,9 +1347,9 @@ async def restore_prompt_version(
 
 @app.get("/agent-links")
 async def get_agent_links(
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     prompt = await get_active_prompt()
     return extract_agent_links(prompt)
 
@@ -1329,9 +1357,9 @@ async def get_agent_links(
 @app.patch("/agent-links")
 async def update_agent_links(
     payload: AgentLinksPayload,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
     prompt = await get_active_prompt()
     next_prompt = append_agent_options(
         prompt,
@@ -1377,9 +1405,9 @@ async def update_agent_links(
 
 @app.get("/insights")
 async def get_insights(
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
 
     try:
         async with httpx.AsyncClient() as http:
@@ -1401,9 +1429,9 @@ async def get_insights(
 @app.patch("/insights/{insight_id}/ignore")
 async def ignore_insight(
     insight_id: str,
-    x_dashboard_secret: Optional[str] = Header(default=None),
+    user_id: str = Depends(require_jwt),
 ):
-    require_dashboard_secret(x_dashboard_secret)
+
 
     try:
         async with httpx.AsyncClient() as http:

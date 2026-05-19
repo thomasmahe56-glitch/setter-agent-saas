@@ -17,6 +17,8 @@ class Config:
     url_call: str
     contact_email: str
     niche_context: str
+    supabase_jwt_secret: str
+    owner_user_id: str
 
 
 def load_config() -> Config:
@@ -34,4 +36,6 @@ def load_config() -> Config:
         url_call=os.environ.get("URL_CALL", ""),
         contact_email=os.environ.get("CONTACT_EMAIL", ""),
         niche_context=os.environ.get("NICHE_CONTEXT", ""),
+        supabase_jwt_secret=os.environ.get("SUPABASE_JWT_SECRET", ""),
+        owner_user_id=os.environ.get("OWNER_USER_ID", ""),
     )
