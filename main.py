@@ -30,6 +30,10 @@ MANYCHAT_SEND_URL = "https://api.manychat.com/fb/sending/sendContent"
 MAX_HISTORY_TURNS = 40
 AGENT_OPTIONS_START = "<!-- AGENT_OPTIONS_START -->"
 AGENT_OPTIONS_END = "<!-- AGENT_OPTIONS_END -->"
+AGENT_PROFILE_START = "<!-- AGENT_PROFILE_START -->"
+AGENT_PROFILE_END = "<!-- AGENT_PROFILE_END -->"
+AGENT_PROFILE_PROMPT_START = "<!-- AGENT_PROFILE_PROMPT_START -->"
+AGENT_PROFILE_PROMPT_END = "<!-- AGENT_PROFILE_PROMPT_END -->"
 AUTO_FOLLOW_UP_HOURS = 23
 MANUAL_FOLLOW_UP_1_HOURS = 72
 MANUAL_FOLLOW_UP_2_HOURS = 240
@@ -123,6 +127,83 @@ def strip_agent_options(prompt: str) -> str:
         prompt,
         flags=re.DOTALL,
     ).strip()
+
+
+def extract_agent_profile(prompt: str) -> dict:
+    block_match = re.search(
+        rf"{re.escape(AGENT_PROFILE_START)}(.*?){re.escape(AGENT_PROFILE_END)}",
+        prompt,
+        flags=re.DOTALL,
+    )
+    if not block_match:
+        return {}
+    block = block_match.group(1).strip()
+    try:
+        return json.loads(block)
+    except json.JSONDecodeError:
+        return {}
+
+
+def strip_agent_profile(prompt: str) -> str:
+    prompt = re.sub(
+        rf"\n*\s*{re.escape(AGENT_PROFILE_START)}.*?{re.escape(AGENT_PROFILE_END)}\s*",
+        "\n",
+        prompt,
+        flags=re.DOTALL,
+    )
+    return re.sub(
+        rf"\n*\s*{re.escape(AGENT_PROFILE_PROMPT_START)}.*?{re.escape(AGENT_PROFILE_PROMPT_END)}\s*",
+        "\n",
+        prompt,
+        flags=re.DOTALL,
+    ).strip()
+
+
+def append_agent_profile(prompt: str, profile: dict) -> str:
+    prompt = strip_agent_profile(prompt)
+    clean_profile = {
+        key: (value.strip() if isinstance(value, str) else value)
+        for key, value in profile.items()
+        if value is not None and (not isinstance(value, str) or value.strip())
+    }
+    if not clean_profile:
+        return prompt
+    profile_json = json.dumps(clean_profile, ensure_ascii=False, indent=2)
+    profile_prompt = format_agent_profile_for_prompt(clean_profile)
+    return (
+        f"{prompt}\n\n{AGENT_PROFILE_START}\n{profile_json}\n{AGENT_PROFILE_END}\n\n"
+        f"{AGENT_PROFILE_PROMPT_START}\n"
+        f"=== PROFIL BUSINESS ET VOIX D'ANGELOS ===\n{profile_prompt}\n"
+        f"{AGENT_PROFILE_PROMPT_END}"
+    )
+
+
+def format_agent_profile_for_prompt(profile: dict) -> str:
+    labels = {
+        "avatar_client": "Avatar client",
+        "offer": "Offre",
+        "price": "Prix et modalités",
+        "pain_points": "Douleurs et frustrations",
+        "goals": "Objectifs du prospect",
+        "objections": "Objections fréquentes",
+        "qualification_rules": "Questions et règles de qualification",
+        "sales_rules": "Règles commerciales",
+        "proof_points": "Preuves, résultats et cas clients",
+        "voice_samples": "Transcripts, posts ou exemples de voix du coach",
+        "tone_rules": "Style de voix à imiter",
+        "forbidden_phrases": "Mots ou formulations à éviter",
+    }
+    lines = []
+    for key, label in labels.items():
+        value = profile.get(key)
+        if value:
+            lines.append(f"{label} :\n{value}")
+    lines.append(
+        "Utilise ce contexte pour répondre comme le coach : précis, naturel, humain, "
+        "adapté à son offre et à son style. Ne récite pas ces informations ; transforme-les "
+        "en réponses courtes et utiles dans la conversation Instagram."
+    )
+    return "\n\n".join(lines)
 
 
 def append_agent_options(prompt: str, calendly_url: str = "", sales_page_url: str = "") -> str:
@@ -415,6 +496,21 @@ class ApplyPromptPayload(BaseModel):
 class AgentLinksPayload(BaseModel):
     calendly_url: str = ""
     sales_page_url: str = ""
+
+
+class AgentProfilePayload(BaseModel):
+    avatar_client: str = ""
+    offer: str = ""
+    price: str = ""
+    pain_points: str = ""
+    goals: str = ""
+    objections: str = ""
+    qualification_rules: str = ""
+    sales_rules: str = ""
+    proof_points: str = ""
+    voice_samples: str = ""
+    tone_rules: str = ""
+    forbidden_phrases: str = ""
 
 
 class FollowUpPreviewPayload(BaseModel):
@@ -1427,6 +1523,58 @@ async def update_agent_links(
         raise HTTPException(status_code=502, detail=f"Supabase insert error: {e}")
 
     print(f"[agent-links] version_id={new_version.get('id')}")
+    return {"success": True, "prompt_version_id": new_version.get("id")}
+
+
+@app.get("/agent-profile")
+async def get_agent_profile(
+    user_id: str = Depends(require_jwt),
+):
+    prompt = await get_active_prompt()
+    return extract_agent_profile(prompt)
+
+
+@app.patch("/agent-profile")
+async def update_agent_profile(
+    payload: AgentProfilePayload,
+    user_id: str = Depends(require_jwt),
+):
+    prompt = await get_active_prompt()
+    next_prompt = append_agent_profile(prompt, payload.model_dump())
+
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"is_active": "eq.true"},
+                json={"is_active": False},
+                timeout=10.0,
+            )
+            res.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase deactivate error: {e}")
+
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.post(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=representation"},
+                json={
+                    "content": next_prompt,
+                    "is_active": True,
+                    "source": "agent-profile",
+                    "insight_id": None,
+                },
+                timeout=10.0,
+            )
+            res.raise_for_status()
+            created = res.json()
+            new_version = created[0] if isinstance(created, list) else created
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase insert error: {e}")
+
+    print(f"[agent-profile] version_id={new_version.get('id')}")
     return {"success": True, "prompt_version_id": new_version.get("id")}
 
 
