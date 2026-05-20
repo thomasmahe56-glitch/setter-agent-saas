@@ -88,6 +88,7 @@ def require_jwt(authorization: Optional[str] = Header(default=None)) -> str:
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
     except pyjwt.InvalidTokenError as e:
+        print(f"[JWT ERROR] {type(e).__name__}: {e}")
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 
