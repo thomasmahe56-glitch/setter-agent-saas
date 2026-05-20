@@ -84,6 +84,8 @@ def require_jwt(authorization: Optional[str] = Header(default=None)) -> str:
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token: no sub")
+        if config.owner_user_id and not hmac.compare_digest(user_id, config.owner_user_id):
+            raise HTTPException(status_code=403, detail="Forbidden dashboard user")
         return user_id
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -253,24 +255,30 @@ async def get_active_prompt() -> str:
     return build_system_prompt(config)
 
 
-async def get_contact(username: str) -> Optional[dict]:
+async def get_contact(username: str, user_id: Optional[str] = None) -> Optional[dict]:
+    params = {"username": f"eq.{username}", "limit": 1}
+    if user_id:
+        params["user_id"] = f"eq.{user_id}"
     async with httpx.AsyncClient() as http:
         res = await http.get(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Accept": "application/json"},
-            params={"username": f"eq.{username}", "limit": 1},
+            params=params,
         )
         res.raise_for_status()
         rows = res.json()
     return rows[0] if rows else None
 
 
-async def get_conversation_by_id(conversation_id: str) -> Optional[dict]:
+async def get_conversation_by_id(conversation_id: str, user_id: Optional[str] = None) -> Optional[dict]:
+    params = {"id": f"eq.{conversation_id}", "limit": "1"}
+    if user_id:
+        params["user_id"] = f"eq.{user_id}"
     async with httpx.AsyncClient() as http:
         res = await http.get(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Accept": "application/json"},
-            params={"id": f"eq.{conversation_id}", "limit": "1"},
+            params=params,
         )
         res.raise_for_status()
         rows = res.json()
@@ -614,7 +622,7 @@ async def activate(
     user_id: str = Depends(require_jwt),
 ):
 
-    contact = await get_contact(payload.username)
+    contact = await get_contact(payload.username, user_id)
     history = (contact.get("history") or []) if contact else []
     patch_data: dict = {"agent_active": True}
     if not history:
@@ -623,7 +631,7 @@ async def activate(
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"username": f"eq.{payload.username}"},
+            params={"username": f"eq.{payload.username}", "user_id": f"eq.{user_id}"},
             json=patch_data,
         )
         res.raise_for_status()
@@ -640,7 +648,7 @@ async def deactivate(
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"username": f"eq.{payload.username}"},
+            params={"username": f"eq.{payload.username}", "user_id": f"eq.{user_id}"},
             json={"agent_active": False},
         )
         res.raise_for_status()
@@ -666,7 +674,7 @@ async def activate_conversation(
         res = await http.get(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Accept": "application/json"},
-            params={"id": f"eq.{conversation_id}", "select": "history", "limit": "1"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}", "select": "history", "limit": "1"},
             timeout=5.0,
         )
         res.raise_for_status()
@@ -679,7 +687,7 @@ async def activate_conversation(
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"id": f"eq.{conversation_id}"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
             json=patch_data,
         )
         res.raise_for_status()
@@ -696,7 +704,7 @@ async def deactivate_conversation(
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"id": f"eq.{conversation_id}"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
             json={"agent_active": False},
         )
         res.raise_for_status()
@@ -714,7 +722,7 @@ async def update_status(
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"id": f"eq.{conversation_id}"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
             json={"status": payload.status},
         )
         res.raise_for_status()
@@ -734,7 +742,7 @@ async def update_automation_mode(
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"id": f"eq.{conversation_id}"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
             json={"automation_mode": payload.automation_mode},
         )
         res.raise_for_status()
@@ -747,7 +755,7 @@ async def ignore_pending(
     user_id: str = Depends(require_jwt),
 ):
 
-    conversation = await get_conversation_by_id(conversation_id)
+    conversation = await get_conversation_by_id(conversation_id, user_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -770,7 +778,7 @@ async def ignore_pending(
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"id": f"eq.{conversation_id}"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
             json=patch_data,
         )
         res.raise_for_status()
@@ -787,7 +795,7 @@ async def refine_pending(
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
 
-    conversation = await get_conversation_by_id(conversation_id)
+    conversation = await get_conversation_by_id(conversation_id, user_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -847,7 +855,7 @@ async def refine_pending(
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"id": f"eq.{conversation_id}"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
             json=patch_data,
         )
         res.raise_for_status()
@@ -866,7 +874,7 @@ async def delete_conversation(
         res = await http.delete(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"id": f"eq.{conversation_id}"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
         )
         res.raise_for_status()
     return {"status": "deleted"}
@@ -908,7 +916,7 @@ async def preview_follow_up(
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
 
-    conversation = await get_conversation_by_id(payload.conversation_id)
+    conversation = await get_conversation_by_id(payload.conversation_id, user_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -933,7 +941,7 @@ async def manychat_auto_23h_follow_up(
     if not subscriber_id:
         return {"ok": False, "message": "", "reason": "subscriber_id is required"}
 
-    conversation = await get_contact(subscriber_id)
+    conversation = await get_contact(subscriber_id, user_id)
     if not conversation:
         return {"ok": False, "message": "", "reason": "Conversation not found"}
 
@@ -958,7 +966,7 @@ async def manychat_auto_23h_follow_up(
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"username": f"eq.{subscriber_id}"},
+            params={"username": f"eq.{subscriber_id}", "user_id": f"eq.{user_id}"},
             json={
                 "response": message,
                 "history": new_history,
@@ -986,7 +994,7 @@ async def send_auto_23h_follow_up(
     if not MANYCHAT_API_KEY:
         raise HTTPException(status_code=500, detail="MANYCHAT_API_KEY is not configured")
 
-    conversation = await get_conversation_by_id(conversation_id)
+    conversation = await get_conversation_by_id(conversation_id, user_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
@@ -1019,7 +1027,7 @@ async def send_auto_23h_follow_up(
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"id": f"eq.{conversation_id}"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
             json={
                 "response": message,
                 "history": new_history,

@@ -329,6 +329,47 @@ Changements effectues :
 Limites et suites :
 
 - Ce build ajoute l'envoi H23 declenche depuis le dashboard, pas encore une tache cron autonome.
+
+## 2026-05-20
+
+### Stabilisation du login dashboard SaaS
+
+Contexte :
+
+- Demande utilisateur : corriger les problemes de login du dashboard SaaS et aligner le backend avec Supabase Auth.
+
+Fichiers consultes :
+
+- `main.py`
+- `README.md`
+- Fichiers frontend dans `setter-dashboard-saas`
+
+Fichiers modifies :
+
+- `main.py`
+- `README.md`
+- `AGENT_LOG.md`
+- `proxy.ts`, `app/login/page.tsx`, `lib/api.ts`, `lib/config.ts`, `lib/supabase.ts`, `lib/supabase/client.ts`, `.env.example`, `migrations/frontend_env_vars.md` dans `setter-dashboard-saas`
+
+Changements effectues :
+
+- Remplacement du middleware Next vide du dashboard par un `proxy.ts` compatible Next 16.
+- Protection serveur des routes dashboard et redirection automatique login/CRM selon la session Supabase.
+- Nettoyage de la page login : redirection via router Next, suppression du log de resultat auth, trim email.
+- Ajout d'erreurs explicites si `NEXT_PUBLIC_API_URL` ou Supabase Auth ne sont pas configures.
+- Durcissement backend : refus des JWT qui ne correspondent pas a `OWNER_USER_ID` quand il est configure.
+- Ajout de filtres `user_id` aux lectures et mutations de conversations du dashboard.
+- Mise a jour des variables frontend documentees et de la doc backend sur l'auth dashboard.
+
+Verifications :
+
+- `npm run build` dans `setter-dashboard-saas`
+- `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py config.py prompts.py test.py`
+
+Limites et suites :
+
+- `npm run lint` reste bloque par une installation locale ESLint cassee dans `node_modules`, a reparer via reinstall des dependances si necessaire.
+- Verifier sur Vercel que `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_SUPABASE_URL` et `NEXT_PUBLIC_SUPABASE_ANON_KEY` sont bien configurees.
 - Prochaine etape possible : ajouter un cron Railway qui appelle l'envoi H23 automatiquement toutes les quelques minutes.
 
 ### Endpoint ManyChat pour relance J1

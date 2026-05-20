@@ -116,7 +116,9 @@ Pour la relance automatique 23h :
 | `SUPABASE_KEY` | Clé service Supabase | ✅ |
 | `ANTHROPIC_API_KEY` | Clé API Anthropic | ✅ |
 | `WEBHOOK_SECRET` | Secret pour l'endpoint `/webhook` | ✅ |
-| `DASHBOARD_SECRET` | Secret pour les endpoints dashboard | ✅ |
+| `SUPABASE_JWT_SECRET` | Secret JWT Supabase Auth pour valider les connexions dashboard | ✅ |
+| `OWNER_USER_ID` | UUID Supabase Auth du coach propriétaire de cette instance | ✅ |
+| `DASHBOARD_SECRET` | Ancien secret dashboard, conservé seulement si un outil local l'utilise encore | Optionnel |
 | `MANYCHAT_TOKEN` | Token API ManyChat | ✅ |
 | `BUSINESS_NAME` | Nom du business | ✅ |
 | `COACH_NAME` | Prénom + nom du coach | ✅ |
@@ -141,4 +143,5 @@ Pour la relance automatique 23h :
 | `POST` | `/feedback-loop` | Analyse les conversations et propose une amélioration du prompt |
 | `POST` | `/playground` | Teste le prompt en mode sandbox |
 
-Tous les endpoints dashboard requièrent le header `X-Dashboard-Secret`.
+Les endpoints dashboard requièrent `Authorization: Bearer <access_token Supabase>`.
+Si `OWNER_USER_ID` est configuré, seul cet utilisateur Supabase Auth peut accéder au dashboard de cette instance.
