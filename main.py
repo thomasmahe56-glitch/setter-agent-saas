@@ -560,6 +560,17 @@ async def webhook(
 
 # ── Dashboard endpoints ────────────────────────────────────────────────────────
 
+@app.get("/auth/me")
+async def auth_me(
+    user_id: str = Depends(require_jwt),
+):
+    return {
+        "user_id": user_id,
+        "owner_user_id_configured": bool(config.owner_user_id),
+        "matches_owner_user_id": (not config.owner_user_id) or hmac.compare_digest(user_id, config.owner_user_id),
+    }
+
+
 @app.get("/conversations")
 async def get_conversations(
     user_id: str = Depends(require_jwt),
