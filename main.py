@@ -7,7 +7,6 @@ from config import load_config
 from prompts import build_system_prompt, build_analysis_prompt, build_follow_up_prompt
 import hmac
 import httpx
-import jwt as pyjwt
 import json
 import os
 import re
@@ -21,6 +20,8 @@ ANTHROPIC_API_KEY = config.anthropic_api_key
 WEBHOOK_SECRET = config.webhook_secret
 DASHBOARD_SECRET = config.dashboard_secret
 SUPABASE_SERVICE_KEY = config.supabase_key
+SUPABASE_PROJECT_URL = config.supabase_url.replace("/rest/v1", "").rstrip("/")
+SUPABASE_AUTH_USER_URL = f"{SUPABASE_PROJECT_URL}/auth/v1/user"
 SUPABASE_CONVERSATIONS_URL = f"{config.supabase_url}/conversations"
 SUPABASE_INSIGHTS_URL = f"{config.supabase_url}/insights"
 SUPABASE_PROMPT_VERSIONS_URL = f"{config.supabase_url}/prompt_versions"
@@ -68,30 +69,36 @@ def require_dashboard_secret(x_dashboard_secret: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Invalid dashboard secret")
 
 
-def require_jwt(authorization: Optional[str] = Header(default=None)) -> str:
+async def require_jwt(authorization: Optional[str] = Header(default=None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     token = authorization.removeprefix("Bearer ").strip()
-    if not config.supabase_jwt_secret:
-        raise HTTPException(status_code=500, detail="SUPABASE_JWT_SECRET is not configured")
-    try:
-        payload = pyjwt.decode(
-            token,
-            config.supabase_jwt_secret,
-            algorithms=["HS256"],
-            options={"verify_aud": False},
+    if not SUPABASE_PROJECT_URL:
+        raise HTTPException(status_code=500, detail="SUPABASE_URL is not configured")
+    if not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="SUPABASE_KEY is not configured")
+
+    async with httpx.AsyncClient() as http:
+        res = await http.get(
+            SUPABASE_AUTH_USER_URL,
+            headers={
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {token}",
+            },
+            timeout=10.0,
         )
-        user_id = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token: no sub")
-        if config.owner_user_id and not hmac.compare_digest(user_id, config.owner_user_id):
-            raise HTTPException(status_code=403, detail="Forbidden dashboard user")
-        return user_id
-    except pyjwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except pyjwt.InvalidTokenError as e:
-        print(f"[JWT ERROR] {type(e).__name__}: {e}")
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+    if res.status_code == 401:
+        raise HTTPException(status_code=401, detail=f"Invalid Supabase session: {res.text[:200]}")
+    if res.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Supabase Auth error: {res.status_code} {res.text[:200]}")
+
+    user = res.json()
+    user_id = user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid Supabase session: no user id")
+    if config.owner_user_id and not hmac.compare_digest(user_id, config.owner_user_id):
+        raise HTTPException(status_code=403, detail="Forbidden dashboard user")
+    return user_id
 
 
 def extract_agent_links(prompt: str) -> dict:

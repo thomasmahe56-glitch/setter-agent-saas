@@ -116,7 +116,6 @@ Pour la relance automatique 23h :
 | `SUPABASE_KEY` | Clé service Supabase | ✅ |
 | `ANTHROPIC_API_KEY` | Clé API Anthropic | ✅ |
 | `WEBHOOK_SECRET` | Secret pour l'endpoint `/webhook` | ✅ |
-| `SUPABASE_JWT_SECRET` | Secret JWT Supabase Auth pour valider les connexions dashboard | ✅ |
 | `OWNER_USER_ID` | UUID Supabase Auth du coach propriétaire de cette instance | ✅ |
 | `DASHBOARD_SECRET` | Ancien secret dashboard, conservé seulement si un outil local l'utilise encore | Optionnel |
 | `MANYCHAT_TOKEN` | Token API ManyChat | ✅ |
@@ -144,4 +143,5 @@ Pour la relance automatique 23h :
 | `POST` | `/playground` | Teste le prompt en mode sandbox |
 
 Les endpoints dashboard requièrent `Authorization: Bearer <access_token Supabase>`.
+Le token est validé via Supabase Auth, donc `SUPABASE_JWT_SECRET` n'est plus nécessaire.
 Si `OWNER_USER_ID` est configuré, seul cet utilisateur Supabase Auth peut accéder au dashboard de cette instance.
