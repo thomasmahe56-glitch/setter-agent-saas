@@ -417,13 +417,14 @@ async def create_contact(
         "status": "nouveau",
         "agent_active": True,
         "history": [],
-        "user_id": config.owner_user_id,
         "channel": channel,
         "external_contact_id": external_contact_id,
         "phone_e164": phone_e164,
         "last_inbound_at": received_at,
         "transport_metadata": transport_metadata or {},
     }
+    if config.owner_user_id:
+        row["user_id"] = config.owner_user_id
     async with httpx.AsyncClient() as http:
         res = await http.post(
             SUPABASE_CONVERSATIONS_URL,
