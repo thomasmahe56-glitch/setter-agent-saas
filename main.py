@@ -431,7 +431,9 @@ async def create_contact(
             json=row,
             timeout=10.0,
         )
-        res.raise_for_status()
+        if res.status_code >= 400:
+            print(f"[create_contact] Supabase error status={res.status_code} body={res.text!r}")
+            raise HTTPException(status_code=502, detail=f"Supabase create_contact error: {res.text[:500]}")
         rows = res.json()
     return rows[0] if rows else row
 
