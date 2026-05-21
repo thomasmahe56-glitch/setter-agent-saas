@@ -380,6 +380,7 @@ async def get_contact_by_external_id(
     channel: str = "instagram",
     user_id: Optional[str] = None,
 ) -> Optional[dict]:
+    effective_user_id = user_id or config.owner_user_id
     if channel == "instagram":
         params = {"username": f"eq.{external_contact_id}", "limit": 1}
     else:
@@ -388,13 +389,13 @@ async def get_contact_by_external_id(
             "external_contact_id": f"eq.{external_contact_id}",
             "limit": 1,
         }
-    if user_id:
-        params["user_id"] = f"eq.{user_id}"
+    if effective_user_id:
+        params["user_id"] = f"eq.{effective_user_id}"
     async with httpx.AsyncClient() as http:
         res = await http.get(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Accept": "application/json"},
-            params=params,
+            params={**params, "order": "created_at.desc"},
         )
         res.raise_for_status()
         rows = res.json()
