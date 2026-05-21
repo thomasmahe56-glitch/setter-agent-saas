@@ -848,9 +848,16 @@ async def verify_whatsapp_webhook(
     hub_mode: Optional[str] = Query(default=None, alias="hub.mode"),
     hub_verify_token: Optional[str] = Query(default=None, alias="hub.verify_token"),
     hub_challenge: Optional[str] = Query(default=None, alias="hub.challenge"),
+    hub_mode_fallback: Optional[str] = Query(default=None, alias="hub_mode"),
+    hub_verify_token_fallback: Optional[str] = Query(default=None, alias="hub_verify_token"),
+    hub_challenge_fallback: Optional[str] = Query(default=None, alias="hub_challenge"),
 ):
-    if hub_mode == "subscribe" and WHATSAPP_VERIFY_TOKEN and hmac.compare_digest(hub_verify_token or "", WHATSAPP_VERIFY_TOKEN):
-        return Response(content=hub_challenge or "", media_type="text/plain")
+    mode = (hub_mode or hub_mode_fallback or "").strip()
+    verify_token = (hub_verify_token or hub_verify_token_fallback or "").strip()
+    expected_token = (WHATSAPP_VERIFY_TOKEN or "").strip()
+    challenge = hub_challenge or hub_challenge_fallback or ""
+    if mode == "subscribe" and expected_token and hmac.compare_digest(verify_token, expected_token):
+        return Response(content=challenge, media_type="text/plain")
     raise HTTPException(status_code=403, detail="Invalid WhatsApp verify token")
 
 
