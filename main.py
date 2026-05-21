@@ -264,6 +264,15 @@ def strip_message_metadata(messages: list) -> list:
     ]
 
 
+def is_whatsapp_test_contact(conversation: dict) -> bool:
+    metadata = conversation.get("transport_metadata") or {}
+    return metadata.get("phone_number_id") == WHATSAPP_PHONE_NUMBER_ID
+
+
+def is_whatsapp_test_metadata(metadata: Optional[dict]) -> bool:
+    return bool(metadata and metadata.get("phone_number_id") == WHATSAPP_PHONE_NUMBER_ID)
+
+
 def get_message_time(message: dict) -> Optional[datetime]:
     return parse_iso(message.get("timestamp") or message.get("created_at"))
 
@@ -723,21 +732,6 @@ async def handle_inbound_message(
     if transport_metadata:
         patch_data["transport_metadata"] = transport_metadata
 
-    if not contact.get("agent_active"):
-        async with httpx.AsyncClient() as http:
-            res = await http.patch(
-                SUPABASE_CONVERSATIONS_URL,
-                headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"id": f"eq.{contact.get('id')}"},
-                json=patch_data,
-                timeout=10.0,
-            )
-            res.raise_for_status()
-        if channel == "instagram":
-            await clear_manychat_agent_response(external_contact_id)
-        print(f"[inbound] SKIP channel={channel} external_id={external_contact_id}")
-        return {"reply": "", "sent": False, "skipped": True, "reason": "agent_inactive"}
-
     automation_mode = contact.get("automation_mode") or "supervised"
     if automation_mode == "disabled":
         patch_data["pending_message"] = None
@@ -757,6 +751,21 @@ async def handle_inbound_message(
     system_prompt = await get_active_prompt()
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+    if not contact.get("agent_active"):
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{contact.get('id')}"},
+                json=patch_data,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        if channel == "instagram":
+            await clear_manychat_agent_response(external_contact_id)
+        print(f"[inbound] INACTIVE_HISTORY_ONLY channel={channel} external_id={external_contact_id}")
+        return {"reply": "", "sent": False, "skipped": True, "reason": "agent_inactive"}
+
     first_turn = not history
     prospect_label = "Prospect WhatsApp" if channel == "whatsapp" else "Prospect Instagram"
     user_content = (
@@ -773,8 +782,11 @@ async def handle_inbound_message(
 
     if "[STOP_AGENT]" in reply:
         reply = reply.replace("[STOP_AGENT]", "").strip()
-        patch_data["agent_active"] = False
-        print(f"[inbound] STOP_AGENT channel={channel} external_id={external_contact_id}")
+        if not (channel == "whatsapp" and (is_whatsapp_test_contact(contact) or is_whatsapp_test_metadata(transport_metadata))):
+            patch_data["agent_active"] = False
+            print(f"[inbound] STOP_AGENT channel={channel} external_id={external_contact_id}")
+        else:
+            print(f"[inbound] STOP_AGENT ignored for whatsapp test contact external_id={external_contact_id}")
 
     sent = automation_mode == "auto"
     assistant_entry = {
