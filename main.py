@@ -977,6 +977,48 @@ async def get_conversation(
     return rows[0]
 
 
+@app.get("/debug/whatsapp-conversations/{external_contact_id}")
+async def debug_whatsapp_conversations(
+    external_contact_id: str,
+    user_id: str = Depends(require_jwt),
+):
+    async with httpx.AsyncClient() as http:
+        res = await http.get(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Accept": "application/json"},
+            params={
+                "channel": "eq.whatsapp",
+                "external_contact_id": f"eq.{external_contact_id}",
+                "select": "id,created_at,user_id,username,display_name,message,status,agent_active,automation_mode,pending_message,pending_message_at,last_inbound_at,history",
+                "order": "created_at.desc",
+            },
+            timeout=10.0,
+        )
+        res.raise_for_status()
+        rows = res.json()
+
+    return [
+        {
+            "id": row.get("id"),
+            "created_at": row.get("created_at"),
+            "user_id": row.get("user_id"),
+            "visible_to_current_user": row.get("user_id") == user_id,
+            "username": row.get("username"),
+            "display_name": row.get("display_name"),
+            "message": row.get("message"),
+            "status": row.get("status"),
+            "agent_active": row.get("agent_active"),
+            "automation_mode": row.get("automation_mode"),
+            "pending_message": row.get("pending_message"),
+            "pending_message_at": row.get("pending_message_at"),
+            "last_inbound_at": row.get("last_inbound_at"),
+            "history_count": len(row.get("history") or []),
+            "history_tail": (row.get("history") or [])[-5:],
+        }
+        for row in rows
+    ]
+
+
 @app.post("/activate")
 async def activate(
     payload: AgentControlPayload,
