@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException, Depends
+from fastapi import FastAPI, Header, HTTPException, Depends, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from anthropic import Anthropic
@@ -7,6 +7,7 @@ from config import load_config
 from prompts import build_system_prompt, build_analysis_prompt, build_follow_up_prompt
 import hmac
 import httpx
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,12 @@ SUPABASE_INSIGHTS_URL = f"{config.supabase_url}/insights"
 SUPABASE_PROMPT_VERSIONS_URL = f"{config.supabase_url}/prompt_versions"
 MANYCHAT_API_KEY = config.manychat_token
 MANYCHAT_SEND_URL = "https://api.manychat.com/fb/sending/sendContent"
+WHATSAPP_ACCESS_TOKEN = config.whatsapp_access_token
+WHATSAPP_PHONE_NUMBER_ID = config.whatsapp_phone_number_id
+WHATSAPP_VERIFY_TOKEN = config.whatsapp_verify_token
+META_APP_SECRET = config.meta_app_secret
+GRAPH_API_VERSION = config.graph_api_version or "v23.0"
+WHATSAPP_SEND_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 MAX_HISTORY_TURNS = 40
 AGENT_OPTIONS_START = "<!-- AGENT_OPTIONS_START -->"
 AGENT_OPTIONS_END = "<!-- AGENT_OPTIONS_END -->"
@@ -64,6 +71,20 @@ def require_secret(x_webhook_secret: Optional[str]) -> None:
         raise HTTPException(status_code=500, detail="WEBHOOK_SECRET is not configured")
     if not x_webhook_secret or not hmac.compare_digest(x_webhook_secret, WEBHOOK_SECRET):
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+
+def verify_meta_signature(body: bytes, x_hub_signature_256: Optional[str]) -> None:
+    if not META_APP_SECRET:
+        return
+    if not x_hub_signature_256 or not x_hub_signature_256.startswith("sha256="):
+        raise HTTPException(status_code=401, detail="Missing Meta signature")
+    expected = "sha256=" + hmac.new(
+        META_APP_SECRET.encode(),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected, x_hub_signature_256):
+        raise HTTPException(status_code=401, detail="Invalid Meta signature")
 
 
 def require_dashboard_secret(x_dashboard_secret: Optional[str]) -> None:
@@ -283,6 +304,8 @@ def has_follow_up_stage(history: list, stage: str) -> bool:
 def build_follow_up_item(conversation: dict) -> Optional[dict]:
     if not conversation.get("agent_active"):
         return None
+    if conversation.get("automation_mode") == "disabled":
+        return None
     if conversation.get("status") in {"appel_booke", "signe"}:
         return None
 
@@ -308,10 +331,15 @@ def build_follow_up_item(conversation: dict) -> Optional[dict]:
         "id": conversation.get("id"),
         "created_at": conversation.get("created_at"),
         "username": conversation.get("username"),
+        "channel": conversation.get("channel") or "instagram",
+        "external_contact_id": conversation.get("external_contact_id") or conversation.get("username"),
+        "phone_e164": conversation.get("phone_e164"),
         "display_name": conversation.get("display_name"),
         "message": conversation.get("message"),
         "status": conversation.get("status"),
         "agent_active": conversation.get("agent_active"),
+        "automation_mode": conversation.get("automation_mode") or "supervised",
+        "manual_contact_url": manual_contact_url(conversation),
         "stage": stage["stage"],
         "stage_label": stage["label"],
         "mode": stage["mode"],
@@ -344,7 +372,22 @@ async def get_active_prompt() -> str:
 
 
 async def get_contact(username: str, user_id: Optional[str] = None) -> Optional[dict]:
-    params = {"username": f"eq.{username}", "limit": 1}
+    return await get_contact_by_external_id(username, "instagram", user_id)
+
+
+async def get_contact_by_external_id(
+    external_contact_id: str,
+    channel: str = "instagram",
+    user_id: Optional[str] = None,
+) -> Optional[dict]:
+    if channel == "instagram":
+        params = {"username": f"eq.{external_contact_id}", "limit": 1}
+    else:
+        params = {
+            "channel": f"eq.{channel}",
+            "external_contact_id": f"eq.{external_contact_id}",
+            "limit": 1,
+        }
     if user_id:
         params["user_id"] = f"eq.{user_id}"
     async with httpx.AsyncClient() as http:
@@ -356,6 +399,41 @@ async def get_contact(username: str, user_id: Optional[str] = None) -> Optional[
         res.raise_for_status()
         rows = res.json()
     return rows[0] if rows else None
+
+
+async def create_contact(
+    external_contact_id: str,
+    display_name: str,
+    message: str,
+    channel: str,
+    received_at: str,
+    phone_e164: Optional[str] = None,
+    transport_metadata: Optional[dict] = None,
+) -> dict:
+    row = {
+        "username": external_contact_id,
+        "display_name": display_name,
+        "message": message,
+        "status": "nouveau",
+        "agent_active": True,
+        "history": [],
+        "user_id": config.owner_user_id,
+        "channel": channel,
+        "external_contact_id": external_contact_id,
+        "phone_e164": phone_e164,
+        "last_inbound_at": received_at,
+        "transport_metadata": transport_metadata or {},
+    }
+    async with httpx.AsyncClient() as http:
+        res = await http.post(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=representation"},
+            json=row,
+            timeout=10.0,
+        )
+        res.raise_for_status()
+        rows = res.json()
+    return rows[0] if rows else row
 
 
 async def get_conversation_by_id(conversation_id: str, user_id: Optional[str] = None) -> Optional[dict]:
@@ -403,6 +481,70 @@ async def send_manychat_message(subscriber_id: str, text: str) -> dict:
         )
     print(f"[manychat] status={res.status_code} body={res.text!r}")
     return {"status_code": res.status_code, "body": res.text}
+
+
+async def clear_manychat_agent_response(subscriber_id: str) -> None:
+    if not MANYCHAT_API_KEY:
+        return
+    try:
+        async with httpx.AsyncClient() as http:
+            await http.post(
+                "https://api.manychat.com/fb/subscriber/setCustomFieldByName",
+                headers={"Authorization": f"Bearer {MANYCHAT_API_KEY}", "Content-Type": "application/json"},
+                json={"subscriber_id": subscriber_id, "field_name": "agent_response", "field_value": ""},
+                timeout=10.0,
+            )
+    except Exception:
+        pass
+
+
+async def send_whatsapp_text(phone_e164: str, text: str) -> dict:
+    if not WHATSAPP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="WHATSAPP_ACCESS_TOKEN is not configured")
+    if not WHATSAPP_PHONE_NUMBER_ID:
+        raise HTTPException(status_code=500, detail="WHATSAPP_PHONE_NUMBER_ID is not configured")
+
+    async with httpx.AsyncClient() as http:
+        res = await http.post(
+            WHATSAPP_SEND_URL,
+            headers={
+                "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": phone_e164,
+                "type": "text",
+                "text": {"preview_url": False, "body": text},
+            },
+            timeout=15.0,
+        )
+    print(f"[whatsapp] status={res.status_code} body={res.text!r}")
+    return {"status_code": res.status_code, "body": res.text}
+
+
+async def send_channel_message(conversation: dict, text: str) -> dict:
+    channel = conversation.get("channel") or "instagram"
+    if channel == "whatsapp":
+        phone_e164 = conversation.get("phone_e164") or conversation.get("external_contact_id") or conversation.get("username")
+        if not phone_e164:
+            raise HTTPException(status_code=422, detail="Conversation has no WhatsApp phone number")
+        return await send_whatsapp_text(phone_e164, text)
+
+    subscriber_id = conversation.get("external_contact_id") or conversation.get("username")
+    if not subscriber_id:
+        raise HTTPException(status_code=422, detail="Conversation has no ManyChat subscriber id")
+    return await send_manychat_message(subscriber_id, text)
+
+
+def manual_contact_url(conversation: dict) -> Optional[str]:
+    channel = conversation.get("channel") or "instagram"
+    if channel == "whatsapp":
+        phone = conversation.get("phone_e164") or conversation.get("external_contact_id")
+        return f"https://wa.me/{phone.lstrip('+')}" if phone else None
+    display_name = conversation.get("display_name") or conversation.get("username")
+    return f"https://ig.me/m/{display_name}" if display_name else None
 
 
 async def generate_follow_up_message(conversation: dict, stage: str) -> str:
@@ -537,7 +679,152 @@ class PlaygroundPayload(BaseModel):
     sales_page_url: Optional[str] = None
 
 
-# ── Webhook (setter core — inchangé) ──────────────────────────────────────────
+async def handle_inbound_message(
+    *,
+    channel: str,
+    external_contact_id: str,
+    display_name: str,
+    message: str,
+    phone_e164: Optional[str] = None,
+    transport_metadata: Optional[dict] = None,
+) -> dict:
+    received_at = now_iso()
+    contact = await get_contact_by_external_id(external_contact_id, channel)
+    if contact is None:
+        contact = await create_contact(
+            external_contact_id=external_contact_id,
+            display_name=display_name,
+            message=message,
+            channel=channel,
+            received_at=received_at,
+            phone_e164=phone_e164,
+            transport_metadata=transport_metadata,
+        )
+
+    history = contact.get("history") or []
+    user_message = {"role": "user", "content": message, "timestamp": received_at, "channel": channel}
+    messages = history + [user_message]
+    if len(messages) > MAX_HISTORY_TURNS * 2:
+        messages = messages[-(MAX_HISTORY_TURNS * 2):]
+
+    patch_data: dict = {
+        "message": message,
+        "history": messages,
+        "last_inbound_at": received_at,
+    }
+    if display_name:
+        patch_data["display_name"] = display_name
+    if phone_e164:
+        patch_data["phone_e164"] = phone_e164
+    if transport_metadata:
+        patch_data["transport_metadata"] = transport_metadata
+
+    if not contact.get("agent_active"):
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{contact.get('id')}"},
+                json=patch_data,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        if channel == "instagram":
+            await clear_manychat_agent_response(external_contact_id)
+        print(f"[inbound] SKIP channel={channel} external_id={external_contact_id}")
+        return {"reply": "", "sent": False, "skipped": True, "reason": "agent_inactive"}
+
+    automation_mode = contact.get("automation_mode") or "supervised"
+    if automation_mode == "disabled":
+        patch_data["pending_message"] = None
+        patch_data["pending_message_at"] = None
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{contact.get('id')}"},
+                json=patch_data,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        print(f"[inbound] DISABLED channel={channel} external_id={external_contact_id}")
+        return {"reply": "", "sent": False, "skipped": True, "reason": "automation_disabled"}
+
+    system_prompt = await get_active_prompt()
+    if client is None:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+    first_turn = not history
+    prospect_label = "Prospect WhatsApp" if channel == "whatsapp" else "Prospect Instagram"
+    user_content = (
+        f"{prospect_label} : {display_name}\nMessage reçu : {message}"
+        if first_turn
+        else message
+    )
+    messages_for_generation = history + [{"role": "user", "content": user_content, "timestamp": received_at}]
+
+    try:
+        reply = generate_claude_reply(strip_message_metadata(messages_for_generation), system_prompt)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+
+    if "[STOP_AGENT]" in reply:
+        reply = reply.replace("[STOP_AGENT]", "").strip()
+        patch_data["agent_active"] = False
+        print(f"[inbound] STOP_AGENT channel={channel} external_id={external_contact_id}")
+
+    sent = automation_mode == "auto"
+    assistant_entry = {
+        "role": "assistant",
+        "content": reply,
+        "timestamp": now_iso(),
+        "channel": channel,
+        "sent": sent,
+        "ignored": False,
+    }
+    new_history = messages + [assistant_entry]
+    if len(new_history) > MAX_HISTORY_TURNS * 2:
+        new_history = new_history[-(MAX_HISTORY_TURNS * 2):]
+
+    patch_data.update({
+        "response": reply,
+        "history": new_history,
+        "status": "en_cours",
+    })
+    if automation_mode == "supervised":
+        patch_data["pending_message"] = reply
+        patch_data["pending_message_at"] = now_iso()
+    elif automation_mode == "auto":
+        patch_data["pending_message"] = None
+        patch_data["pending_message_at"] = None
+
+    send_result = None
+    if automation_mode == "auto":
+        send_result = await send_channel_message(contact, reply)
+        if send_result["status_code"] >= 400:
+            raise HTTPException(status_code=502, detail=f"{channel} send error: {send_result['body']}")
+
+    async with httpx.AsyncClient() as http:
+        res = await http.patch(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=minimal"},
+            params={"id": f"eq.{contact.get('id')}"},
+            json=patch_data,
+            timeout=10.0,
+        )
+        res.raise_for_status()
+
+    print(f"[inbound] REPLY channel={channel} external_id={external_contact_id} mode={automation_mode}")
+    return {
+        "reply": reply,
+        "sent": sent,
+        "skipped": False,
+        "reason": None,
+        "send_result": send_result,
+        "conversation_id": contact.get("id"),
+    }
+
+
+# ── Webhooks ──────────────────────────────────────────────────────────────────
 
 @app.post("/webhook")
 async def webhook(
@@ -546,119 +833,68 @@ async def webhook(
 ):
     require_secret(x_webhook_secret)
 
-    if client is None:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
-
-    contact = await get_contact(payload.subscriber_id)
-    history = (contact.get("history") or []) if contact else []
-    received_at = now_iso()
-
-    # Nouveau contact → créer la ligne avec agent_active=true
-    if contact is None:
-        async with httpx.AsyncClient() as http:
-            await http.post(
-                SUPABASE_CONVERSATIONS_URL,
-                headers=supabase_headers(),
-                json={
-                    "username": payload.subscriber_id,
-                    "display_name": payload.username,
-                    "message": payload.message,
-                    "status": "nouveau",
-                    "agent_active": True,
-                    "history": [],
-                    "user_id": config.owner_user_id,
-                },
-            )
-
-    # Guard agent_active — contact existant avec agent désactivé
-    if contact is not None and not contact.get("agent_active"):
-        new_history = history + [{"role": "user", "content": payload.message, "timestamp": received_at}]
-        if len(new_history) > MAX_HISTORY_TURNS * 2:
-            new_history = new_history[-(MAX_HISTORY_TURNS * 2):]
-        async with httpx.AsyncClient() as http:
-            res = await http.patch(
-                SUPABASE_CONVERSATIONS_URL,
-                headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"username": f"eq.{payload.subscriber_id}"},
-                json={"message": payload.message, "history": new_history},
-            )
-        res.raise_for_status()
-        try:
-            async with httpx.AsyncClient() as http:
-                await http.post(
-                    "https://api.manychat.com/fb/subscriber/setCustomFieldByName",
-                    headers={"Authorization": f"Bearer {MANYCHAT_API_KEY}", "Content-Type": "application/json"},
-                    json={"subscriber_id": payload.subscriber_id, "field_name": "agent_response", "field_value": ""},
-                )
-        except Exception:
-            pass
-        print(f"[webhook] SKIP username={payload.subscriber_id}")
-        return {"agent_response": "SKIP"}
-
-    # Charger le prompt actif (Supabase ou fallback hardcodé)
-    system_prompt = await get_active_prompt()
-
-    # Générer la réponse Claude
-    user_content = (
-        f"Prospect Instagram : {payload.username}\nMessage reçu : {payload.message}"
-        if not history
-        else payload.message
+    result = await handle_inbound_message(
+        channel="instagram",
+        external_contact_id=payload.subscriber_id,
+        display_name=payload.username,
+        message=payload.message,
+        transport_metadata={"provider": "manychat"},
     )
-    user_message = {"role": "user", "content": user_content, "timestamp": received_at}
-    messages = history + [user_message]
-    reply = generate_claude_reply(strip_message_metadata(messages), system_prompt)
+    return {"agent_response": result["reply"] or "SKIP"}
 
-    if "[STOP_AGENT]" in reply:
-        reply = reply.replace("[STOP_AGENT]", "").strip()
-        async with httpx.AsyncClient() as http:
-            await http.patch(
-                SUPABASE_CONVERSATIONS_URL,
-                headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"username": f"eq.{payload.subscriber_id}"},
-                json={"agent_active": False},
-            )
-        print(f"[webhook] STOP_AGENT triggered username={payload.subscriber_id}")
 
-    automation_mode = (contact.get("automation_mode") or "supervised") if contact else "supervised"
-    sent = automation_mode == "auto"
+@app.get("/webhooks/whatsapp")
+async def verify_whatsapp_webhook(
+    hub_mode: Optional[str] = Query(default=None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(default=None, alias="hub.verify_token"),
+    hub_challenge: Optional[str] = Query(default=None, alias="hub.challenge"),
+):
+    if hub_mode == "subscribe" and WHATSAPP_VERIFY_TOKEN and hmac.compare_digest(hub_verify_token or "", WHATSAPP_VERIFY_TOKEN):
+        return Response(content=hub_challenge or "", media_type="text/plain")
+    raise HTTPException(status_code=403, detail="Invalid WhatsApp verify token")
 
-    assistant_entry = {
-        "role": "assistant",
-        "content": reply,
-        "timestamp": now_iso(),
-        "sent": sent,
-        "ignored": False,
-    }
-    new_history = messages + [assistant_entry]
-    if len(new_history) > MAX_HISTORY_TURNS * 2:
-        new_history = new_history[-(MAX_HISTORY_TURNS * 2):]
 
-    patch_data: dict = {
-        "message": payload.message,
-        "response": reply,
-        "history": new_history,
-        "status": "en_cours",
-    }
-    if automation_mode == "supervised":
-        patch_data["pending_message"] = reply
-        patch_data["pending_message_at"] = now_iso()
-    elif automation_mode == "auto":
-        patch_data["pending_message"] = None
-        patch_data["pending_message_at"] = None
+@app.post("/webhooks/whatsapp")
+async def whatsapp_webhook(
+    request: Request,
+    x_hub_signature_256: Optional[str] = Header(default=None),
+):
+    body = await request.body()
+    verify_meta_signature(body, x_hub_signature_256)
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    async with httpx.AsyncClient() as http:
-        res = await http.patch(
-            SUPABASE_CONVERSATIONS_URL,
-            headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"username": f"eq.{payload.subscriber_id}"},
-            json=patch_data,
-        )
-    res.raise_for_status()
+    processed = 0
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value") or {}
+            contacts = {contact.get("wa_id"): contact for contact in value.get("contacts", [])}
+            for message_item in value.get("messages", []):
+                if message_item.get("type") != "text":
+                    continue
+                wa_id = message_item.get("from")
+                text = ((message_item.get("text") or {}).get("body") or "").strip()
+                if not wa_id or not text:
+                    continue
+                contact = contacts.get(wa_id) or {}
+                profile = contact.get("profile") or {}
+                await handle_inbound_message(
+                    channel="whatsapp",
+                    external_contact_id=wa_id,
+                    display_name=profile.get("name") or wa_id,
+                    message=text,
+                    phone_e164=wa_id,
+                    transport_metadata={
+                        "provider": "meta_whatsapp_cloud_api",
+                        "message_id": message_item.get("id"),
+                        "phone_number_id": (value.get("metadata") or {}).get("phone_number_id"),
+                    },
+                )
+                processed += 1
 
-    if automation_mode == "auto" and MANYCHAT_API_KEY:
-        await send_manychat_message(payload.subscriber_id, reply)
-    print(f"[webhook] REPLY username={payload.subscriber_id} agent_active={contact.get('agent_active') if contact else True}")
-    return {"agent_response": reply}
+    return {"success": True, "processed": processed}
 
 
 # ── Dashboard endpoints ────────────────────────────────────────────────────────
@@ -702,7 +938,7 @@ async def get_conversation_summaries(
                 "order": "created_at.desc",
                 "limit": 500,
                 "user_id": f"eq.{user_id}",
-                "select": "id,created_at,username,display_name,message,status,agent_active,automation_mode,pending_message,pending_message_at",
+                "select": "id,created_at,username,display_name,message,status,agent_active,automation_mode,pending_message,pending_message_at,channel,external_contact_id,phone_e164,last_inbound_at",
             },
             timeout=10.0,
         )
@@ -1009,7 +1245,7 @@ async def get_due_follow_ups(
                 "order": "created_at.desc",
                 "limit": "500",
                 "user_id": f"eq.{user_id}",
-                "select": "id,created_at,username,display_name,message,status,agent_active,history",
+                "select": "id,created_at,username,display_name,message,status,agent_active,automation_mode,history,channel,external_contact_id,phone_e164,last_inbound_at",
             },
             timeout=10.0,
         )
@@ -1105,25 +1341,23 @@ async def send_auto_23h_follow_up(
     user_id: str = Depends(require_jwt),
 ):
 
-    if not MANYCHAT_API_KEY:
-        raise HTTPException(status_code=500, detail="MANYCHAT_API_KEY is not configured")
-
     conversation = await get_conversation_by_id(conversation_id, user_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    channel = conversation.get("channel") or "instagram"
+    if channel == "instagram" and not MANYCHAT_API_KEY:
+        raise HTTPException(status_code=500, detail="MANYCHAT_API_KEY is not configured")
+    if channel == "whatsapp" and (not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID):
+        raise HTTPException(status_code=500, detail="WhatsApp API is not configured")
 
     due_item = build_follow_up_item(conversation)
     if not due_item or due_item.get("stage") != "auto_23h":
         raise HTTPException(status_code=409, detail="Auto 23h follow-up is not due")
 
-    subscriber_id = conversation.get("username")
-    if not subscriber_id:
-        raise HTTPException(status_code=422, detail="Conversation has no ManyChat subscriber id")
-
     message = await generate_follow_up_message(conversation, "auto_23h")
-    send_result = await send_manychat_message(subscriber_id, message)
+    send_result = await send_channel_message(conversation, message)
     if send_result["status_code"] >= 400:
-        raise HTTPException(status_code=502, detail=f"ManyChat error: {send_result['body']}")
+        raise HTTPException(status_code=502, detail=f"Send error: {send_result['body']}")
 
     history = conversation.get("history") or []
     new_history = history + [{

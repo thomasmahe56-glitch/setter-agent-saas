@@ -4,7 +4,8 @@ import os
 
 payload = json.dumps({
     "username": "julien_runs",
-    "message": "Salut, j'ai commenté Analyse sur ton post"
+    "message": "Salut, j'ai commenté Analyse sur ton post",
+    "subscriber_id": "julien_runs_test",
 }).encode()
 
 req = urllib.request.Request(
@@ -19,4 +20,4 @@ req = urllib.request.Request(
 
 with urllib.request.urlopen(req) as res:
     data = json.loads(res.read())
-    print(data["response"])
+    print(data["agent_response"])

@@ -10,6 +10,11 @@ class Config:
     webhook_secret: str
     dashboard_secret: str
     manychat_token: str
+    whatsapp_access_token: str
+    whatsapp_phone_number_id: str
+    whatsapp_verify_token: str
+    meta_app_secret: str
+    graph_api_version: str
     business_name: str
     coach_name: str
     agent_name: str
@@ -29,6 +34,11 @@ def load_config() -> Config:
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
         dashboard_secret=os.environ.get("DASHBOARD_SECRET", ""),
         manychat_token=os.environ.get("MANYCHAT_TOKEN", ""),
+        whatsapp_access_token=os.environ.get("WHATSAPP_ACCESS_TOKEN", ""),
+        whatsapp_phone_number_id=os.environ.get("WHATSAPP_PHONE_NUMBER_ID", ""),
+        whatsapp_verify_token=os.environ.get("WHATSAPP_VERIFY_TOKEN", ""),
+        meta_app_secret=os.environ.get("META_APP_SECRET", ""),
+        graph_api_version=os.environ.get("GRAPH_API_VERSION", "v23.0"),
         business_name=os.environ.get("BUSINESS_NAME", ""),
         coach_name=os.environ.get("COACH_NAME", ""),
         agent_name=os.environ.get("AGENT_NAME", "Agent"),

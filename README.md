@@ -1,6 +1,6 @@
 # Setter Agent SaaS
 
-Agent setter Instagram multi-client. Qualifie les prospects en DM et les oriente vers un appel ou une page de vente.
+Agent setter Instagram et WhatsApp multi-client. Qualifie les prospects en DM et les oriente vers un appel ou une page de vente.
 
 Une instance Railway = un client. Tout le contexte métier est configuré via variables d'environnement.
 
@@ -23,16 +23,25 @@ Une instance Railway = un client. Tout le contexte métier est configuré via va
 -- Conversations
 create table conversations (
   id uuid default gen_random_uuid() primary key,
+  user_id uuid,
   created_at timestamptz default now(),
-  username text unique not null,
+  username text not null,
+  channel text default 'instagram' check (channel in ('instagram', 'whatsapp')),
+  external_contact_id text not null,
+  phone_e164 text,
   display_name text,
   message text,
   response text,
   status text default 'nouveau',
   agent_active boolean default true,
   pending_opener boolean default false,
+  last_inbound_at timestamptz,
+  transport_metadata jsonb default '{}',
   history jsonb default '[]'
 );
+
+create unique index conversations_user_channel_external_idx
+on conversations (user_id, channel, external_contact_id);
 
 -- Insights (feedback loop)
 create table insights (
@@ -106,6 +115,23 @@ Pour la relance automatique 23h :
 - Flow déclenché par automation ManyChat → `POST /follow-ups/manychat-auto-23h`
 - Body : `{"subscriber_id": "{{subscriber id}}"}`
 
+### 6. Connecter WhatsApp Cloud API
+
+Dans Meta for Developers :
+1. Créer/configurer une app WhatsApp Business Platform.
+2. Renseigner le webhook callback : `GET/POST /webhooks/whatsapp`
+3. Verify token : valeur de `WHATSAPP_VERIFY_TOKEN`
+4. S'abonner aux événements `messages`
+
+Variables Railway à ajouter :
+- `WHATSAPP_ACCESS_TOKEN`
+- `WHATSAPP_PHONE_NUMBER_ID`
+- `WHATSAPP_VERIFY_TOKEN`
+- `META_APP_SECRET`
+- `GRAPH_API_VERSION` (optionnel, défaut `v23.0`)
+
+Le mode `auto` envoie directement les réponses WhatsApp tant que la fenêtre de service 24h est ouverte. Les relances J+3/J+10 restent supervisées sauf ajout futur de templates WhatsApp approuvés.
+
 ---
 
 ## Variables d'environnement
@@ -119,6 +145,11 @@ Pour la relance automatique 23h :
 | `OWNER_USER_ID` | UUID Supabase Auth du coach propriétaire de cette instance | ✅ |
 | `DASHBOARD_SECRET` | Ancien secret dashboard, conservé seulement si un outil local l'utilise encore | Optionnel |
 | `MANYCHAT_TOKEN` | Token API ManyChat | ✅ |
+| `WHATSAPP_ACCESS_TOKEN` | Token Cloud API WhatsApp | Requis pour WhatsApp |
+| `WHATSAPP_PHONE_NUMBER_ID` | Phone Number ID Meta WhatsApp | Requis pour WhatsApp |
+| `WHATSAPP_VERIFY_TOKEN` | Token de vérification du webhook WhatsApp | Requis pour WhatsApp |
+| `META_APP_SECRET` | Secret app Meta pour valider `X-Hub-Signature-256` | Recommandé |
+| `GRAPH_API_VERSION` | Version Graph API, défaut `v23.0` | Optionnel |
 | `BUSINESS_NAME` | Nom du business | ✅ |
 | `COACH_NAME` | Prénom + nom du coach | ✅ |
 | `AGENT_NAME` | Nom de l'agent IA | ✅ |
@@ -134,6 +165,8 @@ Pour la relance automatique 23h :
 | Méthode | Endpoint | Description |
 |---------|----------|-------------|
 | `POST` | `/webhook` | Reçoit un message ManyChat, génère et envoie la réponse |
+| `GET` | `/webhooks/whatsapp` | Vérification webhook Meta WhatsApp |
+| `POST` | `/webhooks/whatsapp` | Reçoit les messages WhatsApp Cloud API |
 | `GET` | `/conversations` | Liste toutes les conversations |
 | `POST` | `/activate` | Active l'agent pour un contact |
 | `POST` | `/deactivate` | Désactive l'agent pour un contact |

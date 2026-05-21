@@ -20,3 +20,17 @@ OWNER_USER_ID=7b8b8a81-a22d-49ab-8564-e159db5546e2
   (récupérable dans Supabase → Authentication → Users)
 - SUPABASE_JWT_SECRET est utilisé pour valider les tokens JWT émis par Supabase Auth
 - DASHBOARD_SECRET reste nécessaire si tu l'utilises encore localement (optionnel)
+
+### WhatsApp Cloud API
+
+```
+WHATSAPP_ACCESS_TOKEN=<token Meta Cloud API>
+WHATSAPP_PHONE_NUMBER_ID=<Phone Number ID WhatsApp>
+WHATSAPP_VERIFY_TOKEN=<secret libre à copier aussi dans Meta Webhooks>
+META_APP_SECRET=<App Secret Meta>
+GRAPH_API_VERSION=v23.0
+```
+
+- `WHATSAPP_VERIFY_TOKEN` sert à valider l'installation du webhook `/webhooks/whatsapp`.
+- `META_APP_SECRET` permet de vérifier `X-Hub-Signature-256` sur les webhooks entrants.
+- `GRAPH_API_VERSION` est optionnel ; le backend utilise `v23.0` par défaut.

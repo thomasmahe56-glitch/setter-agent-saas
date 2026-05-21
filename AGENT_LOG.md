@@ -10,6 +10,57 @@ Pour chaque intervention, ajouter une entree datee avec :
 - les verifications lancees
 - les limites ou suites a prevoir
 
+## 2026-05-21
+
+### Integration WhatsApp Cloud API
+
+Contexte :
+
+- Demande utilisateur : ajouter WhatsApp en plus d'Instagram et poser une architecture multi-canal.
+
+Fichiers consultes :
+
+- `main.py`
+- `config.py`
+- `README.md`
+- `.env.example`
+- `migrations/env_vars_to_add.md`
+- `test.py`
+
+Fichiers modifies :
+
+- `main.py`
+- `config.py`
+- `.env.example`
+- `.gitignore`
+- `README.md`
+- `migrations/env_vars_to_add.md`
+- `migrations/add_whatsapp_channel.sql`
+- `test.py`
+- `AGENT_LOG.md`
+
+Changements effectues :
+
+- Ajout des variables de configuration WhatsApp Cloud API.
+- Ajout d'une migration multi-canal pour `channel`, `external_contact_id`, `phone_e164`, `last_inbound_at` et `transport_metadata`.
+- Extraction d'un traitement commun des messages entrants pour Instagram et WhatsApp.
+- Ajout de l'envoi WhatsApp via Graph API `/{phone_number_id}/messages`.
+- Ajout des endpoints `GET /webhooks/whatsapp` et `POST /webhooks/whatsapp`.
+- Ajout de la verification optionnelle `X-Hub-Signature-256` avec `META_APP_SECRET`.
+- Correction du mode `disabled` pour historiser sans generer de reponse.
+- Extension des donnees dashboard et relances avec le canal et le lien manuel `wa.me` ou `ig.me`.
+
+Verifications :
+
+- `PYTHONPYCACHEPREFIX=.pycache python3 -m py_compile main.py config.py test.py`
+- Import FastAPI et verification de l'enregistrement des routes WhatsApp.
+
+Limites et suites :
+
+- Executer `migrations/add_whatsapp_channel.sql` dans Supabase avant de deployer ce backend.
+- Configurer les variables Railway WhatsApp et le webhook Meta.
+- Les relances hors fenetre 24h restent supervisees tant que les templates WhatsApp approuves ne sont pas ajoutes.
+
 ## 2026-05-01
 
 ### Configuration Railway du secret webhook
