@@ -62,13 +62,12 @@ def cors_allowed_origins() -> list[str]:
         for origin in (config.cors_allowed_origins or "").split(",")
         if origin.strip()
     ]
-    if origins:
-        return origins
-    return [
+    default_origins = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "https://setter-dashboard-saas.vercel.app",
     ]
+    return list(dict.fromkeys([*origins, *default_origins]))
 
 
 app.add_middleware(
