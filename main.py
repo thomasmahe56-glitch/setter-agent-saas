@@ -64,11 +64,10 @@ def cors_allowed_origins() -> list[str]:
     ]
     if origins:
         return origins
-    if (config.environment or "").lower() in {"production", "prod"}:
-        return []
     return [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "https://setter-dashboard-saas.vercel.app",
     ]
 
 
