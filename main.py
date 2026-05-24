@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Header, HTTPException, Depends, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from config import load_config
@@ -26,6 +26,9 @@ SUPABASE_AUTH_USER_URL = f"{SUPABASE_PROJECT_URL}/auth/v1/user"
 SUPABASE_CONVERSATIONS_URL = f"{config.supabase_url}/conversations"
 SUPABASE_INSIGHTS_URL = f"{config.supabase_url}/insights"
 SUPABASE_PROMPT_VERSIONS_URL = f"{config.supabase_url}/prompt_versions"
+SUPABASE_AGENT_PROFILES_URL = f"{config.supabase_url}/agent_profiles"
+SUPABASE_AGENT_AVATARS_URL = f"{config.supabase_url}/agent_avatars"
+SUPABASE_AGENT_SALES_RULES_URL = f"{config.supabase_url}/agent_sales_rules"
 MANYCHAT_API_KEY = config.manychat_token
 MANYCHAT_SEND_URL = "https://api.manychat.com/fb/sending/sendContent"
 WHATSAPP_ACCESS_TOKEN = config.whatsapp_access_token
@@ -41,6 +44,10 @@ AGENT_PROFILE_START = "<!-- AGENT_PROFILE_START -->"
 AGENT_PROFILE_END = "<!-- AGENT_PROFILE_END -->"
 AGENT_PROFILE_PROMPT_START = "<!-- AGENT_PROFILE_PROMPT_START -->"
 AGENT_PROFILE_PROMPT_END = "<!-- AGENT_PROFILE_PROMPT_END -->"
+TRAINING_CENTER_START = "<!-- TRAINING_CENTER_START -->"
+TRAINING_CENTER_END = "<!-- TRAINING_CENTER_END -->"
+TRAINING_CENTER_PROMPT_START = "<!-- TRAINING_CENTER_PROMPT_START -->"
+TRAINING_CENTER_PROMPT_END = "<!-- TRAINING_CENTER_PROMPT_END -->"
 AUTO_FOLLOW_UP_HOURS = 23
 MANUAL_FOLLOW_UP_1_HOURS = 72
 MANUAL_FOLLOW_UP_2_HOURS = 240
@@ -49,9 +56,25 @@ client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 app = FastAPI()
 
+def cors_allowed_origins() -> list[str]:
+    origins = [
+        origin.strip().rstrip("/")
+        for origin in (config.cors_allowed_origins or "").split(",")
+        if origin.strip()
+    ]
+    if origins:
+        return origins
+    if (config.environment or "").lower() in {"production", "prod"}:
+        return []
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_allowed_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -75,7 +98,7 @@ def require_secret(x_webhook_secret: Optional[str]) -> None:
 
 def verify_meta_signature(body: bytes, x_hub_signature_256: Optional[str]) -> None:
     if not META_APP_SECRET:
-        return
+        raise HTTPException(status_code=500, detail="META_APP_SECRET is not configured")
     if not x_hub_signature_256 or not x_hub_signature_256.startswith("sha256="):
         raise HTTPException(status_code=401, detail="Missing Meta signature")
     expected = "sha256=" + hmac.new(
@@ -85,6 +108,16 @@ def verify_meta_signature(body: bytes, x_hub_signature_256: Optional[str]) -> No
     ).hexdigest()
     if not hmac.compare_digest(expected, x_hub_signature_256):
         raise HTTPException(status_code=401, detail="Invalid Meta signature")
+
+
+def owner_scope(user_id: Optional[str] = None) -> dict:
+    effective_user_id = user_id or config.owner_user_id
+    return {"user_id": f"eq.{effective_user_id}"} if effective_user_id else {}
+
+
+def row_owner_fields(user_id: Optional[str] = None) -> dict:
+    effective_user_id = user_id or config.owner_user_id
+    return {"user_id": effective_user_id} if effective_user_id else {}
 
 
 def require_dashboard_secret(x_dashboard_secret: Optional[str]) -> None:
@@ -180,6 +213,21 @@ def strip_agent_profile(prompt: str) -> str:
     ).strip()
 
 
+def strip_training_center(prompt: str) -> str:
+    prompt = re.sub(
+        rf"\n*\s*{re.escape(TRAINING_CENTER_START)}.*?{re.escape(TRAINING_CENTER_END)}\s*",
+        "\n",
+        prompt,
+        flags=re.DOTALL,
+    )
+    return re.sub(
+        rf"\n*\s*{re.escape(TRAINING_CENTER_PROMPT_START)}.*?{re.escape(TRAINING_CENTER_PROMPT_END)}\s*",
+        "\n",
+        prompt,
+        flags=re.DOTALL,
+    ).strip()
+
+
 def append_agent_profile(prompt: str, profile: dict) -> str:
     prompt = strip_agent_profile(prompt)
     clean_profile = {
@@ -196,6 +244,93 @@ def append_agent_profile(prompt: str, profile: dict) -> str:
         f"{AGENT_PROFILE_PROMPT_START}\n"
         f"=== PROFIL BUSINESS ET VOIX D'ANGELOS ===\n{profile_prompt}\n"
         f"{AGENT_PROFILE_PROMPT_END}"
+    )
+
+
+def clean_json_value(value):
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return [clean_json_value(item) for item in value if clean_json_value(item) not in ("", None, [], {})]
+    if isinstance(value, dict):
+        return {
+            key: cleaned
+            for key, val in value.items()
+            if (cleaned := clean_json_value(val)) not in ("", None, [], {})
+        }
+    return value
+
+
+def parse_llm_json(raw: str) -> dict:
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        parts = cleaned.split("```")
+        cleaned = parts[1] if len(parts) > 1 else cleaned
+        if cleaned.lstrip().startswith("json"):
+            cleaned = cleaned.lstrip()[4:]
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if not match:
+            raise
+        parsed = json.loads(match.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError("Claude returned JSON but not an object")
+    return parsed
+
+
+def format_training_center_for_prompt(profile: dict, avatar: dict, sales_rules: dict) -> str:
+    parts = [
+        "=== TRAINING CENTER ANGELOS ===",
+        "Ces donnees structurees sont la source de verite metier. Applique-les avant les exemples generiques du prompt.",
+    ]
+    if profile:
+        parts.extend([
+            "",
+            "PROFIL BUSINESS STRUCTURE :",
+            json.dumps(profile, ensure_ascii=False, indent=2),
+        ])
+    if avatar:
+        parts.extend([
+            "",
+            "AVATAR CLIENT STRUCTURE :",
+            json.dumps(avatar, ensure_ascii=False, indent=2),
+        ])
+    if sales_rules:
+        parts.extend([
+            "",
+            "REGLES DM STRUCTUREES :",
+            json.dumps(sales_rules, ensure_ascii=False, indent=2),
+        ])
+    parts.extend([
+        "",
+        "Priorites d'execution :",
+        "1. Respecter les stop_conditions, red_flags, bad_fit et do_not_say.",
+        "2. Qualifier avec les qualification_questions et detecter les buying_signals, sans interrogatoire.",
+        "3. Utiliser les exact_words et objections pour parler comme le prospect, sans copier mecaniquement.",
+        "4. Proposer appel ou page uniquement quand les call_offer_conditions sont reunies.",
+    ])
+    return "\n".join(parts)
+
+
+def build_training_center_prompt(base_prompt: str, profile: dict, avatar: dict, sales_rules: dict) -> str:
+    clean_prompt = strip_training_center(base_prompt)
+    payload = {
+        "agent_profile": clean_json_value(profile or {}),
+        "agent_avatar": clean_json_value(avatar or {}),
+        "agent_sales_rules": clean_json_value(sales_rules or {}),
+    }
+    prompt_block = format_training_center_for_prompt(
+        payload["agent_profile"],
+        payload["agent_avatar"],
+        payload["agent_sales_rules"],
+    )
+    return (
+        f"{clean_prompt}\n\n{TRAINING_CENTER_START}\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
+        f"{TRAINING_CENTER_END}\n\n{TRAINING_CENTER_PROMPT_START}\n"
+        f"{prompt_block}\n{TRAINING_CENTER_PROMPT_END}"
     )
 
 
@@ -361,20 +496,43 @@ def build_follow_up_item(conversation: dict) -> Optional[dict]:
 
 
 
-async def get_active_prompt() -> str:
+async def get_active_prompt(user_id: Optional[str] = None) -> str:
     """Retourne le prompt actif depuis prompt_versions, ou le fallback hardcodé."""
     try:
         async with httpx.AsyncClient() as http:
+            params = {
+                "is_active": "eq.true",
+                "order": "created_at.desc",
+                "limit": "1",
+                **owner_scope(user_id),
+            }
             res = await http.get(
                 SUPABASE_PROMPT_VERSIONS_URL,
                 headers={**supabase_headers(), "Accept": "application/json"},
-                params={"is_active": "eq.true", "order": "created_at.desc", "limit": "1"},
+                params=params,
                 timeout=5.0,
             )
             res.raise_for_status()
             rows = res.json()
             if rows and rows[0].get("content"):
                 return rows[0]["content"]
+            effective_user_id = user_id or config.owner_user_id
+            if effective_user_id and config.owner_user_id and hmac.compare_digest(effective_user_id, config.owner_user_id):
+                res = await http.get(
+                    SUPABASE_PROMPT_VERSIONS_URL,
+                    headers={**supabase_headers(), "Accept": "application/json"},
+                    params={
+                        "is_active": "eq.true",
+                        "user_id": "is.null",
+                        "order": "created_at.desc",
+                        "limit": "1",
+                    },
+                    timeout=5.0,
+                )
+                res.raise_for_status()
+                rows = res.json()
+                if rows and rows[0].get("content"):
+                    return rows[0]["content"]
     except Exception as e:
         print(f"[get_active_prompt] fallback to hardcoded prompt: {e}")
     return build_system_prompt(config)
@@ -464,6 +622,81 @@ async def get_conversation_by_id(conversation_id: str, user_id: Optional[str] = 
     return rows[0] if rows else None
 
 
+async def require_owned_insight(insight_id: str, user_id: str) -> dict:
+    async with httpx.AsyncClient() as http:
+        res = await http.get(
+            SUPABASE_INSIGHTS_URL,
+            headers={**supabase_headers(), "Accept": "application/json"},
+            params={
+                "id": f"eq.{insight_id}",
+                **owner_scope(user_id),
+                "select": "id,status",
+                "limit": "1",
+            },
+            timeout=10.0,
+        )
+        res.raise_for_status()
+        rows = res.json()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Insight not found")
+    return rows[0]
+
+
+async def require_owned_prompt_version(version_id: str, user_id: str) -> dict:
+    async with httpx.AsyncClient() as http:
+        res = await http.get(
+            SUPABASE_PROMPT_VERSIONS_URL,
+            headers={**supabase_headers(), "Accept": "application/json"},
+            params={
+                "id": f"eq.{version_id}",
+                **owner_scope(user_id),
+                "select": "id",
+                "limit": "1",
+            },
+            timeout=10.0,
+        )
+        res.raise_for_status()
+        rows = res.json()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Prompt version not found")
+    return rows[0]
+
+
+async def get_user_singleton_row(table_url: str, user_id: str, select: str = "*") -> Optional[dict]:
+    async with httpx.AsyncClient() as http:
+        res = await http.get(
+            table_url,
+            headers={**supabase_headers(), "Accept": "application/json"},
+            params={
+                "user_id": f"eq.{user_id}",
+                "select": select,
+                "limit": "1",
+            },
+            timeout=10.0,
+        )
+        res.raise_for_status()
+        rows = res.json()
+    return rows[0] if rows else None
+
+
+async def upsert_user_singleton_row(table_url: str, user_id: str, payload: dict) -> dict:
+    row = {**payload, **row_owner_fields(user_id)}
+    async with httpx.AsyncClient() as http:
+        res = await http.post(
+            table_url,
+            headers={
+                **supabase_headers(),
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            },
+            params={"on_conflict": "user_id"},
+            json=row,
+            timeout=10.0,
+        )
+        res.raise_for_status()
+        created = res.json()
+    return created[0] if isinstance(created, list) and created else created
+
+
 def generate_claude_reply(messages: list, system_prompt: str = "") -> str:
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -492,7 +725,7 @@ async def send_manychat_message(subscriber_id: str, text: str) -> dict:
                 },
             },
         )
-    print(f"[manychat] status={res.status_code} body={res.text!r}")
+    print(f"[manychat] status={res.status_code} body_len={len(res.text)}")
     return {"status_code": res.status_code, "body": res.text}
 
 
@@ -533,7 +766,7 @@ async def send_whatsapp_text(phone_e164: str, text: str) -> dict:
             },
             timeout=15.0,
         )
-    print(f"[whatsapp] status={res.status_code} body={res.text!r}")
+    print(f"[whatsapp] status={res.status_code} body_len={len(res.text)}")
     return {"status_code": res.status_code, "body": res.text}
 
 
@@ -560,6 +793,67 @@ def manual_contact_url(conversation: dict) -> Optional[str]:
     return f"https://ig.me/m/{display_name}" if display_name else None
 
 
+def allowed_reply_urls(system_prompt: str) -> set[str]:
+    links = extract_agent_links(system_prompt)
+    return {
+        url.rstrip("/")
+        for url in [
+            config.url_call,
+            config.url_page,
+            links.get("calendly_url", ""),
+            links.get("sales_page_url", ""),
+        ]
+        if url
+    }
+
+
+def extract_urls(text: str) -> list[str]:
+    return [match.rstrip(".,;:!?)\"'") for match in re.findall(r"https?://\S+", text or "")]
+
+
+def validate_agent_reply(reply: str, system_prompt: str) -> str:
+    cleaned = (reply or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=502, detail="Empty AI reply")
+    if len(cleaned) > 2000:
+        raise HTTPException(status_code=502, detail="AI reply is too long")
+    allowed_urls = allowed_reply_urls(system_prompt)
+    unexpected_urls = [
+        url for url in extract_urls(cleaned)
+        if url.rstrip("/") not in allowed_urls
+    ]
+    if unexpected_urls:
+        raise HTTPException(status_code=502, detail="AI reply contains an unauthorized URL")
+    return cleaned
+
+
+def has_processed_transport_message(history: list, transport_metadata: Optional[dict]) -> bool:
+    message_id = (transport_metadata or {}).get("message_id")
+    if not message_id:
+        return False
+    return any(
+        ((message.get("transport_metadata") or {}).get("message_id") == message_id)
+        for message in history
+        if message.get("role") == "user"
+    )
+
+
+def mark_last_auto_assistant_sent(history: list, sent: bool, send_result: Optional[dict] = None) -> list:
+    updated_history = []
+    patched = False
+    for message in reversed(history):
+        if not patched and message.get("role") == "assistant" and message.get("source") == "inbound_auto":
+            updated = dict(message)
+            updated["sent"] = sent
+            if send_result is not None:
+                updated["send_status_code"] = send_result.get("status_code")
+            updated_history.insert(0, updated)
+            patched = True
+        else:
+            updated_history.insert(0, message)
+    return updated_history
+
+
 async def generate_follow_up_message(conversation: dict, stage: str) -> str:
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
@@ -570,7 +864,7 @@ async def generate_follow_up_message(conversation: dict, stage: str) -> str:
         "j10": "relance assistee J+10",
     }
     stage_label = stage_labels.get(stage, stage)
-    active_prompt = await get_active_prompt()
+    active_prompt = await get_active_prompt(conversation.get("user_id"))
     context = format_conversations_for_analysis([conversation], active_prompt)
     user_message = (
         f"Stage de relance : {stage_label}\n"
@@ -589,7 +883,7 @@ async def generate_follow_up_message(conversation: dict, stage: str) -> str:
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
 
-    return reply.strip()
+    return validate_agent_reply(reply, active_prompt)
 
 
 def format_conversations_for_analysis(conversations: list, system_prompt: str) -> str:
@@ -616,9 +910,9 @@ def format_conversations_for_analysis(conversations: list, system_prompt: str) -
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
 class WebhookPayload(BaseModel):
-    username: str
-    message: str
-    subscriber_id: str
+    username: str = Field(max_length=200)
+    message: str = Field(max_length=4000)
+    subscriber_id: str = Field(max_length=200)
 
 
 class AgentControlPayload(BaseModel):
@@ -668,6 +962,47 @@ class AgentProfilePayload(BaseModel):
     forbidden_phrases: str = ""
 
 
+class TrainingProfilePayload(BaseModel):
+    business_name: str = Field(default="", max_length=300)
+    coach_name: str = Field(default="", max_length=300)
+    niche: str = Field(default="", max_length=1000)
+    offer_name: str = Field(default="", max_length=300)
+    offer_promise: str = Field(default="", max_length=2000)
+    offer_format: str = Field(default="", max_length=2000)
+    price: str = Field(default="", max_length=1000)
+    proof_points: list[str] = Field(default_factory=list)
+    tone_rules: list[str] = Field(default_factory=list)
+    forbidden_phrases: list[str] = Field(default_factory=list)
+    calendly_url: str = Field(default="", max_length=1000)
+    sales_page_url: str = Field(default="", max_length=1000)
+    raw_notes: str = Field(default="", max_length=8000)
+
+
+class AvatarGeneratePayload(BaseModel):
+    client_ideal: str = Field(default="", max_length=2000)
+    main_problem: str = Field(default="", max_length=2000)
+    current_block: str = Field(default="", max_length=2000)
+    fears: str = Field(default="", max_length=2000)
+    tried_before: str = Field(default="", max_length=2000)
+    buying_hesitations: str = Field(default="", max_length=2000)
+    desired_outcome: str = Field(default="", max_length=2000)
+    bad_fit: str = Field(default="", max_length=2000)
+
+
+class AvatarSavePayload(BaseModel):
+    source_inputs: AvatarGeneratePayload = Field(default_factory=AvatarGeneratePayload)
+    avatar: dict
+
+
+class SalesRulesGeneratePayload(BaseModel):
+    avatar: Optional[dict] = None
+    profile: Optional[dict] = None
+
+
+class SalesRulesSavePayload(BaseModel):
+    rules: dict
+
+
 class FollowUpPreviewPayload(BaseModel):
     conversation_id: str
     stage: str
@@ -682,8 +1017,8 @@ class AutomationModePayload(BaseModel):
 
 
 class RefineMessagePayload(BaseModel):
-    instruction: str
-    original_message: str
+    instruction: str = Field(max_length=1000)
+    original_message: str = Field(default="", max_length=4000)
 
 
 class PlaygroundPayload(BaseModel):
@@ -715,7 +1050,18 @@ async def handle_inbound_message(
         )
 
     history = contact.get("history") or []
-    user_message = {"role": "user", "content": message, "timestamp": received_at, "channel": channel}
+    if has_processed_transport_message(history, transport_metadata):
+        print(f"[inbound] DUPLICATE channel={channel} external_id={external_contact_id}")
+        return {"reply": "", "sent": False, "skipped": True, "reason": "duplicate_message"}
+
+    user_message = {
+        "role": "user",
+        "content": message,
+        "timestamp": received_at,
+        "channel": channel,
+    }
+    if transport_metadata:
+        user_message["transport_metadata"] = transport_metadata
     messages = history + [user_message]
     if len(messages) > MAX_HISTORY_TURNS * 2:
         messages = messages[-(MAX_HISTORY_TURNS * 2):]
@@ -748,7 +1094,7 @@ async def handle_inbound_message(
         print(f"[inbound] DISABLED channel={channel} external_id={external_contact_id}")
         return {"reply": "", "sent": False, "skipped": True, "reason": "automation_disabled"}
 
-    system_prompt = await get_active_prompt()
+    system_prompt = await get_active_prompt(contact.get("user_id"))
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
     if not contact.get("agent_active"):
@@ -779,6 +1125,7 @@ async def handle_inbound_message(
         reply = generate_claude_reply(strip_message_metadata(messages_for_generation), system_prompt)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+    reply = validate_agent_reply(reply, system_prompt)
 
     if "[STOP_AGENT]" in reply:
         reply = reply.replace("[STOP_AGENT]", "").strip()
@@ -794,8 +1141,9 @@ async def handle_inbound_message(
         "content": reply,
         "timestamp": now_iso(),
         "channel": channel,
-        "sent": sent,
+        "sent": False if automation_mode == "auto" else sent,
         "ignored": False,
+        "source": "inbound_auto" if sent else "inbound_supervised",
     }
     new_history = messages + [assistant_entry]
     if len(new_history) > MAX_HISTORY_TURNS * 2:
@@ -813,21 +1161,46 @@ async def handle_inbound_message(
         patch_data["pending_message"] = None
         patch_data["pending_message_at"] = None
 
-    send_result = None
     if automation_mode == "auto":
-        send_result = await send_channel_message(contact, reply)
-        if send_result["status_code"] >= 400:
-            raise HTTPException(status_code=502, detail=f"{channel} send error: {send_result['body']}")
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{contact.get('id')}"},
+                json=patch_data,
+                timeout=10.0,
+            )
+            res.raise_for_status()
 
-    async with httpx.AsyncClient() as http:
-        res = await http.patch(
-            SUPABASE_CONVERSATIONS_URL,
-            headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"id": f"eq.{contact.get('id')}"},
-            json=patch_data,
-            timeout=10.0,
-        )
-        res.raise_for_status()
+        send_result = await send_channel_message(contact, reply)
+        sent_history = mark_last_auto_assistant_sent(new_history, send_result["status_code"] < 400, send_result)
+        followup_patch = {
+            "history": sent_history,
+            "pending_message": None if send_result["status_code"] < 400 else reply,
+            "pending_message_at": None if send_result["status_code"] < 400 else now_iso(),
+        }
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{contact.get('id')}"},
+                json=followup_patch,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        if send_result["status_code"] >= 400:
+            raise HTTPException(status_code=502, detail=f"{channel} send error")
+    else:
+        send_result = None
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{contact.get('id')}"},
+                json=patch_data,
+                timeout=10.0,
+            )
+            res.raise_for_status()
 
     print(f"[inbound] REPLY channel={channel} external_id={external_contact_id} mode={automation_mode}")
     return {
@@ -900,6 +1273,9 @@ async def whatsapp_webhook(
                 wa_id = message_item.get("from")
                 text = ((message_item.get("text") or {}).get("body") or "").strip()
                 if not wa_id or not text:
+                    continue
+                if len(text) > 4000:
+                    print(f"[whatsapp] ignored oversized message from={wa_id} len={len(text)}")
                     continue
                 contact = contacts.get(wa_id) or {}
                 profile = contact.get("profile") or {}
@@ -1001,6 +1377,7 @@ async def debug_whatsapp_conversations(
             params={
                 "channel": "eq.whatsapp",
                 "external_contact_id": f"eq.{external_contact_id}",
+                "user_id": f"eq.{user_id}",
                 "select": "id,created_at,user_id,username,display_name,message,status,agent_active,automation_mode,pending_message,pending_message_at,last_inbound_at,history",
                 "order": "created_at.desc",
             },
@@ -1216,7 +1593,20 @@ async def refine_pending(
 
     history = conversation.get("history") or []
     display_name = conversation.get("display_name") or conversation.get("username", "le prospect")
-    active_prompt = await get_active_prompt()
+    active_prompt = await get_active_prompt(user_id)
+    original_message = (conversation.get("pending_message") or "").strip()
+    if not original_message:
+        for msg in reversed(history):
+            if msg.get("role") == "assistant" and not msg.get("sent") and not msg.get("ignored"):
+                original_message = (msg.get("content") or "").strip()
+                break
+    if not original_message:
+        raise HTTPException(status_code=409, detail="No pending message to refine")
+    instruction = payload.instruction.strip()
+    if not instruction:
+        raise HTTPException(status_code=400, detail="Refinement instruction is required")
+    if len(instruction) > 1000:
+        raise HTTPException(status_code=413, detail="Refinement instruction is too long")
 
     history_text = "\n".join([
         f"{'Prospect' if m.get('role') == 'user' else 'Angelos'} : {m.get('content', '')}"
@@ -1226,11 +1616,11 @@ async def refine_pending(
     refine_prompt = (
         f"Tu es Angelos, l'agent setter Instagram de TrainToRehab.\n"
         f"Tu as généré ce message pour le prospect @{display_name} :\n"
-        f"<message_original>\n{payload.original_message}\n</message_original>\n\n"
+        f"<message_original>\n{original_message}\n</message_original>\n\n"
         f"Voici le contexte récent de la conversation :\n"
         f"<historique>\n{history_text}\n</historique>\n\n"
         f"Thomas te demande d'affiner le message avec cette instruction :\n"
-        f"<instruction>\n{payload.instruction}\n</instruction>\n\n"
+        f"<instruction>\n{instruction}\n</instruction>\n\n"
         f"Réécris uniquement le message affiné, sans explication, sans guillemets, "
         f"sans introduction. Juste le message final tel qu'il sera envoyé."
     )
@@ -1243,17 +1633,17 @@ async def refine_pending(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
 
-    refined = refined.strip()
+    refined = validate_agent_reply(refined, active_prompt)
 
     updated_history = []
     patched = False
     for msg in reversed(history):
         if not patched and msg.get("role") == "assistant" and not msg.get("sent") and not msg.get("ignored"):
             updated_msg = dict(msg)
-            updated_msg["generated_content"] = payload.original_message
+            updated_msg["generated_content"] = original_message
             updated_msg["content"] = refined
             updated_msg["edited"] = True
-            updated_msg["refinement_instruction"] = payload.instruction
+            updated_msg["refinement_instruction"] = instruction
             updated_history.insert(0, updated_msg)
             patched = True
         else:
@@ -1275,7 +1665,7 @@ async def refine_pending(
         )
         res.raise_for_status()
 
-    print(f"[refine-pending] conversation_id={conversation_id} instruction={payload.instruction!r}")
+    print(f"[refine-pending] conversation_id={conversation_id} instruction_len={len(instruction)}")
     return {"refined_message": refined}
 
 
@@ -1468,7 +1858,7 @@ async def playground(
 
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
-    system_prompt = await get_active_prompt()
+    system_prompt = await get_active_prompt(user_id)
     if payload.calendly_url or payload.sales_page_url:
         system_prompt = append_agent_options(
             system_prompt,
@@ -1525,7 +1915,7 @@ async def run_feedback_loop(
         raise HTTPException(status_code=422, detail="Pas assez de conversations engagées pour l'analyse.")
 
     # 2. Récupérer le prompt actif
-    system_prompt = await get_active_prompt()
+    system_prompt = await get_active_prompt(user_id)
 
     # 3. Formater les conversations et appeler Claude
     user_message = format_conversations_for_analysis(convs, system_prompt)
@@ -1562,6 +1952,7 @@ async def run_feedback_loop(
     date_range_end = convs[0].get("created_at") if convs else None
 
     insight_data = {
+        **row_owner_fields(user_id),
         "conversations_analyzed": len(convs),
         "date_range_start": date_range_start,
         "date_range_end": date_range_end,
@@ -1605,7 +1996,7 @@ async def preview_prompt(
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
 
-    prompt_actif = await get_active_prompt()
+    prompt_actif = await get_active_prompt(user_id)
 
     def fmt(items: list[str], label: str) -> str:
         if not items:
@@ -1658,6 +2049,7 @@ async def apply_prompt(
 ):
     """Applique un prompt déjà construit par /preview-prompt."""
 
+    await require_owned_insight(payload.insight_id, user_id)
 
     # 1. Désactiver tous les prompts actifs
     try:
@@ -1665,7 +2057,7 @@ async def apply_prompt(
             res = await http.patch(
                 SUPABASE_PROMPT_VERSIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"is_active": "eq.true"},
+                params={"is_active": "eq.true", **owner_scope(user_id)},
                 json={"is_active": False},
                 timeout=10.0,
             )
@@ -1680,6 +2072,7 @@ async def apply_prompt(
                 SUPABASE_PROMPT_VERSIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=representation"},
                 json={
+                    **row_owner_fields(user_id),
                     "content": payload.prompt_proposed,
                     "is_active": True,
                     "source": "feedback-loop",
@@ -1699,7 +2092,7 @@ async def apply_prompt(
             res = await http.patch(
                 SUPABASE_INSIGHTS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"id": f"eq.{payload.insight_id}"},
+                params={"id": f"eq.{payload.insight_id}", **owner_scope(user_id)},
                 json={"status": "applied"},
                 timeout=10.0,
             )
@@ -1724,6 +2117,7 @@ async def get_prompt_versions(
                 params={
                     "order": "created_at.desc",
                     "select": "id,created_at,is_active,source,insight_id",
+                    **owner_scope(user_id),
                 },
                 timeout=10.0,
             )
@@ -1739,12 +2133,14 @@ async def restore_prompt_version(
     user_id: str = Depends(require_jwt),
 ):
 
+    await require_owned_prompt_version(version_id, user_id)
+
     try:
         async with httpx.AsyncClient() as http:
             res = await http.patch(
                 SUPABASE_PROMPT_VERSIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"is_active": "eq.true"},
+                params={"is_active": "eq.true", **owner_scope(user_id)},
                 json={"is_active": False},
                 timeout=10.0,
             )
@@ -1756,7 +2152,7 @@ async def restore_prompt_version(
             res = await http.patch(
                 SUPABASE_PROMPT_VERSIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"id": f"eq.{version_id}"},
+                params={"id": f"eq.{version_id}", **owner_scope(user_id)},
                 json={"is_active": True},
                 timeout=10.0,
             )
@@ -1772,7 +2168,7 @@ async def get_agent_links(
     user_id: str = Depends(require_jwt),
 ):
 
-    prompt = await get_active_prompt()
+    prompt = await get_active_prompt(user_id)
     return extract_agent_links(prompt)
 
 
@@ -1782,7 +2178,7 @@ async def update_agent_links(
     user_id: str = Depends(require_jwt),
 ):
 
-    prompt = await get_active_prompt()
+    prompt = await get_active_prompt(user_id)
     next_prompt = append_agent_options(
         prompt,
         calendly_url=payload.calendly_url.strip(),
@@ -1794,7 +2190,7 @@ async def update_agent_links(
             res = await http.patch(
                 SUPABASE_PROMPT_VERSIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"is_active": "eq.true"},
+                params={"is_active": "eq.true", **owner_scope(user_id)},
                 json={"is_active": False},
                 timeout=10.0,
             )
@@ -1808,6 +2204,7 @@ async def update_agent_links(
                 SUPABASE_PROMPT_VERSIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=representation"},
                 json={
+                    **row_owner_fields(user_id),
                     "content": next_prompt,
                     "is_active": True,
                     "source": "agent-options",
@@ -1829,7 +2226,7 @@ async def update_agent_links(
 async def get_agent_profile(
     user_id: str = Depends(require_jwt),
 ):
-    prompt = await get_active_prompt()
+    prompt = await get_active_prompt(user_id)
     return extract_agent_profile(prompt)
 
 
@@ -1838,7 +2235,7 @@ async def update_agent_profile(
     payload: AgentProfilePayload,
     user_id: str = Depends(require_jwt),
 ):
-    prompt = await get_active_prompt()
+    prompt = await get_active_prompt(user_id)
     next_prompt = append_agent_profile(prompt, payload.model_dump())
 
     try:
@@ -1846,7 +2243,7 @@ async def update_agent_profile(
             res = await http.patch(
                 SUPABASE_PROMPT_VERSIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"is_active": "eq.true"},
+                params={"is_active": "eq.true", **owner_scope(user_id)},
                 json={"is_active": False},
                 timeout=10.0,
             )
@@ -1860,6 +2257,7 @@ async def update_agent_profile(
                 SUPABASE_PROMPT_VERSIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=representation"},
                 json={
+                    **row_owner_fields(user_id),
                     "content": next_prompt,
                     "is_active": True,
                     "source": "agent-profile",
@@ -1877,6 +2275,234 @@ async def update_agent_profile(
     return {"success": True, "prompt_version_id": new_version.get("id")}
 
 
+# ── Training Center endpoints ─────────────────────────────────────────────────
+
+@app.get("/agent/training-center")
+async def get_training_center(
+    user_id: str = Depends(require_jwt),
+):
+    try:
+        profile = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id)
+        avatar = await get_user_singleton_row(SUPABASE_AGENT_AVATARS_URL, user_id)
+        sales_rules = await get_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
+
+    checklist = {
+        "business_setup": bool(profile and profile.get("profile")),
+        "avatar_client": bool(avatar and avatar.get("avatar")),
+        "regles_dm": bool(sales_rules and sales_rules.get("rules")),
+        "test_conversation": False,
+    }
+    completed = sum(1 for value in checklist.values() if value)
+    return {
+        "profile": profile,
+        "avatar": avatar,
+        "sales_rules": sales_rules,
+        "checklist": checklist,
+        "progress_score": round((completed / len(checklist)) * 100),
+    }
+
+
+@app.post("/agent/profile/save")
+async def save_training_profile(
+    payload: TrainingProfilePayload,
+    user_id: str = Depends(require_jwt),
+):
+    profile = clean_json_value(payload.model_dump())
+    try:
+        row = await upsert_user_singleton_row(
+            SUPABASE_AGENT_PROFILES_URL,
+            user_id,
+            {"profile": profile},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase upsert error: {e}")
+    return {"success": True, "profile": row}
+
+
+@app.post("/agent/avatar/generate")
+async def generate_agent_avatar(
+    payload: AvatarGeneratePayload,
+    user_id: str = Depends(require_jwt),
+):
+    if client is None:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+
+    system = (
+        "Tu es un strategist CRM et sales enablement pour un setter Instagram. "
+        "Transforme les reponses brutes en avatar client exploitable par un agent IA. "
+        "Retourne uniquement un JSON valide, sans markdown."
+    )
+    user_message = (
+        "Reponses utilisateur :\n"
+        f"{json.dumps(payload.model_dump(), ensure_ascii=False, indent=2)}\n\n"
+        "Genere exactement cette structure JSON :\n"
+        "{\n"
+        '  "persona_summary": "",\n'
+        '  "current_situation": "",\n'
+        '  "desired_situation": "",\n'
+        '  "pain_points": [],\n'
+        '  "fears": [],\n'
+        '  "frustrations": [],\n'
+        '  "objections": [],\n'
+        '  "buying_triggers": [],\n'
+        '  "dream_outcomes": [],\n'
+        '  "exact_words": [],\n'
+        '  "bad_fit": [],\n'
+        '  "confidence_score": 0\n'
+        "}\n"
+        "confidence_score est un entier de 0 a 100 selon la precision des inputs."
+    )
+    try:
+        raw = generate_claude_reply([{"role": "user", "content": user_message}], system)
+        avatar = clean_json_value(parse_llm_json(raw))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Avatar generation error: {e}")
+
+    return {"avatar": avatar}
+
+
+@app.post("/agent/avatar/save")
+async def save_agent_avatar(
+    payload: AvatarSavePayload,
+    user_id: str = Depends(require_jwt),
+):
+    try:
+        row = await upsert_user_singleton_row(
+            SUPABASE_AGENT_AVATARS_URL,
+            user_id,
+            {
+                "source_inputs": clean_json_value(payload.source_inputs.model_dump()),
+                "avatar": clean_json_value(payload.avatar),
+            },
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase upsert error: {e}")
+    return {"success": True, "avatar": row}
+
+
+@app.post("/agent/sales-rules/generate")
+async def generate_agent_sales_rules(
+    payload: SalesRulesGeneratePayload = SalesRulesGeneratePayload(),
+    user_id: str = Depends(require_jwt),
+):
+    if client is None:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+
+    try:
+        profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id)
+        avatar_row = await get_user_singleton_row(SUPABASE_AGENT_AVATARS_URL, user_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
+
+    profile = payload.profile or (profile_row or {}).get("profile") or {}
+    avatar = payload.avatar or (avatar_row or {}).get("avatar") or {}
+    if not profile or not avatar:
+        raise HTTPException(status_code=422, detail="Business profile and avatar are required")
+
+    system = (
+        "Tu es un expert en qualification DM Instagram pour coachs et infopreneurs. "
+        "Cree des regles simples, operationnelles et non agressives pour un agent setter IA. "
+        "Retourne uniquement un JSON valide, sans markdown."
+    )
+    user_message = (
+        "Profil business :\n"
+        f"{json.dumps(profile, ensure_ascii=False, indent=2)}\n\n"
+        "Avatar client :\n"
+        f"{json.dumps(avatar, ensure_ascii=False, indent=2)}\n\n"
+        "Genere exactement cette structure JSON :\n"
+        "{\n"
+        '  "qualification_questions": [],\n'
+        '  "buying_signals": [],\n'
+        '  "call_offer_conditions": [],\n'
+        '  "red_flags": [],\n'
+        '  "stop_conditions": [],\n'
+        '  "objection_responses": [],\n'
+        '  "follow_up_rules": [],\n'
+        '  "do_not_say": [],\n'
+        '  "escalation_rules": []\n'
+        "}\n"
+        "Chaque liste doit contenir des phrases concretes et courtes."
+    )
+    try:
+        raw = generate_claude_reply([{"role": "user", "content": user_message}], system)
+        rules = clean_json_value(parse_llm_json(raw))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Sales rules generation error: {e}")
+
+    return {"rules": rules}
+
+
+@app.post("/agent/sales-rules/save")
+async def save_agent_sales_rules(
+    payload: SalesRulesSavePayload,
+    user_id: str = Depends(require_jwt),
+):
+    try:
+        row = await upsert_user_singleton_row(
+            SUPABASE_AGENT_SALES_RULES_URL,
+            user_id,
+            {"rules": clean_json_value(payload.rules)},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase upsert error: {e}")
+    return {"success": True, "sales_rules": row}
+
+
+@app.post("/agent/prompt/rebuild")
+async def rebuild_agent_prompt_from_training_center(
+    user_id: str = Depends(require_jwt),
+):
+    try:
+        profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id)
+        avatar_row = await get_user_singleton_row(SUPABASE_AGENT_AVATARS_URL, user_id)
+        sales_rules_row = await get_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
+
+    profile = (profile_row or {}).get("profile") or {}
+    avatar = (avatar_row or {}).get("avatar") or {}
+    sales_rules = (sales_rules_row or {}).get("rules") or {}
+    if not profile:
+        raise HTTPException(status_code=422, detail="Business profile is required")
+
+    active_prompt = await get_active_prompt(user_id)
+    next_prompt = build_training_center_prompt(active_prompt, profile, avatar, sales_rules)
+
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"is_active": "eq.true", **owner_scope(user_id)},
+                json={"is_active": False},
+                timeout=10.0,
+            )
+            res.raise_for_status()
+
+            res = await http.post(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=representation"},
+                json={
+                    **row_owner_fields(user_id),
+                    "content": next_prompt,
+                    "is_active": True,
+                    "source": "training-center",
+                    "insight_id": None,
+                },
+                timeout=10.0,
+            )
+            res.raise_for_status()
+            created = res.json()
+            new_version = created[0] if isinstance(created, list) else created
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase prompt rebuild error: {e}")
+
+    print(f"[training-center] prompt_version_id={new_version.get('id')}")
+    return {"success": True, "prompt_version_id": new_version.get("id")}
+
+
 @app.get("/insights")
 async def get_insights(
     user_id: str = Depends(require_jwt),
@@ -1891,6 +2517,7 @@ async def get_insights(
                 params={
                     "order": "created_at.desc",
                     "select": "id,created_at,conversations_analyzed,status,pain_points,objections,business_suggestions,prompt_diff,prompt_proposed",
+                    **owner_scope(user_id),
                 },
                 timeout=10.0,
             )
@@ -1912,7 +2539,7 @@ async def ignore_insight(
             res = await http.patch(
                 SUPABASE_INSIGHTS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"id": f"eq.{insight_id}"},
+                params={"id": f"eq.{insight_id}", **owner_scope(user_id)},
                 json={"status": "ignored"},
                 timeout=10.0,
             )
