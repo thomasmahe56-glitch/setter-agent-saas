@@ -24,6 +24,8 @@ class Config:
     niche_context: str
     supabase_jwt_secret: str
     owner_user_id: str
+    cors_allowed_origins: str
+    environment: str
 
 
 def load_config() -> Config:
@@ -48,4 +50,6 @@ def load_config() -> Config:
         niche_context=os.environ.get("NICHE_CONTEXT", ""),
         supabase_jwt_secret=os.environ.get("SUPABASE_JWT_SECRET", ""),
         owner_user_id=os.environ.get("OWNER_USER_ID", ""),
+        cors_allowed_origins=os.environ.get("CORS_ALLOWED_ORIGINS", ""),
+        environment=os.environ.get("ENVIRONMENT", "development"),
     )
