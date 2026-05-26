@@ -1,136 +1,118 @@
-# Setter Agent SaaS
+# Setter Agent SaaS — Angellos
 
-Agent setter Instagram et WhatsApp multi-client. Qualifie les prospects en DM et les oriente vers un appel ou une page de vente.
-
-Une instance Railway = un client. Tout le contexte métier est configuré via variables d'environnement.
+Agent setter Instagram et WhatsApp multi-client. Qualifie les 
+prospects en DM et les oriente vers un appel ou une page de vente.
 
 ---
 
-## Déploiement d'un nouveau client
+## Architecture
 
-### 1. Créer un projet Supabase
+**Une seule infrastructure, plusieurs clients.**
 
-1. Créer un compte sur [supabase.com](https://supabase.com)
-2. Créer un nouveau projet
-3. Dans **SQL Editor**, exécuter le script de création des tables (voir section Tables)
-4. Récupérer dans **Settings > API** :
-   - **Project URL** → `SUPABASE_URL` (ajouter `/rest/v1` à la fin)
-   - **service_role key** → `SUPABASE_KEY`
-
-### 2. Tables Supabase requises
-
-```sql
--- Conversations
-create table conversations (
-  id uuid default gen_random_uuid() primary key,
-  user_id uuid,
-  created_at timestamptz default now(),
-  username text not null,
-  channel text default 'instagram' check (channel in ('instagram', 'whatsapp')),
-  external_contact_id text not null,
-  phone_e164 text,
-  display_name text,
-  message text,
-  response text,
-  status text default 'nouveau',
-  agent_active boolean default true,
-  pending_opener boolean default false,
-  last_inbound_at timestamptz,
-  transport_metadata jsonb default '{}',
-  history jsonb default '[]'
-);
-
-create unique index conversations_user_channel_external_idx
-on conversations (user_id, channel, external_contact_id);
-
--- Insights (feedback loop)
-create table insights (
-  id uuid default gen_random_uuid() primary key,
-  created_at timestamptz default now(),
-  conversations_analyzed int,
-  date_range_start timestamptz,
-  date_range_end timestamptz,
-  pain_points jsonb,
-  objections jsonb,
-  converting_profiles jsonb,
-  drop_off_stages jsonb,
-  business_suggestions jsonb,
-  prompt_current text,
-  prompt_proposed text,
-  prompt_diff jsonb,
-  status text default 'pending'
-);
-
--- Versions de prompt
-create table prompt_versions (
-  id uuid default gen_random_uuid() primary key,
-  created_at timestamptz default now(),
-  content text not null,
-  is_active boolean default false,
-  source text,
-  insight_id uuid references insights(id)
-);
+```
+Railway (1 instance backend)
+    └── Supabase (1 base de données)
+            ├── Client A (user_id: uuid-a)
+            ├── Client B (user_id: uuid-b)
+            └── Client C (user_id: uuid-c)
 ```
 
-### 3. Créer un projet Railway
+Chaque client a son propre compte Supabase Auth. Toutes les tables 
+sont isolées par `user_id` via Row Level Security (RLS). Un client 
+ne voit jamais les données d'un autre.
 
-1. Aller sur [railway.app](https://railway.app)
-2. **New Project → Deploy from GitHub** (connecter ce repo)
-3. Dans **Variables**, ajouter toutes les variables du `.env.example`
+Tu n'as **pas** besoin de créer une instance Railway ou une base 
+Supabase par client. Tout tourne sur une seule infrastructure.
 
-**Générer les secrets :**
-```bash
-openssl rand -hex 32   # pour WEBHOOK_SECRET
-openssl rand -hex 32   # pour DASHBOARD_SECRET
-```
+---
 
-### 4. Configurer les variables d'environnement
+## Ajouter un nouveau client
 
-Copier `.env.example`, remplir toutes les valeurs et les coller dans Railway > Variables.
+### 1. Créer son compte dans Supabase Auth
 
-Le point clé : `NICHE_CONTEXT` définit l'avatar client et le positionnement du coach. Railway permet de coller du texte multi-ligne directement dans l'éditeur de variables.
+1. Ouvre ton projet Supabase → Authentication → Users
+2. Clique sur **Invite user** ou **Add user**
+3. Renseigne son email et un mot de passe temporaire
+4. Copie son `user_id` (UUID affiché dans la liste)
 
-**Exemple pour un coach running :**
-```
-POSITIONNEMENT :
-- Approche scientifique, long terme
-- Expert coach, pas vendeur
+### 2. Transmettre ses identifiants dashboard
 
-AVATAR CLIENT : Coureur régulier, souvent blessé ou limité, frustré de stagner.
+Envoie-lui :
+- L'URL de ton dashboard SaaS
+- Son email
+- Son mot de passe temporaire (il pourra le changer)
 
-SOURCES D'ENTRÉE :
-- "Analyse" → script qualification
-- Nouveau follower → script d'accueil
-```
+### 3. Il configure son Training Center
 
-### 5. Connecter ManyChat
+Une fois connecté, le client renseigne dans le dashboard :
 
-Dans ManyChat :
-1. Créer un flow qui appelle `POST /webhook` avec :
-   - Header `X-Webhook-Secret: {WEBHOOK_SECRET}`
-   - Body : `{"username": "{{first name}}", "message": "{{last input text}}", "subscriber_id": "{{subscriber id}}"}`
-2. Lire le champ `agent_response` dans la réponse pour envoyer le message
+- **Profil business** : nom, offre, prix, résultats, ton de voix
+- **Avatar client** : situation, problèmes, peurs, objections, 
+  mots exacts
+- **Règles DM** : questions de qualification, signaux d'achat, 
+  conditions d'arrêt
 
-Pour la relance automatique 23h :
-- Flow déclenché par automation ManyChat → `POST /follow-ups/manychat-auto-23h`
-- Body : `{"subscriber_id": "{{subscriber id}}"}`
+Ces données sont injectées automatiquement dans le prompt 
+d'Angellos pour ce client.
 
-### 6. Connecter WhatsApp Cloud API
+### 4. Connecter ManyChat
+
+Dans ManyChat, créer deux flows :
+
+**Flow principal (réponse aux messages) :**
+POST {RAILWAY_URL}/webhook
+Header : X-Webhook-Secret: {WEBHOOK_SECRET}
+Body :
+{
+  "username": "{{first name}}",
+  "message": "{{last input text}}",
+  "subscriber_id": "{{subscriber id}}"
+}
+Lire le champ `agent_response` dans la réponse pour envoyer 
+le message au prospect.
+
+**Flow relance H23 (automation ManyChat) :**
+POST {RAILWAY_URL}/follow-ups/manychat-auto-23h
+Header : Authorization: Bearer {TOKEN_SUPABASE_CLIENT}
+Body : { "subscriber_id": "{{subscriber id}}" }
+Mapper le champ `message` vers une variable ManyChat et ajouter 
+une condition `message is not empty` avant l'envoi.
+
+### 5. Connecter WhatsApp (optionnel)
 
 Dans Meta for Developers :
-1. Créer/configurer une app WhatsApp Business Platform.
-2. Renseigner le webhook callback : `GET/POST /webhooks/whatsapp`
-3. Verify token : valeur de `WHATSAPP_VERIFY_TOKEN`
-4. S'abonner aux événements `messages`
+1. Créer ou configurer une app WhatsApp Business Platform
+2. Webhook callback : GET /webhooks/whatsapp et 
+   POST /webhooks/whatsapp
+3. Verify token : valeur de WHATSAPP_VERIFY_TOKEN
+4. S'abonner aux événements messages
 
-Variables Railway à ajouter :
-- `WHATSAPP_ACCESS_TOKEN`
-- `WHATSAPP_PHONE_NUMBER_ID`
-- `WHATSAPP_VERIFY_TOKEN`
-- `META_APP_SECRET`
-- `GRAPH_API_VERSION` (optionnel, défaut `v23.0`)
+---
 
-Le mode `auto` envoie directement les réponses WhatsApp tant que la fenêtre de service 24h est ouverte. Les relances J+3/J+10 restent supervisées sauf ajout futur de templates WhatsApp approuvés.
+## Installation initiale (une seule fois)
+
+### 1. Créer le projet Supabase
+
+1. Créer un compte sur supabase.com
+2. Créer un nouveau projet
+3. Dans SQL Editor, exécuter les scripts dans cet ordre :
+   - Script de création des tables de base (voir section Tables)
+   - migrations/add_whatsapp_channel.sql
+   - migrations/add_automation_mode.sql
+   - migrations/add_training_center.sql
+4. Récupérer dans Settings > API :
+   - Project URL → SUPABASE_URL (ajouter /rest/v1 à la fin)
+   - service_role key → SUPABASE_KEY
+
+### 2. Créer le projet Railway
+
+1. Aller sur railway.app
+2. New Project → Deploy from GitHub (connecter ce repo)
+3. Dans Variables, ajouter toutes les variables du .env.example
+
+Générer les secrets :
+openssl rand -hex 32   # pour WEBHOOK_SECRET
+openssl rand -hex 32   # pour DASHBOARD_SECRET
 
 ---
 
@@ -138,25 +120,25 @@ Le mode `auto` envoie directement les réponses WhatsApp tant que la fenêtre de
 
 | Variable | Description | Obligatoire |
 |----------|-------------|-------------|
-| `SUPABASE_URL` | URL Supabase + `/rest/v1` | ✅ |
-| `SUPABASE_KEY` | Clé service Supabase | ✅ |
-| `ANTHROPIC_API_KEY` | Clé API Anthropic | ✅ |
-| `WEBHOOK_SECRET` | Secret pour l'endpoint `/webhook` | ✅ |
-| `OWNER_USER_ID` | UUID Supabase Auth du coach propriétaire de cette instance | ✅ |
-| `DASHBOARD_SECRET` | Ancien secret dashboard, conservé seulement si un outil local l'utilise encore | Optionnel |
-| `MANYCHAT_TOKEN` | Token API ManyChat | ✅ |
-| `WHATSAPP_ACCESS_TOKEN` | Token Cloud API WhatsApp | Requis pour WhatsApp |
-| `WHATSAPP_PHONE_NUMBER_ID` | Phone Number ID Meta WhatsApp | Requis pour WhatsApp |
-| `WHATSAPP_VERIFY_TOKEN` | Token de vérification du webhook WhatsApp | Requis pour WhatsApp |
-| `META_APP_SECRET` | Secret app Meta pour valider `X-Hub-Signature-256` | Recommandé |
-| `GRAPH_API_VERSION` | Version Graph API, défaut `v23.0` | Optionnel |
-| `BUSINESS_NAME` | Nom du business | ✅ |
-| `COACH_NAME` | Prénom + nom du coach | ✅ |
-| `AGENT_NAME` | Nom de l'agent IA | ✅ |
-| `URL_PAGE` | URL de la page de vente | ✅ |
-| `URL_CALL` | URL Calendly (appel découverte) | ✅ |
-| `CONTACT_EMAIL` | Email pour partenariats | ✅ |
-| `NICHE_CONTEXT` | Avatar client + positionnement | Recommandé |
+| SUPABASE_URL | URL Supabase + /rest/v1 | ✅ |
+| SUPABASE_KEY | Clé service Supabase | ✅ |
+| ANTHROPIC_API_KEY | Clé API Anthropic | ✅ |
+| WEBHOOK_SECRET | Secret pour /webhook | ✅ |
+| OWNER_USER_ID | UUID Supabase Auth du fondateur | Recommandé |
+| DASHBOARD_SECRET | Secret legacy | Optionnel |
+| MANYCHAT_TOKEN | Token API ManyChat | ✅ |
+| WHATSAPP_ACCESS_TOKEN | Token Cloud API WhatsApp | Si WhatsApp |
+| WHATSAPP_PHONE_NUMBER_ID | Phone Number ID Meta | Si WhatsApp |
+| WHATSAPP_VERIFY_TOKEN | Token vérification webhook | Si WhatsApp |
+| META_APP_SECRET | Secret app Meta | Recommandé |
+| GRAPH_API_VERSION | Version Graph API (défaut v23.0) | Optionnel |
+| BUSINESS_NAME | Nom du business (fallback) | ✅ |
+| COACH_NAME | Prénom + nom du coach (fallback) | ✅ |
+| AGENT_NAME | Nom de l'agent IA | ✅ |
+| URL_PAGE | URL page de vente (fallback) | ✅ |
+| URL_CALL | URL Calendly (fallback) | ✅ |
+| CONTACT_EMAIL | Email pour partenariats | ✅ |
+| NICHE_CONTEXT | Contexte métier injecté (fallback) | Recommandé |
 
 ---
 
@@ -164,17 +146,57 @@ Le mode `auto` envoie directement les réponses WhatsApp tant que la fenêtre de
 
 | Méthode | Endpoint | Description |
 |---------|----------|-------------|
-| `POST` | `/webhook` | Reçoit un message ManyChat, génère et envoie la réponse |
-| `GET` | `/webhooks/whatsapp` | Vérification webhook Meta WhatsApp |
-| `POST` | `/webhooks/whatsapp` | Reçoit les messages WhatsApp Cloud API |
-| `GET` | `/conversations` | Liste toutes les conversations |
-| `POST` | `/activate` | Active l'agent pour un contact |
-| `POST` | `/deactivate` | Désactive l'agent pour un contact |
-| `GET` | `/follow-ups/due` | Relances en attente |
-| `POST` | `/follow-ups/preview` | Prévisualise une relance IA |
-| `POST` | `/feedback-loop` | Analyse les conversations et propose une amélioration du prompt |
-| `POST` | `/playground` | Teste le prompt en mode sandbox |
+| POST | /webhook | Message ManyChat → réponse agent |
+| GET | /webhooks/whatsapp | Vérification webhook Meta |
+| POST | /webhooks/whatsapp | Messages WhatsApp Cloud API |
+| GET | /conversations | Liste conversations du client |
+| GET | /conversations/summary | Liste légère sans historique |
+| GET | /conversations/{id} | Détail complet |
+| POST | /activate | Active l'agent pour un contact |
+| POST | /deactivate | Désactive l'agent |
+| GET | /follow-ups/due | Relances en attente |
+| POST | /follow-ups/preview | Prévisualise une relance IA |
+| POST | /follow-ups/manychat-auto-23h | Relance H23 depuis ManyChat |
+| POST | /feedback-loop | Analyse et améliore le prompt |
+| POST | /playground | Test du prompt en sandbox |
+| GET | /agent/training-center | Profil complet du client |
+| POST | /agent/profile/save | Sauvegarde profil business |
+| POST | /agent/avatar/generate | Génère avatar client via IA |
+| POST | /agent/avatar/save | Sauvegarde avatar client |
+| POST | /agent/sales-rules/generate | Génère règles DM via IA |
+| POST | /agent/sales-rules/save | Sauvegarde règles DM |
+| POST | /agent/prompt/rebuild | Reconstruit le prompt actif |
 
-Les endpoints dashboard requièrent `Authorization: Bearer <access_token Supabase>`.
-Le token est validé via Supabase Auth, donc `SUPABASE_JWT_SECRET` n'est plus nécessaire.
-Si `OWNER_USER_ID` est configuré, seul cet utilisateur Supabase Auth peut accéder au dashboard de cette instance.
+Tous les endpoints dashboard requièrent :
+Authorization: Bearer <access_token Supabase>
+
+---
+
+## Modes de fonctionnement par conversation
+
+| Mode | Comportement |
+|------|-------------|
+| auto | Génère et envoie directement (fenêtre 24h uniquement) |
+| supervised | Génère et stocke dans pending_message |
+| disabled | Stocke les messages, ne génère rien |
+
+---
+
+## Relances automatiques
+
+| Stage | Déclenchement | Mode |
+|-------|--------------|------|
+| auto_23h | Entre 23h et 24h après dernier message | Auto ManyChat |
+| j3 | Entre 72h et 240h | Supervisé |
+| j10 | Après 240h | Supervisé |
+
+---
+
+## Stack technique
+
+- Backend : FastAPI + Python 3.11, déployé sur Railway
+- Base de données : Supabase (PostgreSQL + Auth + RLS)
+- IA : Anthropic Claude Sonnet (réponses) + Claude Opus (analyse)
+- Instagram : ManyChat webhook
+- WhatsApp : Meta Cloud API
+- Dashboard : Next.js déployé sur Vercel (setter-dashboard-saas)
