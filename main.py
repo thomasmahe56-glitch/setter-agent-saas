@@ -89,6 +89,8 @@ def supabase_headers() -> dict:
 
 async def require_secret(x_webhook_secret: Optional[str]) -> str:
     secret = (x_webhook_secret or "").strip()
+    print(f"[require_secret] received_secret_prefix={secret[:10]!r}")
+    print(f"[require_secret] supabase_url={SUPABASE_WEBHOOK_SECRETS_URL}")
     if not secret:
         raise HTTPException(status_code=401, detail="Missing webhook secret")
     async with httpx.AsyncClient() as http:
@@ -102,6 +104,8 @@ async def require_secret(x_webhook_secret: Optional[str]) -> str:
             },
             timeout=10.0,
         )
+    print(f"[require_secret] supabase_status={res.status_code}")
+    print(f"[require_secret] supabase_body={res.text}")
     if res.status_code >= 400:
         raise HTTPException(status_code=502, detail=f"Supabase webhook secret lookup error: {res.text[:200]}")
     rows = res.json()
