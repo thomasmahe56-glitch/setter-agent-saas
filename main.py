@@ -18,12 +18,12 @@ load_dotenv()
 config = load_config()
 
 ANTHROPIC_API_KEY = config.anthropic_api_key
-WEBHOOK_SECRET = config.webhook_secret
 DASHBOARD_SECRET = config.dashboard_secret
 SUPABASE_SERVICE_KEY = config.supabase_key
 SUPABASE_PROJECT_URL = config.supabase_url.replace("/rest/v1", "").rstrip("/")
 SUPABASE_AUTH_USER_URL = f"{SUPABASE_PROJECT_URL}/auth/v1/user"
 SUPABASE_CONVERSATIONS_URL = f"{config.supabase_url}/conversations"
+SUPABASE_WEBHOOK_SECRETS_URL = f"{config.supabase_url}/webhook_secrets"
 SUPABASE_INSIGHTS_URL = f"{config.supabase_url}/insights"
 SUPABASE_PROMPT_VERSIONS_URL = f"{config.supabase_url}/prompt_versions"
 SUPABASE_AGENT_PROFILES_URL = f"{config.supabase_url}/agent_profiles"
@@ -87,11 +87,28 @@ def supabase_headers() -> dict:
     }
 
 
-def require_secret(x_webhook_secret: Optional[str]) -> None:
-    if not WEBHOOK_SECRET:
-        raise HTTPException(status_code=500, detail="WEBHOOK_SECRET is not configured")
-    if not x_webhook_secret or not hmac.compare_digest(x_webhook_secret, WEBHOOK_SECRET):
+async def require_webhook_user_id(x_webhook_secret: Optional[str]) -> str:
+    secret = (x_webhook_secret or "").strip()
+    if not secret:
+        raise HTTPException(status_code=401, detail="Missing webhook secret")
+    async with httpx.AsyncClient() as http:
+        res = await http.get(
+            SUPABASE_WEBHOOK_SECRETS_URL,
+            headers={**supabase_headers(), "Accept": "application/json"},
+            params={
+                "secret": f"eq.{secret}",
+                "select": "user_id",
+                "limit": "1",
+            },
+            timeout=10.0,
+        )
+    if res.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Supabase webhook secret lookup error: {res.text[:200]}")
+    rows = res.json()
+    user_id = rows[0].get("user_id") if rows else None
+    if not user_id:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    return user_id
 
 
 def verify_meta_signature(body: bytes, x_hub_signature_256: Optional[str]) -> None:
@@ -109,13 +126,11 @@ def verify_meta_signature(body: bytes, x_hub_signature_256: Optional[str]) -> No
 
 
 def owner_scope(user_id: Optional[str] = None) -> dict:
-    effective_user_id = user_id or config.owner_user_id
-    return {"user_id": f"eq.{effective_user_id}"} if effective_user_id else {}
+    return {"user_id": f"eq.{user_id}"} if user_id else {}
 
 
 def row_owner_fields(user_id: Optional[str] = None) -> dict:
-    effective_user_id = user_id or config.owner_user_id
-    return {"user_id": effective_user_id} if effective_user_id else {}
+    return {"user_id": user_id} if user_id else {}
 
 
 def require_dashboard_secret(x_dashboard_secret: Optional[str]) -> None:
@@ -152,6 +167,8 @@ async def require_jwt(authorization: Optional[str] = Header(default=None)) -> st
     user_id = user.get("id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid Supabase session: no user id")
+    if config.owner_user_id and not hmac.compare_digest(user_id, config.owner_user_id):
+        raise HTTPException(status_code=403, detail="Forbidden dashboard user")
     return user_id
 
 
@@ -494,6 +511,8 @@ def build_follow_up_item(conversation: dict) -> Optional[dict]:
 
 async def get_active_prompt(user_id: Optional[str] = None) -> str:
     """Retourne le prompt actif depuis prompt_versions, ou le fallback hardcodé."""
+    if not user_id:
+        return build_system_prompt(config)
     try:
         async with httpx.AsyncClient() as http:
             params = {
@@ -512,23 +531,6 @@ async def get_active_prompt(user_id: Optional[str] = None) -> str:
             rows = res.json()
             if rows and rows[0].get("content"):
                 return rows[0]["content"]
-            effective_user_id = user_id or config.owner_user_id
-            if effective_user_id and config.owner_user_id and hmac.compare_digest(effective_user_id, config.owner_user_id):
-                res = await http.get(
-                    SUPABASE_PROMPT_VERSIONS_URL,
-                    headers={**supabase_headers(), "Accept": "application/json"},
-                    params={
-                        "is_active": "eq.true",
-                        "user_id": "is.null",
-                        "order": "created_at.desc",
-                        "limit": "1",
-                    },
-                    timeout=5.0,
-                )
-                res.raise_for_status()
-                rows = res.json()
-                if rows and rows[0].get("content"):
-                    return rows[0]["content"]
     except Exception as e:
         print(f"[get_active_prompt] fallback to hardcoded prompt: {e}")
     return build_system_prompt(config)
@@ -543,7 +545,8 @@ async def get_contact_by_external_id(
     channel: str = "instagram",
     user_id: Optional[str] = None,
 ) -> Optional[dict]:
-    effective_user_id = user_id or config.owner_user_id
+    if not user_id:
+        return None
     if channel == "instagram":
         params = {"username": f"eq.{external_contact_id}", "limit": 1}
     else:
@@ -552,8 +555,7 @@ async def get_contact_by_external_id(
             "external_contact_id": f"eq.{external_contact_id}",
             "limit": 1,
         }
-    if effective_user_id:
-        params["user_id"] = f"eq.{effective_user_id}"
+    params["user_id"] = f"eq.{user_id}"
     async with httpx.AsyncClient() as http:
         res = await http.get(
             SUPABASE_CONVERSATIONS_URL,
@@ -571,6 +573,7 @@ async def create_contact(
     message: str,
     channel: str,
     received_at: str,
+    user_id: str,
     phone_e164: Optional[str] = None,
     transport_metadata: Optional[dict] = None,
 ) -> dict:
@@ -586,9 +589,8 @@ async def create_contact(
         "phone_e164": phone_e164,
         "last_inbound_at": received_at,
         "transport_metadata": transport_metadata or {},
+        "user_id": user_id,
     }
-    if config.owner_user_id:
-        row["user_id"] = config.owner_user_id
     async with httpx.AsyncClient() as http:
         res = await http.post(
             SUPABASE_CONVERSATIONS_URL,
@@ -1029,11 +1031,12 @@ async def handle_inbound_message(
     external_contact_id: str,
     display_name: str,
     message: str,
+    user_id: str,
     phone_e164: Optional[str] = None,
     transport_metadata: Optional[dict] = None,
 ) -> dict:
     received_at = now_iso()
-    contact = await get_contact_by_external_id(external_contact_id, channel)
+    contact = await get_contact_by_external_id(external_contact_id, channel, user_id)
     if contact is None:
         contact = await create_contact(
             external_contact_id=external_contact_id,
@@ -1041,6 +1044,7 @@ async def handle_inbound_message(
             message=message,
             channel=channel,
             received_at=received_at,
+            user_id=user_id,
             phone_e164=phone_e164,
             transport_metadata=transport_metadata,
         )
@@ -1082,7 +1086,7 @@ async def handle_inbound_message(
             res = await http.patch(
                 SUPABASE_CONVERSATIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"id": f"eq.{contact.get('id')}"},
+                params={"id": f"eq.{contact.get('id')}", "user_id": f"eq.{user_id}"},
                 json=patch_data,
                 timeout=10.0,
             )
@@ -1098,7 +1102,7 @@ async def handle_inbound_message(
             res = await http.patch(
                 SUPABASE_CONVERSATIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"id": f"eq.{contact.get('id')}"},
+                params={"id": f"eq.{contact.get('id')}", "user_id": f"eq.{user_id}"},
                 json=patch_data,
                 timeout=10.0,
             )
@@ -1162,7 +1166,7 @@ async def handle_inbound_message(
             res = await http.patch(
                 SUPABASE_CONVERSATIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"id": f"eq.{contact.get('id')}"},
+                params={"id": f"eq.{contact.get('id')}", "user_id": f"eq.{user_id}"},
                 json=patch_data,
                 timeout=10.0,
             )
@@ -1179,7 +1183,7 @@ async def handle_inbound_message(
             res = await http.patch(
                 SUPABASE_CONVERSATIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"id": f"eq.{contact.get('id')}"},
+                params={"id": f"eq.{contact.get('id')}", "user_id": f"eq.{user_id}"},
                 json=followup_patch,
                 timeout=10.0,
             )
@@ -1192,7 +1196,7 @@ async def handle_inbound_message(
             res = await http.patch(
                 SUPABASE_CONVERSATIONS_URL,
                 headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"id": f"eq.{contact.get('id')}"},
+                params={"id": f"eq.{contact.get('id')}", "user_id": f"eq.{user_id}"},
                 json=patch_data,
                 timeout=10.0,
             )
@@ -1216,13 +1220,14 @@ async def webhook(
     payload: WebhookPayload,
     x_webhook_secret: Optional[str] = Header(default=None),
 ):
-    require_secret(x_webhook_secret)
+    user_id = await require_webhook_user_id(x_webhook_secret)
 
     result = await handle_inbound_message(
         channel="instagram",
         external_contact_id=payload.subscriber_id,
         display_name=payload.username,
         message=payload.message,
+        user_id=user_id,
         transport_metadata={"provider": "manychat"},
     )
     return {"agent_response": result["reply"] or "SKIP"}
@@ -1250,9 +1255,11 @@ async def verify_whatsapp_webhook(
 async def whatsapp_webhook(
     request: Request,
     x_hub_signature_256: Optional[str] = Header(default=None),
+    x_webhook_secret: Optional[str] = Header(default=None),
 ):
     body = await request.body()
     verify_meta_signature(body, x_hub_signature_256)
+    user_id = await require_webhook_user_id(x_webhook_secret)
     try:
         payload = json.loads(body.decode("utf-8"))
     except json.JSONDecodeError:
@@ -1280,6 +1287,7 @@ async def whatsapp_webhook(
                     external_contact_id=wa_id,
                     display_name=profile.get("name") or wa_id,
                     message=text,
+                    user_id=user_id,
                     phone_e164=wa_id,
                     transport_metadata={
                         "provider": "meta_whatsapp_cloud_api",
