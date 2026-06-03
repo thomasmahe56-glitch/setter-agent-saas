@@ -87,7 +87,7 @@ def supabase_headers() -> dict:
     }
 
 
-async def require_webhook_user_id(x_webhook_secret: Optional[str]) -> str:
+async def require_secret(x_webhook_secret: Optional[str]) -> str:
     secret = (x_webhook_secret or "").strip()
     if not secret:
         raise HTTPException(status_code=401, detail="Missing webhook secret")
@@ -109,6 +109,9 @@ async def require_webhook_user_id(x_webhook_secret: Optional[str]) -> str:
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
     return user_id
+
+
+require_webhook_user_id = require_secret
 
 
 def verify_meta_signature(body: bytes, x_hub_signature_256: Optional[str]) -> None:
@@ -1218,7 +1221,7 @@ async def webhook(
     payload: WebhookPayload,
     x_webhook_secret: Optional[str] = Header(default=None),
 ):
-    user_id = await require_webhook_user_id(x_webhook_secret)
+    user_id = await require_secret(x_webhook_secret)
 
     result = await handle_inbound_message(
         channel="instagram",
@@ -1257,7 +1260,7 @@ async def whatsapp_webhook(
 ):
     body = await request.body()
     verify_meta_signature(body, x_hub_signature_256)
-    user_id = await require_webhook_user_id(x_webhook_secret)
+    user_id = await require_secret(x_webhook_secret)
     try:
         payload = json.loads(body.decode("utf-8"))
     except json.JSONDecodeError:
