@@ -167,8 +167,6 @@ async def require_jwt(authorization: Optional[str] = Header(default=None)) -> st
     user_id = user.get("id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid Supabase session: no user id")
-    if config.owner_user_id and not hmac.compare_digest(user_id, config.owner_user_id):
-        raise HTTPException(status_code=403, detail="Forbidden dashboard user")
     return user_id
 
 
