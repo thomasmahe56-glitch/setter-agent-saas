@@ -8,6 +8,7 @@ from prompts import build_system_prompt, build_analysis_prompt, build_follow_up_
 import hmac
 import httpx
 import hashlib
+import difflib
 import json
 import os
 import re
@@ -298,6 +299,44 @@ def parse_llm_json(raw: str) -> dict:
     return parsed
 
 
+def build_prompt_diff(before: str, after: str) -> list[dict]:
+    diff = difflib.ndiff(before.splitlines(), after.splitlines())
+    visual_diff = []
+    for line in diff:
+        marker = line[:2]
+        text = line[2:]
+        if marker == "- ":
+            visual_diff.append({"type": "remove", "line": text})
+        elif marker == "+ ":
+            visual_diff.append({"type": "add", "line": text})
+        elif marker == "  " and visual_diff and len(visual_diff) < 120:
+            visual_diff.append({"type": "keep", "line": text})
+    return visual_diff[:160]
+
+
+def normalize_prompt_refinement_result(raw_result: dict, current_prompt: str) -> dict:
+    updated_prompt = (raw_result.get("updated_prompt") or raw_result.get("prompt_updated") or "").strip()
+    if not updated_prompt:
+        raise ValueError("Claude did not return updated_prompt")
+    if updated_prompt == current_prompt.strip():
+        raise ValueError("Claude returned the same prompt")
+    if len(updated_prompt) < max(200, int(len(current_prompt) * 0.4)):
+        raise ValueError("Claude returned a prompt that is suspiciously short")
+    return {
+        "updated_prompt": updated_prompt,
+        "target_section": str(raw_result.get("target_section") or "section ciblee").strip(),
+        "summary": str(raw_result.get("summary") or "").strip(),
+        "changes": raw_result.get("changes") if isinstance(raw_result.get("changes"), list) else [],
+    }
+
+
+def prompt_refinement_source(instruction: str) -> str:
+    clean_instruction = re.sub(r"\s+", " ", instruction).strip()
+    if len(clean_instruction) > 72:
+        clean_instruction = f"{clean_instruction[:69]}..."
+    return f"training-refine: {clean_instruction}"
+
+
 def format_training_center_for_prompt(profile: dict, avatar: dict, sales_rules: dict) -> str:
     parts = [
         "=== TRAINING CENTER ANGELOS ===",
@@ -539,6 +578,36 @@ async def get_active_prompt(user_id: Optional[str] = None) -> str:
     except Exception as e:
         print(f"[get_active_prompt] fallback to hardcoded prompt: {e}")
     return build_system_prompt(config)
+
+
+async def get_active_prompt_version(user_id: str) -> dict:
+    """Retourne la version active complete si elle existe, sinon un fallback non persiste."""
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.get(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params={
+                    "is_active": "eq.true",
+                    "order": "created_at.desc",
+                    "limit": "1",
+                    "select": "*",
+                    **owner_scope(user_id),
+                },
+                timeout=5.0,
+            )
+            res.raise_for_status()
+            rows = res.json()
+            if rows and rows[0].get("content"):
+                return rows[0]
+    except Exception as e:
+        print(f"[get_active_prompt_version] fallback to hardcoded prompt: {e}")
+    return {
+        "id": None,
+        "content": build_system_prompt(config),
+        "source": "fallback",
+        "is_active": True,
+    }
 
 
 async def get_contact(username: str, user_id: Optional[str] = None) -> Optional[dict]:
@@ -943,6 +1012,13 @@ class PreviewPromptPayload(BaseModel):
 class ApplyPromptPayload(BaseModel):
     insight_id: str
     prompt_proposed: str
+
+
+class RefinePromptPayload(BaseModel):
+    instruction: str = Field(max_length=1200)
+    active_prompt: Optional[str] = Field(default=None, max_length=120000)
+    prompt_proposed: Optional[str] = Field(default=None, max_length=120000)
+    apply: bool = False
 
 
 class AgentLinksPayload(BaseModel):
@@ -2113,6 +2189,141 @@ async def apply_prompt(
     return {"success": True, "prompt_version_id": new_version.get("id")}
 
 
+@app.post("/refine-prompt")
+async def refine_prompt(
+    payload: RefinePromptPayload,
+    user_id: str = Depends(require_jwt),
+):
+    """Affinage chirurgical du prompt actif depuis le Training Center."""
+
+    instruction = payload.instruction.strip()
+    if not instruction:
+        raise HTTPException(status_code=422, detail="Instruction is required")
+
+    active_version = await get_active_prompt_version(user_id)
+    current_prompt = active_version.get("content") or build_system_prompt(config)
+    if payload.active_prompt and not payload.apply:
+        current_prompt = payload.active_prompt.strip()
+
+    if payload.apply and payload.prompt_proposed:
+        try:
+            result = normalize_prompt_refinement_result(
+                {
+                    "updated_prompt": payload.prompt_proposed,
+                    "target_section": "Validation utilisateur",
+                    "summary": "Version previsualisee validee depuis le Training Center.",
+                    "changes": [],
+                },
+                current_prompt,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Invalid prompt_proposed: {e}")
+    else:
+        if client is None:
+            raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+        system = (
+            "Tu es un expert senior en prompt engineering pour un agent setter Instagram. "
+            "Tu dois modifier un prompt existant de facon chirurgicale. "
+            "Ne reecris jamais tout le prompt pour une instruction mineure. "
+            "Garde la structure, les balises techniques et les donnees metier intactes sauf si la modification cible cette section. "
+            "Retourne uniquement un JSON valide, sans markdown."
+        )
+        user_message = (
+            "Instruction utilisateur :\n"
+            f"{instruction}\n\n"
+            "Prompt actif :\n"
+            f"<prompt_actif>\n{current_prompt}\n</prompt_actif>\n\n"
+            "Analyse quelle section est concernee: ton, regles, questions de qualification, relances, prix, objections, liens, ou garde-fous.\n"
+            "Applique uniquement la modification minimale necessaire. Exemples attendus:\n"
+            '- "Il utilise trop d emojis" => ajoute/renforce une regle zero emoji dans la section ton.\n'
+            '- "Il pose deux questions dans le meme message" => renforce une question par message.\n'
+            '- "Il repond trop vite sur le prix" => ajoute une condition de qualification avant de parler des modalites.\n'
+            "Retourne exactement ce JSON :\n"
+            "{\n"
+            '  "updated_prompt": "<prompt complet apres modification minimale>",\n'
+            '  "target_section": "<section identifiee>",\n'
+            '  "summary": "<resume court de la modification>",\n'
+            '  "changes": ["<changement 1>", "<changement 2>"]\n'
+            "}\n"
+        )
+
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=8192,
+                system=system,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            raw = response.content[0].text.strip()
+            result = normalize_prompt_refinement_result(parse_llm_json(raw), current_prompt)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Prompt refinement error: {e}")
+
+    updated_prompt = result["updated_prompt"]
+    visual_diff = build_prompt_diff(current_prompt, updated_prompt)
+    response_payload = {
+        "success": True,
+        "applied": False,
+        "prompt_proposed": updated_prompt,
+        "updated_prompt": updated_prompt,
+        "diff": visual_diff,
+        "target_section": result["target_section"],
+        "summary": result["summary"],
+        "changes": result["changes"],
+        "instruction": instruction,
+        "reset_test_conversation": False,
+    }
+
+    if not payload.apply:
+        print(f"[refine-prompt:preview] instruction_len={len(instruction)} diff_lines={len(visual_diff)}")
+        return response_payload
+
+    applied_at = now_iso()
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"is_active": "eq.true", **owner_scope(user_id)},
+                json={"is_active": False},
+                timeout=10.0,
+            )
+            res.raise_for_status()
+
+            insert_payload = {
+                **row_owner_fields(user_id),
+                "content": updated_prompt,
+                "is_active": True,
+                "source": prompt_refinement_source(instruction),
+                "insight_id": None,
+                "refinement_instruction": instruction,
+                "refinement_applied_at": applied_at,
+                "previous_version_id": active_version.get("id"),
+                "prompt_diff": visual_diff,
+            }
+            res = await http.post(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=representation"},
+                json=insert_payload,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+            created = res.json()
+            new_version = created[0] if isinstance(created, list) else created
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase prompt refinement save error: {e}")
+
+    response_payload.update({
+        "applied": True,
+        "prompt_version_id": new_version.get("id"),
+        "previous_version_id": active_version.get("id"),
+        "refinement_applied_at": applied_at,
+        "reset_test_conversation": True,
+    })
+    print(f"[refine-prompt:apply] version_id={new_version.get('id')} instruction_len={len(instruction)}")
+    return response_payload
+
+
 @app.get("/prompt-versions")
 async def get_prompt_versions(
     user_id: str = Depends(require_jwt),
@@ -2125,7 +2336,7 @@ async def get_prompt_versions(
                 headers={**supabase_headers(), "Accept": "application/json"},
                 params={
                     "order": "created_at.desc",
-                    "select": "id,created_at,is_active,source,insight_id",
+                    "select": "id,created_at,is_active,source,insight_id,refinement_instruction,refinement_applied_at,previous_version_id",
                     **owner_scope(user_id),
                 },
                 timeout=10.0,
