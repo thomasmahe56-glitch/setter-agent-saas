@@ -1073,6 +1073,10 @@ class AvatarSavePayload(BaseModel):
     avatar: dict
 
 
+class AvatarDataPayload(BaseModel):
+    avatar: dict
+
+
 class SalesRulesGeneratePayload(BaseModel):
     avatar: Optional[dict] = None
     profile: Optional[dict] = None
@@ -2541,6 +2545,23 @@ async def save_training_profile(
     return {"success": True, "profile": row}
 
 
+@app.patch("/agent/profile")
+async def autosave_training_profile(
+    payload: TrainingProfilePayload,
+    user_id: str = Depends(require_jwt),
+):
+    profile = clean_json_value(payload.model_dump())
+    try:
+        row = await upsert_user_singleton_row(
+            SUPABASE_AGENT_PROFILES_URL,
+            user_id,
+            {"profile": profile},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase upsert error: {e}")
+    return {"success": True, "profile": row}
+
+
 @app.post("/agent/avatar/generate")
 async def generate_agent_avatar(
     payload: AvatarGeneratePayload,
@@ -2602,6 +2623,38 @@ async def save_agent_avatar(
     return {"success": True, "avatar": row}
 
 
+@app.patch("/agent/avatar/source-inputs")
+async def autosave_agent_avatar_source_inputs(
+    payload: AvatarGeneratePayload,
+    user_id: str = Depends(require_jwt),
+):
+    try:
+        row = await upsert_user_singleton_row(
+            SUPABASE_AGENT_AVATARS_URL,
+            user_id,
+            {"source_inputs": clean_json_value(payload.model_dump())},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase upsert error: {e}")
+    return {"success": True, "avatar": row}
+
+
+@app.patch("/agent/avatar")
+async def autosave_agent_avatar(
+    payload: AvatarDataPayload,
+    user_id: str = Depends(require_jwt),
+):
+    try:
+        row = await upsert_user_singleton_row(
+            SUPABASE_AGENT_AVATARS_URL,
+            user_id,
+            {"avatar": clean_json_value(payload.avatar)},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase upsert error: {e}")
+    return {"success": True, "avatar": row}
+
+
 @app.post("/agent/sales-rules/generate")
 async def generate_agent_sales_rules(
     payload: SalesRulesGeneratePayload = SalesRulesGeneratePayload(),
@@ -2656,6 +2709,22 @@ async def generate_agent_sales_rules(
 
 @app.post("/agent/sales-rules/save")
 async def save_agent_sales_rules(
+    payload: SalesRulesSavePayload,
+    user_id: str = Depends(require_jwt),
+):
+    try:
+        row = await upsert_user_singleton_row(
+            SUPABASE_AGENT_SALES_RULES_URL,
+            user_id,
+            {"rules": clean_json_value(payload.rules)},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase upsert error: {e}")
+    return {"success": True, "sales_rules": row}
+
+
+@app.patch("/agent/sales-rules")
+async def autosave_agent_sales_rules(
     payload: SalesRulesSavePayload,
     user_id: str = Depends(require_jwt),
 ):
