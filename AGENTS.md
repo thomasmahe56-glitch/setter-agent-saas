@@ -1,42 +1,42 @@
-## Feature : Automation Mode + Affiner avec Angelos
-Déployé le 19 mai 2026.
+## Feature: Automation Mode + Refine With Angelos
+Deployed on May 19, 2026.
 
 ### Automation Mode
-Chaque conversation a un champ `automation_mode` (TEXT, default 'supervised') :
-- `auto` : Angelos génère + envoie directement via ManyChat (fenêtre 24h active)
-- `supervised` : Angelos génère, stocke dans `pending_message`, Thomas envoie manuellement
-- `disabled` : message entrant stocké dans history, rien n'est généré
+Each conversation has an `automation_mode` field (TEXT, default 'supervised'):
+- `auto`: Angelos generates + sends directly through ManyChat (active 24h window)
+- `supervised`: Angelos generates, stores in `pending_message`, Thomas sends manually
+- `disabled`: incoming message is stored in history, nothing is generated
 
-Colonnes ajoutées en base (migration : migrations/add_automation_mode.sql) :
+Columns added in the database (migration: migrations/add_automation_mode.sql):
 - `automation_mode` TEXT DEFAULT 'supervised' CHECK (auto/supervised/disabled)
 - `pending_message` TEXT
 - `pending_message_at` TIMESTAMPTZ
 
-Endpoints ajoutés dans main.py :
-- PATCH /conversations/{id}/automation-mode → change le mode
-- POST /conversations/{id}/ignore-pending → vide pending_message, marque ignored=True dans history
-- POST /conversations/{id}/refine-pending → Angelos affine le message (voir ci-dessous)
+Endpoints added in main.py:
+- PATCH /conversations/{id}/automation-mode → changes the mode
+- POST /conversations/{id}/ignore-pending → clears pending_message, marks ignored=True in history
+- POST /conversations/{id}/refine-pending → Angelos refines the message (see below)
 
-Chaque message assistant dans le JSONB history a maintenant ces champs :
-- `sent` (bool) : True si envoyé via ManyChat, False si supervisé en attente
-- `ignored` (bool) : True si Thomas a ignoré le message
-- `edited` (bool) : True si affiné par Angelos sur instruction de Thomas
-- `generated_content` : version originale avant affinement
-- `refinement_instruction` : instruction donnée par Thomas à Angelos
+Each assistant message in the JSONB history now has these fields:
+- `sent` (bool): True if sent through ManyChat, False if supervised and pending
+- `ignored` (bool): True if Thomas ignored the message
+- `edited` (bool): True if refined by Angelos on Thomas's instruction
+- `generated_content`: original version before refinement
+- `refinement_instruction`: instruction given by Thomas to Angelos
 
-### Affiner avec Angelos
-Dans la bannière pending_message du dashboard, bouton "✨ Demander à Angelos d'affiner".
-Thomas tape une instruction en langage naturel ("Rends-le plus chaleureux", "Trop long, raccourcis"...).
-Angelos régénère en tenant compte des 10 derniers messages du prospect.
-Le pending_message est mis à jour immédiatement dans la bannière.
-Le message affiné est tracé dans history avec edited=True + refinement_instruction.
-→ Signal fort pour le feedback loop : compare generated_content vs content final.
+### Refine With Angelos
+In the dashboard pending_message banner, button "✨ Ask Angelos to refine".
+Thomas enters a natural-language instruction ("Make it warmer", "Too long, shorten it"...).
+Angelos regenerates while taking the prospect's last 10 messages into account.
+The pending_message is updated immediately in the banner.
+The refined message is traced in history with edited=True + refinement_instruction.
+→ Strong signal for the feedback loop: compare generated_content vs final content.
 
-### Contrainte Instagram 24h
-Le mode `auto` (envoi ManyChat direct) ne fonctionne que dans la fenêtre 24h active.
-Les relances (J+3, J+10) sont toujours en mode supervisé : Copier + lien ig.me/m/{display_name}.
+### Instagram 24h Constraint
+The `auto` mode (direct ManyChat send) only works inside the active 24h window.
+Follow-ups (D+3, D+10) are always supervised: Copy + ig.me/m/{display_name} link.
 
-### UI Dashboard
-- Sélecteur Auto / Supervisé / Off dans le header du ConversationPanel
-- Badge coloré dans ProspectList : vert (auto), orange (supervisé), gris (off)
-- Bannière pending : Copier, Ouvrir Instagram, Affiner avec Angelos, Ignorer
+### Dashboard UI
+- Auto / Supervised / Off selector in the ConversationPanel header
+- Colored badge in ProspectList: green (auto), orange (supervised), gray (off)
+- Pending banner: Copy, Open Instagram, Refine with Angelos, Ignore

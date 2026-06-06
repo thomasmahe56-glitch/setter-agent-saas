@@ -185,8 +185,8 @@ def extract_agent_links(prompt: str) -> dict:
         flags=re.DOTALL,
     )
     block = block_match.group(1) if block_match else ""
-    calendly_match = re.search(r"Lien Calendly\s*:\s*(\S+)", block)
-    sales_page_match = re.search(r"Lien page de vente\s*:\s*(\S+)", block)
+    calendly_match = re.search(r"(?:Calendly link|Lien Calendly)\s*:\s*(\S+)", block)
+    sales_page_match = re.search(r"(?:Sales page link|Lien page de vente)\s*:\s*(\S+)", block)
     return {
         "calendly_url": calendly_match.group(1).strip() if calendly_match else "",
         "sales_page_url": sales_page_match.group(1).strip() if sales_page_match else "",
@@ -261,7 +261,7 @@ def append_agent_profile(prompt: str, profile: dict) -> str:
     return (
         f"{prompt}\n\n{AGENT_PROFILE_START}\n{profile_json}\n{AGENT_PROFILE_END}\n\n"
         f"{AGENT_PROFILE_PROMPT_START}\n"
-        f"=== PROFIL BUSINESS ET VOIX D'ANGELOS ===\n{profile_prompt}\n"
+        f"=== ANGELOS BUSINESS PROFILE AND VOICE ===\n{profile_prompt}\n"
         f"{AGENT_PROFILE_PROMPT_END}"
     )
 
@@ -340,33 +340,33 @@ def prompt_refinement_source(instruction: str) -> str:
 def format_training_center_for_prompt(profile: dict, avatar: dict, sales_rules: dict) -> str:
     parts = [
         "=== TRAINING CENTER ANGELOS ===",
-        "Ces donnees structurees sont la source de verite metier. Applique-les avant les exemples generiques du prompt.",
+        "This structured data is the business source of truth. Apply it before generic prompt examples.",
     ]
     if profile:
         parts.extend([
             "",
-            "PROFIL BUSINESS STRUCTURE :",
+            "STRUCTURED BUSINESS PROFILE:",
             json.dumps(profile, ensure_ascii=False, indent=2),
         ])
     if avatar:
         parts.extend([
             "",
-            "AVATAR CLIENT STRUCTURE :",
+            "STRUCTURED CLIENT AVATAR:",
             json.dumps(avatar, ensure_ascii=False, indent=2),
         ])
     if sales_rules:
         parts.extend([
             "",
-            "REGLES DM STRUCTUREES :",
+            "STRUCTURED DM RULES:",
             json.dumps(sales_rules, ensure_ascii=False, indent=2),
         ])
     parts.extend([
         "",
-        "Priorites d'execution :",
-        "1. Respecter les stop_conditions, red_flags, bad_fit et do_not_say.",
-        "2. Qualifier avec les qualification_questions et detecter les buying_signals, sans interrogatoire.",
-        "3. Utiliser les exact_words et objections pour parler comme le prospect, sans copier mecaniquement.",
-        "4. Proposer appel ou page uniquement quand les call_offer_conditions sont reunies.",
+        "Execution priorities:",
+        "1. Respect stop_conditions, red_flags, bad_fit, and do_not_say.",
+        "2. Qualify with qualification_questions and detect buying_signals without interrogating.",
+        "3. Use exact_words and objections to speak like the prospect, without copying mechanically.",
+        "4. Offer a call or page only when call_offer_conditions are met.",
     ])
     return "\n".join(parts)
 
@@ -393,18 +393,18 @@ def build_training_center_prompt(base_prompt: str, profile: dict, avatar: dict, 
 
 def format_agent_profile_for_prompt(profile: dict) -> str:
     labels = {
-        "avatar_client": "Avatar client",
-        "offer": "Offre",
-        "price": "Prix et modalités",
-        "pain_points": "Douleurs et frustrations",
-        "goals": "Objectifs du prospect",
-        "objections": "Objections fréquentes",
-        "qualification_rules": "Questions et règles de qualification",
-        "sales_rules": "Règles commerciales",
-        "proof_points": "Preuves, résultats et cas clients",
-        "voice_samples": "Transcripts, posts ou exemples de voix du coach",
-        "tone_rules": "Style de voix à imiter",
-        "forbidden_phrases": "Mots ou formulations à éviter",
+        "avatar_client": "Client avatar",
+        "offer": "Offer",
+        "price": "Price and terms",
+        "pain_points": "Pain points and frustrations",
+        "goals": "Prospect goals",
+        "objections": "Frequent objections",
+        "qualification_rules": "Qualification questions and rules",
+        "sales_rules": "Sales rules",
+        "proof_points": "Proof points, results, and client cases",
+        "voice_samples": "Transcripts, posts, or examples of the coach's voice",
+        "tone_rules": "Voice style to mimic",
+        "forbidden_phrases": "Words or phrasing to avoid",
     }
     lines = []
     for key, label in labels.items():
@@ -412,9 +412,9 @@ def format_agent_profile_for_prompt(profile: dict) -> str:
         if value:
             lines.append(f"{label} :\n{value}")
     lines.append(
-        "Utilise ce contexte pour répondre comme le coach : précis, naturel, humain, "
-        "adapté à son offre et à son style. Ne récite pas ces informations ; transforme-les "
-        "en réponses courtes et utiles dans la conversation Instagram."
+        "Use this context to answer like the coach: precise, natural, human, "
+        "adapted to the offer and style. Do not recite this information; transform it "
+        "into short, useful answers in the Instagram conversation."
     )
     return "\n\n".join(lines)
 
@@ -426,11 +426,11 @@ def append_agent_options(prompt: str, calendly_url: str = "", sales_page_url: st
         "OPTIONS AGENT DASHBOARD :",
     ]
     if calendly_url:
-        lines.append(f"Lien Calendly : {calendly_url}")
+        lines.append(f"Calendly link: {calendly_url}")
     if sales_page_url:
-        lines.append(f"Lien page de vente : {sales_page_url}")
+        lines.append(f"Sales page link: {sales_page_url}")
     if calendly_url or sales_page_url:
-        lines.append("Ces liens remplacent les liens d'appel et de page de vente presents ailleurs dans le prompt.")
+        lines.append("These links replace call and sales page links present elsewhere in the prompt.")
     lines.append(AGENT_OPTIONS_END)
     return f"{prompt}\n\n" + "\n".join(lines)
 
@@ -554,7 +554,7 @@ def build_follow_up_item(conversation: dict) -> Optional[dict]:
 
 
 async def get_active_prompt(user_id: Optional[str] = None) -> str:
-    """Retourne le prompt actif depuis prompt_versions, ou le fallback hardcodé."""
+    """Return the active prompt from prompt_versions, or the hardcoded fallback."""
     if not user_id:
         return build_system_prompt(config)
     try:
@@ -581,7 +581,7 @@ async def get_active_prompt(user_id: Optional[str] = None) -> str:
 
 
 async def get_active_prompt_version(user_id: str) -> dict:
-    """Retourne la version active complete si elle existe, sinon un fallback non persiste."""
+    """Return the full active version if it exists, otherwise a non-persisted fallback."""
     try:
         async with httpx.AsyncClient() as http:
             res = await http.get(
@@ -931,20 +931,20 @@ async def generate_follow_up_message(conversation: dict, stage: str) -> str:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
 
     stage_labels = {
-        "auto_23h": "relance automatique a 23 heures",
-        "j3": "relance assistee J+3",
-        "j10": "relance assistee J+10",
+        "auto_23h": "automatic 23-hour follow-up",
+        "j3": "assisted D+3 follow-up",
+        "j10": "assisted D+10 follow-up",
     }
     stage_label = stage_labels.get(stage, stage)
     active_prompt = await get_active_prompt(conversation.get("user_id"))
     context = format_conversations_for_analysis([conversation], active_prompt)
     user_message = (
-        f"Stage de relance : {stage_label}\n"
-        f"Prospect : {conversation.get('display_name') or conversation.get('username')}\n"
-        f"Dernier message connu : {conversation.get('message', '')}\n\n"
-        f"Respecte le prompt actif comme cadre general, mais ecris uniquement une relance courte adaptee au stage.\n\n"
+        f"Follow-up stage: {stage_label}\n"
+        f"Prospect: {conversation.get('display_name') or conversation.get('username')}\n"
+        f"Last known message: {conversation.get('message', '')}\n\n"
+        f"Respect the active prompt as the general framework, but write only a short follow-up adapted to the stage.\n\n"
         f"{context}\n\n"
-        f"Genere la meilleure relance pour ce stage."
+        f"Generate the best follow-up for this stage."
     )
 
     try:
@@ -960,18 +960,18 @@ async def generate_follow_up_message(conversation: dict, stage: str) -> str:
 
 def format_conversations_for_analysis(conversations: list, system_prompt: str) -> str:
     parts = [
-        "=== PROMPT ACTIF ===",
+        "=== ACTIVE PROMPT ===",
         system_prompt,
         "",
         "=== CONVERSATIONS ===",
     ]
     for i, conv in enumerate(conversations, 1):
         history = conv.get("history") or []
-        name = conv.get("display_name") or conv.get("username", "inconnu")
+        name = conv.get("display_name") or conv.get("username", "unknown")
         parts.append(f"\n--- Conversation {i} ---")
-        parts.append(f"Prospect : {name}")
-        parts.append(f"Status : {conv.get('status', 'inconnu')}")
-        parts.append(f"Messages ({len(history)}) :")
+        parts.append(f"Prospect: {name}")
+        parts.append(f"Status: {conv.get('status', 'unknown')}")
+        parts.append(f"Messages ({len(history)}):")
         for msg in history:
             role = "Prospect" if msg.get("role") == "user" else "Agent"
             content = msg.get("content", "")
@@ -997,7 +997,7 @@ class StatusPayload(BaseModel):
 
 
 class FeedbackLoopPayload(BaseModel):
-    n: int = 20  # nombre de conversations à analyser (max 50)
+    n: int = 20  # number of conversations to analyze (max 50)
     manual_observations: Optional[str] = None
     test_conversation: Optional[str] = None
 
@@ -1200,7 +1200,7 @@ async def handle_inbound_message(
     first_turn = not history
     prospect_label = "Prospect WhatsApp" if channel == "whatsapp" else "Prospect Instagram"
     user_content = (
-        f"{prospect_label} : {display_name}\nMessage reçu : {message}"
+        f"{prospect_label}: {display_name}\nReceived message: {message}"
         if first_turn
         else message
     )
@@ -1681,7 +1681,7 @@ async def refine_pending(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     history = conversation.get("history") or []
-    display_name = conversation.get("display_name") or conversation.get("username", "le prospect")
+    display_name = conversation.get("display_name") or conversation.get("username", "the prospect")
     active_prompt = await get_active_prompt(user_id)
     original_message = (conversation.get("pending_message") or "").strip()
     if not original_message:
@@ -1698,20 +1698,20 @@ async def refine_pending(
         raise HTTPException(status_code=413, detail="Refinement instruction is too long")
 
     history_text = "\n".join([
-        f"{'Prospect' if m.get('role') == 'user' else 'Angelos'} : {m.get('content', '')}"
+        f"{'Prospect' if m.get('role') == 'user' else 'Angelos'}: {m.get('content', '')}"
         for m in history[-10:]
     ])
 
     refine_prompt = (
-        f"Tu es Angelos, l'agent setter Instagram de TrainToRehab.\n"
-        f"Tu as généré ce message pour le prospect @{display_name} :\n"
+        f"You are Angelos, TrainToRehab's Instagram setter agent.\n"
+        f"You generated this message for prospect @{display_name}:\n"
         f"<message_original>\n{original_message}\n</message_original>\n\n"
-        f"Voici le contexte récent de la conversation :\n"
-        f"<historique>\n{history_text}\n</historique>\n\n"
-        f"Thomas te demande d'affiner le message avec cette instruction :\n"
+        f"Here is the recent conversation context:\n"
+        f"<history>\n{history_text}\n</history>\n\n"
+        f"Thomas asks you to refine the message with this instruction:\n"
         f"<instruction>\n{instruction}\n</instruction>\n\n"
-        f"Réécris uniquement le message affiné, sans explication, sans guillemets, "
-        f"sans introduction. Juste le message final tel qu'il sera envoyé."
+        f"Rewrite only the refined message, with no explanation, no quotation marks, "
+        f"and no introduction. Just the final message exactly as it will be sent."
     )
 
     try:
@@ -1975,7 +1975,7 @@ async def run_feedback_loop(
 
     n = min(max(payload.n, 1), 50)
 
-    # 1. Récupérer les conversations engagées (status != nouveau)
+    # 1. Fetch engaged conversations (status != nouveau)
     try:
         async with httpx.AsyncClient() as http:
             res = await http.get(
@@ -1984,7 +1984,7 @@ async def run_feedback_loop(
                 params={
                     "status": "neq.nouveau",
                     "order": "created_at.desc",
-                    "limit": str(n * 3),  # marge pour filtrer côté client
+                    "limit": str(n * 3),  # margin for client-side filtering
                     "user_id": f"eq.{user_id}",
                 },
                 timeout=15.0,
@@ -1994,25 +1994,25 @@ async def run_feedback_loop(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
 
-    # Filtrer : au moins 2 messages dans history
+    # Filter: at least 2 messages in history
     convs = [
         c for c in all_convs
         if len(c.get("history") or []) >= 2
     ][:n]
 
     if not convs:
-        raise HTTPException(status_code=422, detail="Pas assez de conversations engagées pour l'analyse.")
+        raise HTTPException(status_code=422, detail="Not enough engaged conversations for analysis.")
 
-    # 2. Récupérer le prompt actif
+    # 2. Fetch the active prompt
     system_prompt = await get_active_prompt(user_id)
 
-    # 3. Formater les conversations et appeler Claude
+    # 3. Format conversations and call Claude
     user_message = format_conversations_for_analysis(convs, system_prompt)
 
     if payload.manual_observations:
-        user_message += f"\n\n=== OBSERVATIONS MANUELLES ===\n{payload.manual_observations}"
+        user_message += f"\n\n=== MANUAL OBSERVATIONS ===\n{payload.manual_observations}"
     if payload.test_conversation:
-        user_message += f"\n\n=== CONVERSATION DE TEST ===\n{payload.test_conversation}"
+        user_message += f"\n\n=== TEST CONVERSATION ===\n{payload.test_conversation}"
 
     try:
         response = client.messages.create(
@@ -2025,9 +2025,9 @@ async def run_feedback_loop(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
 
-    # 4. Parser la réponse JSON
+    # 4. Parse the JSON response
     try:
-        # Nettoyer les éventuels blocs markdown ```json ... ```
+        # Clean possible markdown blocks ```json ... ```
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -2036,7 +2036,7 @@ async def run_feedback_loop(
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=502, detail=f"Invalid JSON from Claude: {e}. Raw: {raw[:200]}")
 
-    # 5. Sauvegarder dans insights
+    # 5. Save into insights
     date_range_start = convs[-1].get("created_at") if convs else None
     date_range_end = convs[0].get("created_at") if convs else None
 
@@ -2079,7 +2079,7 @@ async def preview_prompt(
     payload: PreviewPromptPayload,
     user_id: str = Depends(require_jwt),
 ):
-    """Génère un diff de prévisualisation SANS modifier la base."""
+    """Generate a preview diff WITHOUT modifying the database."""
 
 
     if client is None:
@@ -2089,29 +2089,29 @@ async def preview_prompt(
 
     def fmt(items: list[str], label: str) -> str:
         if not items:
-            return f"{label} : (aucune)"
-        return f"{label} :\n" + "\n".join(f"- {x}" for x in items)
+            return f"{label}: (none)"
+        return f"{label}:\n" + "\n".join(f"- {x}" for x in items)
 
     user_message = (
-        f"Voici le prompt actif d'un agent setter Instagram :\n"
-        f"<prompt_actif>\n{prompt_actif}\n</prompt_actif>\n"
-        f"L'utilisateur a sélectionné ces éléments à intégrer :\n"
-        f"{fmt(payload.selected_suggestions, 'Suggestions business retenues')}\n"
-        f"{fmt(payload.selected_pain_points, 'Douleurs détectées à intégrer dans la qualification')}\n"
-        f"{fmt(payload.selected_objections, 'Objections à mieux traiter dans le prompt')}\n"
-        f'Génère le prompt complet modifié, puis retourne UNIQUEMENT un JSON valide :\n'
-        f'{{"prompt_proposed": "<prompt complet modifié>", "diff": [{{"line": "<texte>", "type": "add|remove|keep", "justification": "<pourquoi>"}}]}}\n'
-        f'Dans le diff : "add" = ligne ajoutée ou modifiée, "remove" = ligne supprimée ou remplacée, '
-        f'"keep" = ligne inchangée proche d\'un changement (contexte). '
-        f'Justification obligatoire pour chaque add/remove uniquement.\n'
-        f"Retourne uniquement le JSON, aucun texte avant ou après."
+        f"Here is the active prompt of an Instagram setter agent:\n"
+        f"<active_prompt>\n{prompt_actif}\n</active_prompt>\n"
+        f"The user selected these elements to integrate:\n"
+        f"{fmt(payload.selected_suggestions, 'Selected business suggestions')}\n"
+        f"{fmt(payload.selected_pain_points, 'Detected pain points to integrate into qualification')}\n"
+        f"{fmt(payload.selected_objections, 'Objections to handle better in the prompt')}\n"
+        f'Generate the complete modified prompt, then return ONLY valid JSON:\n'
+        f'{{"prompt_proposed": "<complete modified prompt>", "diff": [{{"line": "<text>", "type": "add|remove|keep", "justification": "<why>"}}]}}\n'
+        f'In the diff: "add" = added or modified line, "remove" = deleted or replaced line, '
+        f'"keep" = unchanged line near a change (context). '
+        f'Justification is required only for each add/remove.\n'
+        f"Return only JSON, with no text before or after."
     )
 
     try:
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=4096,
-            system="Tu es un expert en optimisation de prompts IA.",
+            system="You are an expert in AI prompt optimization.",
             messages=[{"role": "user", "content": user_message}],
         )
         raw = response.content[0].text.strip()
@@ -2136,11 +2136,11 @@ async def apply_prompt(
     payload: ApplyPromptPayload,
     user_id: str = Depends(require_jwt),
 ):
-    """Applique un prompt déjà construit par /preview-prompt."""
+    """Apply a prompt already built by /preview-prompt."""
 
     await require_owned_insight(payload.insight_id, user_id)
 
-    # 1. Désactiver tous les prompts actifs
+    # 1. Deactivate all active prompts
     try:
         async with httpx.AsyncClient() as http:
             res = await http.patch(
@@ -2154,7 +2154,7 @@ async def apply_prompt(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Supabase deactivate error: {e}")
 
-    # 2. Insérer le nouveau prompt actif
+    # 2. Insert the new active prompt
     try:
         async with httpx.AsyncClient() as http:
             res = await http.post(
@@ -2175,7 +2175,7 @@ async def apply_prompt(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Supabase insert error: {e}")
 
-    # 3. Marquer l'insight comme applied
+    # 3. Mark the insight as applied
     try:
         async with httpx.AsyncClient() as http:
             res = await http.patch(
@@ -2198,7 +2198,7 @@ async def refine_prompt(
     payload: RefinePromptPayload,
     user_id: str = Depends(require_jwt),
 ):
-    """Affinage chirurgical du prompt actif depuis le Training Center."""
+    """Surgical refinement of the active prompt from the Training Center."""
 
     instruction = payload.instruction.strip()
     if not instruction:
@@ -2214,8 +2214,8 @@ async def refine_prompt(
             result = normalize_prompt_refinement_result(
                 {
                     "updated_prompt": payload.prompt_proposed,
-                    "target_section": "Validation utilisateur",
-                    "summary": "Version previsualisee validee depuis le Training Center.",
+                    "target_section": "User validation",
+                    "summary": "Previewed version validated from the Training Center.",
                     "changes": [],
                 },
                 current_prompt,
@@ -2226,28 +2226,28 @@ async def refine_prompt(
         if client is None:
             raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
         system = (
-            "Tu es un expert senior en prompt engineering pour un agent setter Instagram. "
-            "Tu dois modifier un prompt existant de facon chirurgicale. "
-            "Ne reecris jamais tout le prompt pour une instruction mineure. "
-            "Garde la structure, les balises techniques et les donnees metier intactes sauf si la modification cible cette section. "
-            "Retourne uniquement un JSON valide, sans markdown."
+            "You are a senior prompt engineering expert for an Instagram setter agent. "
+            "You must modify an existing prompt surgically. "
+            "Never rewrite the whole prompt for a minor instruction. "
+            "Keep the structure, technical tags, and business data intact unless the modification targets that section. "
+            "Return only valid JSON, with no markdown."
         )
         user_message = (
-            "Instruction utilisateur :\n"
+            "User instruction:\n"
             f"{instruction}\n\n"
-            "Prompt actif :\n"
-            f"<prompt_actif>\n{current_prompt}\n</prompt_actif>\n\n"
-            "Analyse quelle section est concernee: ton, regles, questions de qualification, relances, prix, objections, liens, ou garde-fous.\n"
-            "Applique uniquement la modification minimale necessaire. Exemples attendus:\n"
-            '- "Il utilise trop d emojis" => ajoute/renforce une regle zero emoji dans la section ton.\n'
-            '- "Il pose deux questions dans le meme message" => renforce une question par message.\n'
-            '- "Il repond trop vite sur le prix" => ajoute une condition de qualification avant de parler des modalites.\n'
-            "Retourne exactement ce JSON :\n"
+            "Active prompt:\n"
+            f"<active_prompt>\n{current_prompt}\n</active_prompt>\n\n"
+            "Analyze which section is concerned: tone, rules, qualification questions, follow-ups, price, objections, links, or guardrails.\n"
+            "Apply only the minimum necessary modification. Expected examples:\n"
+            '- "He uses too many emojis" => add/reinforce a zero-emoji rule in the tone section.\n'
+            '- "He asks two questions in the same message" => reinforce one question per message.\n'
+            '- "He answers about price too quickly" => add a qualification condition before mentioning terms.\n'
+            "Return exactly this JSON:\n"
             "{\n"
-            '  "updated_prompt": "<prompt complet apres modification minimale>",\n'
-            '  "target_section": "<section identifiee>",\n'
-            '  "summary": "<resume court de la modification>",\n'
-            '  "changes": ["<changement 1>", "<changement 2>"]\n'
+            '  "updated_prompt": "<complete prompt after minimal modification>",\n'
+            '  "target_section": "<identified section>",\n'
+            '  "summary": "<short summary of the modification>",\n'
+            '  "changes": ["<change 1>", "<change 2>"]\n'
             "}\n"
         )
 
@@ -2571,14 +2571,14 @@ async def generate_agent_avatar(
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
 
     system = (
-        "Tu es un strategist CRM et sales enablement pour un setter Instagram. "
-        "Transforme les reponses brutes en avatar client exploitable par un agent IA. "
-        "Retourne uniquement un JSON valide, sans markdown."
+        "You are a CRM and sales enablement strategist for an Instagram setter. "
+        "Transform raw answers into a client avatar usable by an AI agent. "
+        "Return only valid JSON, with no markdown."
     )
     user_message = (
-        "Reponses utilisateur :\n"
+        "User answers:\n"
         f"{json.dumps(payload.model_dump(), ensure_ascii=False, indent=2)}\n\n"
-        "Genere exactement cette structure JSON :\n"
+        "Generate exactly this JSON structure:\n"
         "{\n"
         '  "persona_summary": "",\n'
         '  "current_situation": "",\n'
@@ -2593,7 +2593,7 @@ async def generate_agent_avatar(
         '  "bad_fit": [],\n'
         '  "confidence_score": 0\n'
         "}\n"
-        "confidence_score est un entier de 0 a 100 selon la precision des inputs."
+        "confidence_score is an integer from 0 to 100 based on input precision."
     )
     try:
         raw = generate_claude_reply([{"role": "user", "content": user_message}], system)
@@ -2675,16 +2675,16 @@ async def generate_agent_sales_rules(
         raise HTTPException(status_code=422, detail="Business profile and avatar are required")
 
     system = (
-        "Tu es un expert en qualification DM Instagram pour coachs et infopreneurs. "
-        "Cree des regles simples, operationnelles et non agressives pour un agent setter IA. "
-        "Retourne uniquement un JSON valide, sans markdown."
+        "You are an expert in Instagram DM qualification for coaches and infopreneurs. "
+        "Create simple, operational, and non-aggressive rules for an AI setter agent. "
+        "Return only valid JSON, with no markdown."
     )
     user_message = (
-        "Profil business :\n"
+        "Business profile:\n"
         f"{json.dumps(profile, ensure_ascii=False, indent=2)}\n\n"
-        "Avatar client :\n"
+        "Client avatar:\n"
         f"{json.dumps(avatar, ensure_ascii=False, indent=2)}\n\n"
-        "Genere exactement cette structure JSON :\n"
+        "Generate exactly this JSON structure:\n"
         "{\n"
         '  "qualification_questions": [],\n'
         '  "buying_signals": [],\n'
@@ -2696,7 +2696,7 @@ async def generate_agent_sales_rules(
         '  "do_not_say": [],\n'
         '  "escalation_rules": []\n'
         "}\n"
-        "Chaque liste doit contenir des phrases concretes et courtes."
+        "Each list must contain short, concrete sentences."
     )
     try:
         raw = generate_claude_reply([{"role": "user", "content": user_message}], system)

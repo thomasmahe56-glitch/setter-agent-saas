@@ -1,24 +1,75 @@
-# Journal des interventions Codex
+# Codex Intervention Log
 
-Ce fichier sert a documenter les interventions effectuees par Codex dans ce projet.
+This file documents Codex interventions in this project.
 
-Pour chaque intervention, ajouter une entree datee avec :
+For each intervention, add a dated entry with:
 
-- le contexte de la demande
-- les fichiers consultes ou modifies
-- les changements effectues
-- les verifications lancees
-- les limites ou suites a prevoir
+- request context
+- files read or modified
+- changes made
+- checks run
+- limits or follow-ups to plan
 
 ## 2026-05-21
 
-### Integration WhatsApp Cloud API
+### Backend Red-Team Hardening
 
-Contexte :
+Context:
 
-- Demande utilisateur : ajouter WhatsApp en plus d'Instagram et poser une architecture multi-canal.
+- User request: immediately fix in code the vulnerabilities identified in the red-team report.
 
-Fichiers consultes :
+Files read:
+
+- `main.py`
+- `config.py`
+- `README.md`
+- `.env.example`
+- `migrations/*`
+- Local dashboard `setter-dashboard-saas` read-only for context.
+
+Files modified:
+
+- `main.py`
+- `config.py`
+- `.env.example`
+- `README.md`
+- `migrations/add_user_scope_to_ai_tables.sql`
+- `AGENT_LOG.md`
+
+Changes made:
+
+- Replaced global CORS with a configurable allowlist through `CORS_ALLOWED_ORIGINS`.
+- Made Meta WhatsApp signature mandatory on the inbound webhook.
+- Added `user_id` scoping on `insights` and `prompt_versions` reads/writes.
+- Added a migration for `user_id`, indexes, and RLS on `conversations`, `insights`, and `prompt_versions`.
+- Scoped the WhatsApp debug endpoint by `user_id`.
+- Deduplicated WhatsApp webhooks using `message_id` stored in history.
+- Persisted auto messages before external sending, then marked them `sent` after success.
+- Validated AI replies before sending or refinement: non-empty, length-limited, authorized links only.
+- Removed provider response bodies from logs.
+- Based pending refinement on the message stored in the database instead of the browser payload.
+- Added size limits on the main inbound payloads.
+
+Checks:
+
+- `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py config.py prompts.py test.py`
+- Imported `main.app` and checked route loading.
+- `git diff --check`
+
+Limits and follow-ups:
+
+- Run `migrations/add_user_scope_to_ai_tables.sql` in Supabase before deploying this backend.
+- Backfill older `insights` and `prompt_versions` rows with `OWNER_USER_ID` if they must remain visible in the dashboard.
+- Configure `CORS_ALLOWED_ORIGINS`, `ENVIRONMENT=production`, and `META_APP_SECRET` in Railway.
+- The SaaS dashboard lives in a sibling repo/folder; no change was applied there in this pass.
+
+### WhatsApp Cloud API Integration
+
+Context:
+
+- User request: add WhatsApp in addition to Instagram and establish a multi-channel architecture.
+
+Files read:
 
 - `main.py`
 - `config.py`
@@ -27,7 +78,7 @@ Fichiers consultes :
 - `migrations/env_vars_to_add.md`
 - `test.py`
 
-Fichiers modifies :
+Files modified:
 
 - `main.py`
 - `config.py`
@@ -39,120 +90,119 @@ Fichiers modifies :
 - `test.py`
 - `AGENT_LOG.md`
 
-Changements effectues :
+Changes made:
 
-- Ajout des variables de configuration WhatsApp Cloud API.
-- Ajout d'une migration multi-canal pour `channel`, `external_contact_id`, `phone_e164`, `last_inbound_at` et `transport_metadata`.
-- Extraction d'un traitement commun des messages entrants pour Instagram et WhatsApp.
-- Ajout de l'envoi WhatsApp via Graph API `/{phone_number_id}/messages`.
-- Ajout des endpoints `GET /webhooks/whatsapp` et `POST /webhooks/whatsapp`.
-- Ajout de la verification optionnelle `X-Hub-Signature-256` avec `META_APP_SECRET`.
-- Correction du mode `disabled` pour historiser sans generer de reponse.
-- Extension des donnees dashboard et relances avec le canal et le lien manuel `wa.me` ou `ig.me`.
+- Added WhatsApp Cloud API configuration variables.
+- Added a multi-channel migration for `channel`, `external_contact_id`, `phone_e164`, `last_inbound_at`, and `transport_metadata`.
+- Extracted shared inbound message handling for Instagram and WhatsApp.
+- Added WhatsApp sending through the Graph API `/{phone_number_id}/messages`.
+- Added `GET /webhooks/whatsapp` and `POST /webhooks/whatsapp`.
+- Added optional `X-Hub-Signature-256` verification with `META_APP_SECRET`.
+- Fixed `disabled` mode so it stores history without generating a reply.
+- Extended dashboard and follow-up data with channel and manual `wa.me` or `ig.me` links.
 
-Verifications :
+Checks:
 
 - `PYTHONPYCACHEPREFIX=.pycache python3 -m py_compile main.py config.py test.py`
-- Import FastAPI et verification de l'enregistrement des routes WhatsApp.
+- FastAPI import and WhatsApp route registration check.
 
-Limites et suites :
+Limits and follow-ups:
 
-- Executer `migrations/add_whatsapp_channel.sql` dans Supabase avant de deployer ce backend.
-- Configurer les variables Railway WhatsApp et le webhook Meta.
-- Les relances hors fenetre 24h restent supervisees tant que les templates WhatsApp approuves ne sont pas ajoutes.
+- Run `migrations/add_whatsapp_channel.sql` in Supabase before deploying this backend.
+- Configure Railway WhatsApp variables and the Meta webhook.
+- Follow-ups outside the 24h window remain supervised until approved WhatsApp templates are added.
 
 ## 2026-05-01
 
-### Configuration Railway du secret webhook
+### Railway Webhook Secret Configuration
 
-Contexte :
+Context:
 
-- Demande utilisateur : configurer la suite necessaire apres la protection du webhook.
+- User request: configure the required next step after webhook protection.
 
-Fichiers consultes :
+Files read:
 
 - `AGENT_LOG.md`
-- `.env` dans le dossier projet principal, sans afficher les secrets
+- `.env` in the main project folder, without displaying secrets
 
-Fichiers modifies :
+Files modified:
 
 - `.gitignore`
 - `AGENT_LOG.md`
 
-Actions effectuees :
+Actions made:
 
-- Verification du lien Railway local : projet `setter-agent`, environnement `production`, service `setter-agent`.
-- Ajout de la variable `WEBHOOK_SECRET` dans Railway depuis la valeur locale du `.env`.
-- Verification de presence de `WEBHOOK_SECRET` via `railway run`, sans afficher sa valeur.
-- Ajout de `.DS_Store` au `.gitignore`.
-- Premiere tentative de `railway up --detach` interrompue car elle ne progressait pas apres l'indexation.
-- Deuxieme tentative de `railway up --detach --verbose` interrompue car elle restait bloquee sur `Indexing...`.
-- Troisieme tentative de `railway up --ci` interrompue apres un blocage prolonge sur `Indexing...`.
-- Creation d'un commit local `Secure webhook with secret header`.
-- Tentative de `git push origin main` refusee par GitHub avec une erreur 403 de droits d'ecriture.
+- Checked the local Railway link: project `setter-agent`, environment `production`, service `setter-agent`.
+- Added `WEBHOOK_SECRET` in Railway from the local `.env` value.
+- Verified `WEBHOOK_SECRET` presence through `railway run`, without displaying its value.
+- Added `.DS_Store` to `.gitignore`.
+- First `railway up --detach` attempt was interrupted because it did not progress after indexing.
+- Second `railway up --detach --verbose` attempt was interrupted because it stayed blocked on `Indexing...`.
+- Third `railway up --ci` attempt was interrupted after a prolonged block on `Indexing...`.
+- Created local commit `Secure webhook with secret header`.
+- `git push origin main` attempt was rejected by GitHub with a 403 write-permission error.
 
-Verifications :
+Checks:
 
-- `railway status` confirme le projet, l'environnement et le service.
-- `railway run sh -c 'test -n "$WEBHOOK_SECRET" ...'` confirme que la variable est presente en production.
-- Le deploiement automatique n'a pas pu etre finalise depuis Codex a cause du blocage `railway up` et du refus d'ecriture GitHub.
+- `railway status` confirmed the project, environment, and service.
+- `railway run sh -c 'test -n "$WEBHOOK_SECRET" ...'` confirmed the variable exists in production.
+- Automatic deployment could not be completed from Codex because of the `railway up` block and GitHub write rejection.
 
-Limites et suites :
+Limits and follow-ups:
 
-- Configurer l'outil qui appelle le webhook pour envoyer le header `X-Webhook-Secret` avec cette meme valeur.
-- Si l'outil appelant ne permet pas d'ajouter un header custom, prevoir une adaptation du webhook.
-- Donner a ce poste un acces d'ecriture GitHub valide ou lancer manuellement le deploiement Railway depuis l'interface.
+- Configure the tool calling the webhook to send the `X-Webhook-Secret` header with this same value.
+- If the calling tool cannot add a custom header, adapt the webhook.
+- Give this workstation valid GitHub write access or launch the Railway deployment manually from the UI.
 
-### Protection du webhook
+### Webhook Protection
 
-Contexte :
+Context:
 
-- Demande utilisateur : appliquer la prochaine etape recommandee, c'est-a-dire securiser le webhook.
+- User request: apply the recommended next step, meaning secure the webhook.
 
-Fichiers consultes :
-
-- `main.py`
-- `test.py`
-- `AGENT_LOG.md`
-
-Fichiers modifies :
+Files read:
 
 - `main.py`
 - `test.py`
 - `AGENT_LOG.md`
-- `.env` dans le dossier projet principal, sans journaliser la valeur du secret
 
-Changements effectues :
+Files modified:
 
-- Ajout de la variable d'environnement `WEBHOOK_SECRET`.
-- Ajout d'une verification obligatoire du header `X-Webhook-Secret` sur `POST /webhook`.
-- Ajout d'une erreur HTTP 401 si le secret fourni est absent ou incorrect.
-- Ajout d'une erreur HTTP 500 claire si `WEBHOOK_SECRET` n'est pas configure.
-- Ajout d'une erreur HTTP 500 claire si `ANTHROPIC_API_KEY` n'est pas configuree.
-- Mise a jour du script `test.py` pour envoyer `X-Webhook-Secret` depuis l'environnement local.
-- Ajout d'une valeur locale `WEBHOOK_SECRET` dans `.env`.
-- Remplacement de l'annotation `str | None` par `Optional[str]` pour rester compatible avec le Python de l'environnement virtuel local.
+- `main.py`
+- `test.py`
+- `AGENT_LOG.md`
+- `.env` in the main project folder, without logging the secret value
 
-Verifications :
+Changes made:
 
-- Verification syntaxique effectuee avec `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py test.py`.
-- Verification dans l'environnement virtuel du projet avec `/Users/thomasmahe/setter-agent/.venv/bin/python -m py_compile main.py test.py`.
-- Verification FastAPI avec `TestClient` : appel sans secret = 401, appel avec mauvais secret = 401.
+- Added the `WEBHOOK_SECRET` environment variable.
+- Added mandatory `X-Webhook-Secret` header verification on `POST /webhook`.
+- Added HTTP 401 if the provided secret is missing or incorrect.
+- Added clear HTTP 500 if `WEBHOOK_SECRET` is not configured.
+- Added clear HTTP 500 if `ANTHROPIC_API_KEY` is not configured.
+- Updated `test.py` to send `X-Webhook-Secret` from the local environment.
+- Added a local `WEBHOOK_SECRET` value in `.env`.
+- Replaced `str | None` with `Optional[str]` for compatibility with the local virtualenv Python.
 
-Limites et suites :
+Checks:
 
-- Configurer `WEBHOOK_SECRET` dans Railway et dans le `.env` local.
-- Configurer `WEBHOOK_SECRET` dans Railway avec la meme valeur que le `.env` local si l'outil appelant utilise ce secret.
-- Configurer l'outil appelant le webhook pour envoyer le header `X-Webhook-Secret`.
-- Ajouter ensuite une gestion d'erreurs autour de l'appel Anthropic.
+- Syntax check with `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py test.py`.
+- Check in the project virtualenv with `/Users/thomasmahe/setter-agent/.venv/bin/python -m py_compile main.py test.py`.
+- FastAPI `TestClient`: call without secret = 401, call with wrong secret = 401.
 
-### Creation du journal d'interventions
+Limits and follow-ups:
 
-Contexte :
+- Configure `WEBHOOK_SECRET` in Railway and in the local `.env`.
+- Configure the tool calling the webhook to send the `X-Webhook-Secret` header.
+- Add error handling around the Anthropic call next.
 
-- Demande utilisateur : creer un fichier pour documenter tout ce que Codex fait dans ce projet.
+### Intervention Log Creation
 
-Fichiers consultes :
+Context:
+
+- User request: create a file documenting everything Codex does in this project.
+
+Files read:
 
 - `main.py`
 - `README.md`
@@ -161,388 +211,388 @@ Fichiers consultes :
 - `requirements.txt`
 - `railway.json`
 
-Fichiers modifies :
+Files modified:
 
 - `AGENT_LOG.md`
 
-Changements effectues :
+Changes made:
 
-- Ajout d'un fichier dedie au suivi des interventions Codex.
-- Definition d'un format simple pour les futures entrees.
-- Ajout de la premiere entree documentant la creation de ce journal.
+- Added a dedicated file for tracking Codex interventions.
+- Defined a simple format for future entries.
+- Added the first entry documenting the creation of this log.
 
-Verifications :
+Checks:
 
-- Aucune verification runtime necessaire, changement documentaire uniquement.
+- No runtime check required; documentation-only change.
 
-Limites et suites :
+Limits and follow-ups:
 
-- Les prochaines interventions devront etre ajoutees dans ce fichier au fur et a mesure.
+- Future interventions should be added to this file over time.
 
 ## 2026-05-10
 
-### Socle backend des relances IA
+### AI Follow-Up Backend Foundation
 
-Contexte :
+Context:
 
-- Demande utilisateur : connecter la page Relance avec le backend et commencer la generation de relances par l'agent.
+- User request: connect the Follow-Up page to the backend and start generating follow-ups through the agent.
 
-Fichiers consultes :
-
-- `main.py`
-- `AGENT_LOG.md`
-- `app/relance/page.tsx` et `lib/api.ts` dans `setter-dashboard-ttr`
-
-Fichiers modifies :
+Files read:
 
 - `main.py`
 - `AGENT_LOG.md`
+- `app/relance/page.tsx` and `lib/api.ts` in `setter-dashboard-ttr`
 
-Changements effectues :
+Files modified:
 
-- Ajout de timestamps dans les nouveaux messages stockes dans `history`.
-- Nettoyage des messages envoyes a Claude pour ne pas lui passer les metadonnees `timestamp`.
-- Ajout de `GET /follow-ups/due` pour lister les relances dues selon les seuils 23 h, J+3 et J+10.
-- Ajout de `POST /follow-ups/preview` pour generer une proposition de relance avec Claude.
-- L'envoi automatique ManyChat n'est pas encore branche.
+- `main.py`
+- `AGENT_LOG.md`
 
-Verifications :
+Changes made:
+
+- Added timestamps to new messages stored in `history`.
+- Cleaned messages sent to Claude so `timestamp` metadata is not passed.
+- Added `GET /follow-ups/due` to list due follow-ups according to the 23h, D+3, and D+10 thresholds.
+- Added `POST /follow-ups/preview` to generate a follow-up proposal with Claude.
+- Automatic ManyChat sending is not connected yet.
+
+Checks:
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py`
-- `npm run build` dans `setter-dashboard-ttr`
+- `npm run build` in `setter-dashboard-ttr`
 
-Limites et suites :
+Limits and follow-ups:
 
-- Les anciennes conversations sans timestamp utilisent `created_at` comme fallback.
-- La prochaine etape sera de valider les propositions dans le dashboard, puis de brancher l'envoi auto uniquement avant 24 h.
+- Older conversations without timestamps use `created_at` as a fallback.
+- Next step will be validating proposals in the dashboard, then connecting auto-send only before 24h.
 
-### Options agent persistantes pour les liens
+### Persistent Agent Link Options
 
-Contexte :
+Context:
 
-- Demande utilisateur : les liens Calendly et page de vente doivent etre des options de l'agent, pas seulement des liens du test playground.
+- User request: Calendly and sales page links must be agent options, not only playground test links.
 
-Fichiers consultes :
-
-- `main.py`
-- `AGENT_LOG.md`
-- `app/agent/page.tsx` dans `setter-dashboard-ttr`
-
-Fichiers modifies :
+Files read:
 
 - `main.py`
 - `AGENT_LOG.md`
+- `app/agent/page.tsx` in `setter-dashboard-ttr`
 
-Changements effectues :
+Files modified:
 
-- Ajout des marqueurs internes `AGENT_OPTIONS_START` / `AGENT_OPTIONS_END` dans le prompt actif.
-- Ajout de `GET /agent-links` pour lire les liens depuis le prompt actif.
-- Ajout de `PATCH /agent-links` pour creer une nouvelle version active du prompt avec les liens agent.
-- Conservation de l'injection playground pour que le test utilise immediatement les champs saisis.
+- `main.py`
+- `AGENT_LOG.md`
 
-Verifications :
+Changes made:
+
+- Added internal markers `AGENT_OPTIONS_START` / `AGENT_OPTIONS_END` in the active prompt.
+- Added `GET /agent-links` to read links from the active prompt.
+- Added `PATCH /agent-links` to create a new active prompt version with agent links.
+- Kept playground injection so tests immediately use the entered fields.
+
+Checks:
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py`
-- `npm run build` dans `setter-dashboard-ttr`
+- `npm run build` in `setter-dashboard-ttr`
 
-Limites et suites :
+Limits and follow-ups:
 
-- Chaque sauvegarde des options cree une nouvelle entree `prompt_versions` avec `source=agent-options`, afin de garder l'historique et permettre une restauration.
-- Restaurer une ancienne version de prompt peut restaurer d'anciens liens ou supprimer les options si cette version n'en contenait pas.
+- Each option save creates a new `prompt_versions` entry with `source=agent-options`, preserving history and enabling restore.
+- Restoring an older prompt version can restore old links or remove options if that version did not contain them.
 
-### Parametres de liens pour le playground agent
+### Agent Playground Link Parameters
 
-Contexte :
+Context:
 
-- Demande utilisateur : conserver la page Agent actuelle et ajouter uniquement le lien Calendly et le lien de la page de vente.
+- User request: keep the current Agent page and add only the Calendly link and sales page link.
 
-Fichiers consultes :
-
-- `main.py`
-- `AGENT_LOG.md`
-- `app/agent/page.tsx` dans `setter-dashboard-ttr`
-
-Fichiers modifies :
+Files read:
 
 - `main.py`
 - `AGENT_LOG.md`
+- `app/agent/page.tsx` in `setter-dashboard-ttr`
 
-Changements effectues :
+Files modified:
 
-- Ajout de champs optionnels `calendly_url` et `sales_page_url` au payload `POST /playground`.
-- Injection de ces liens dans le system prompt uniquement pour le playground dashboard.
-- Aucun changement sur `POST /webhook` ni sur le prompt actif sauvegarde.
+- `main.py`
+- `AGENT_LOG.md`
 
-Verifications :
+Changes made:
+
+- Added optional `calendly_url` and `sales_page_url` fields to the `POST /playground` payload.
+- Injected those links into the system prompt only for the dashboard playground.
+- No change to `POST /webhook` or to the saved active prompt.
+
+Checks:
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py`
-- `npm run build` dans `setter-dashboard-ttr`
+- `npm run build` in `setter-dashboard-ttr`
 
-Limites et suites :
+Limits and follow-ups:
 
-- Ces liens affectent les tests de la page Agent uniquement. Pour modifier le comportement live du webhook, il faudra appliquer une nouvelle version de prompt ou ajouter une configuration partagee.
+- These links affect only Agent page tests. To change live webhook behavior, apply a new prompt version or add shared configuration.
 
-### Chargement progressif des conversations dashboard
+### Progressive Dashboard Conversation Loading
 
-Contexte :
+Context:
 
-- Demande utilisateur : reduire les chargements longs du dashboard et ajouter des animations pour eviter l'impression de blocage.
+- User request: reduce long dashboard loads and add animations to avoid a blocked feeling.
 
-Fichiers consultes :
-
-- `main.py`
-- `AGENT_LOG.md`
-- Fichiers frontend dans `setter-dashboard-ttr`
-
-Fichiers modifies :
+Files read:
 
 - `main.py`
 - `AGENT_LOG.md`
+- Frontend files in `setter-dashboard-ttr`
 
-Changements effectues :
+Files modified:
 
-- Ajout de `GET /conversations/summary` pour renvoyer une liste legere sans historique complet.
-- Ajout de `GET /conversations/{conversation_id}` pour charger le detail complet uniquement au clic sur un prospect.
-- Conservation de `GET /conversations` pour compatibilite avec l'ancien comportement.
+- `main.py`
+- `AGENT_LOG.md`
 
-Verifications :
+Changes made:
+
+- Added `GET /conversations/summary` to return a lightweight list without full history.
+- Added `GET /conversations/{conversation_id}` to load full detail only when clicking a prospect.
+- Kept `GET /conversations` for compatibility with the old behavior.
+
+Checks:
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py`
-- `npm run build` dans `setter-dashboard-ttr`
+- `npm run build` in `setter-dashboard-ttr`
 
-Limites et suites :
+Limits and follow-ups:
 
-- Deployer le backend avant ou en meme temps que le frontend, car le dashboard utilise le nouvel endpoint `/conversations/summary`.
-- Tester sur le dashboard live que la liste charge plus vite et que l'historique s'affiche au clic.
+- Deploy the backend before or at the same time as the frontend, because the dashboard uses the new `/conversations/summary` endpoint.
+- Test on the live dashboard that the list loads faster and history appears on click.
 
-### Alignement des endpoints dashboard conversations
+### Dashboard Conversation Endpoint Alignment
 
-Contexte :
+Context:
 
-- Demande utilisateur : tester et corriger si necessaire la coherence entre le dashboard et l'agent.
-- Observation : le dashboard appelle les endpoints de statut et suppression avec l'id Supabase de la conversation.
+- User request: test and fix consistency between the dashboard and the agent if needed.
+- Observation: the dashboard calls status and deletion endpoints with the Supabase conversation id.
 
-Fichiers consultes :
-
-- `main.py`
-- `AGENT_LOG.md`
-- `lib/api.ts` dans `setter-dashboard-ttr`
-
-Fichiers modifies :
+Files read:
 
 - `main.py`
 - `AGENT_LOG.md`
+- `lib/api.ts` in `setter-dashboard-ttr`
 
-Changements effectues :
+Files modified:
 
-- Modification de `PATCH /conversations/{...}/status` pour filtrer Supabase par `id`.
-- Modification de `DELETE /conversations/{...}` pour filtrer Supabase par `id`.
-- Les endpoints ManyChat `POST /webhook`, `POST /activate` et `POST /deactivate` n'ont pas ete modifies.
+- `main.py`
+- `AGENT_LOG.md`
 
-Verifications :
+Changes made:
+
+- Changed `PATCH /conversations/{...}/status` to filter Supabase by `id`.
+- Changed `DELETE /conversations/{...}` to filter Supabase by `id`.
+- ManyChat endpoints `POST /webhook`, `POST /activate`, and `POST /deactivate` were not changed.
+
+Checks:
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py`
-- `npm run build` dans `setter-dashboard-ttr`
+- `npm run build` in `setter-dashboard-ttr`
 
-Limites et suites :
+Limits and follow-ups:
 
-- Tester sur l'environnement live que le changement de statut et la suppression modifient bien les lignes Supabase attendues.
-- Verifier separement l'alignement `username` / `subscriber_id` pour les liens Instagram du dashboard.
+- Test in the live environment that status changes and deletion update the expected Supabase rows.
+- Separately verify `username` / `subscriber_id` alignment for dashboard Instagram links.
 
-### Envoi manuel securise de la relance H23
+### Secure Manual H23 Follow-Up Send
 
-Contexte :
+Context:
 
-- Demande utilisateur : s'occuper de la premiere relance automatique, celle avant la limite Instagram/ManyChat des 24 heures.
+- User request: handle the first automatic follow-up, the one before the Instagram/ManyChat 24-hour limit.
 
-Fichiers consultes :
-
-- `main.py`
-- `AGENT_LOG.md`
-- Fichiers frontend dans `setter-dashboard-ttr`
-
-Fichiers modifies :
+Files read:
 
 - `main.py`
 - `AGENT_LOG.md`
-- `app/relance/page.tsx` dans `setter-dashboard-ttr`
-- `lib/api.ts` dans `setter-dashboard-ttr`
+- Frontend files in `setter-dashboard-ttr`
 
-Changements effectues :
+Files modified:
 
-- Ajout de `POST /follow-ups/{conversation_id}/send-auto-23h`.
-- L'endpoint verifie que la conversation est bien due en `auto_23h`, donc entre 23 h et 24 h apres le dernier message prospect.
-- Generation du message de relance avec Claude via le prompt de relance existant.
-- Envoi via l'API ManyChat `sendContent` avec `username` comme subscriber id ManyChat.
-- Ajout du message envoye dans `history` avec `follow_up_stage=auto_23h` pour eviter un double envoi.
-- La page `/relance` affiche maintenant un bouton `Envoyer H23` pour les relances automatiques dues.
+- `main.py`
+- `AGENT_LOG.md`
+- `app/relance/page.tsx` in `setter-dashboard-ttr`
+- `lib/api.ts` in `setter-dashboard-ttr`
 
-Limites et suites :
+Changes made:
 
-- Ce build ajoute l'envoi H23 declenche depuis le dashboard, pas encore une tache cron autonome.
+- Added `POST /follow-ups/{conversation_id}/send-auto-23h`.
+- The endpoint verifies that the conversation is due in `auto_23h`, meaning between 23h and 24h after the last prospect message.
+- Generated the follow-up message with Claude through the existing follow-up prompt.
+- Sent through the ManyChat `sendContent` API with `username` as the ManyChat subscriber id.
+- Added the sent message to `history` with `follow_up_stage=auto_23h` to avoid double sending.
+- The `/relance` page now shows a `Send H23` button for due automatic follow-ups.
+
+Limits and follow-ups:
+
+- This build adds dashboard-triggered H23 sending, not yet an autonomous cron job.
 
 ## 2026-05-20
 
-### Stabilisation du login dashboard SaaS
+### SaaS Dashboard Login Stabilization
 
-Contexte :
+Context:
 
-- Demande utilisateur : corriger les problemes de login du dashboard SaaS et aligner le backend avec Supabase Auth.
+- User request: fix SaaS dashboard login issues and align the backend with Supabase Auth.
 
-Fichiers consultes :
+Files read:
 
 - `main.py`
 - `README.md`
-- Fichiers frontend dans `setter-dashboard-saas`
+- Frontend files in `setter-dashboard-saas`
 
-Fichiers modifies :
+Files modified:
 
 - `main.py`
 - `README.md`
 - `AGENT_LOG.md`
-- `proxy.ts`, `app/login/page.tsx`, `lib/api.ts`, `lib/config.ts`, `lib/supabase.ts`, `lib/supabase/client.ts`, `.env.example`, `migrations/frontend_env_vars.md` dans `setter-dashboard-saas`
+- `proxy.ts`, `app/login/page.tsx`, `lib/api.ts`, `lib/config.ts`, `lib/supabase.ts`, `lib/supabase/client.ts`, `.env.example`, `migrations/frontend_env_vars.md` in `setter-dashboard-saas`
 
-Changements effectues :
+Changes made:
 
-- Remplacement du middleware Next vide du dashboard par un `proxy.ts` compatible Next 16.
-- Protection serveur des routes dashboard et redirection automatique login/CRM selon la session Supabase.
-- Nettoyage de la page login : redirection via router Next, suppression du log de resultat auth, trim email.
-- Ajout d'erreurs explicites si `NEXT_PUBLIC_API_URL` ou Supabase Auth ne sont pas configures.
-- Durcissement backend : refus des JWT qui ne correspondent pas a `OWNER_USER_ID` quand il est configure.
-- Ajout de filtres `user_id` aux lectures et mutations de conversations du dashboard.
-- Mise a jour des variables frontend documentees et de la doc backend sur l'auth dashboard.
+- Replaced the empty Next middleware in the dashboard with a Next 16-compatible `proxy.ts`.
+- Added server protection for dashboard routes and automatic login/CRM redirects based on the Supabase session.
+- Cleaned up the login page: Next router redirect, removed auth result log, trimmed email.
+- Added explicit errors if `NEXT_PUBLIC_API_URL` or Supabase Auth are not configured.
+- Backend hardening: reject JWTs that do not match `OWNER_USER_ID` when it is configured.
+- Added `user_id` filters to dashboard conversation reads and mutations.
+- Updated documented frontend variables and backend dashboard auth docs.
 
-Verifications :
+Checks:
 
-- `npm run build` dans `setter-dashboard-saas`
+- `npm run build` in `setter-dashboard-saas`
 - `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py config.py prompts.py test.py`
 
-Limites et suites :
+Limits and follow-ups:
 
-- `npm run lint` reste bloque par une installation locale ESLint cassee dans `node_modules`, a reparer via reinstall des dependances si necessaire.
-- Verifier sur Vercel que `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_SUPABASE_URL` et `NEXT_PUBLIC_SUPABASE_ANON_KEY` sont bien configurees.
-- Prochaine etape possible : ajouter un cron Railway qui appelle l'envoi H23 automatiquement toutes les quelques minutes.
+- `npm run lint` remains blocked by a broken local ESLint install in `node_modules`; fix by reinstalling dependencies if needed.
+- Verify on Vercel that `NEXT_PUBLIC_API_URL`, `NEXT_PUBLIC_SUPABASE_URL`, and `NEXT_PUBLIC_SUPABASE_ANON_KEY` are configured.
+- Possible next step: add a Railway cron that calls H23 sending automatically every few minutes.
 
-### Endpoint ManyChat pour relance J1
+### ManyChat Endpoint For D+1 Follow-Up
 
-Contexte :
+Context:
 
-- Demande utilisateur : brancher la relance J1 directement dans ManyChat avec un External Request.
-- ManyChat appelait `/follow-ups/manychat-auto-23h` et recevait `404 Not Found`.
+- User request: connect the D+1 follow-up directly in ManyChat with an External Request.
+- ManyChat called `/follow-ups/manychat-auto-23h` and received `404 Not Found`.
 
-Fichiers modifies :
+Files modified:
 
 - `main.py`
 - `AGENT_LOG.md`
 
-Changements effectues :
+Changes made:
 
-- Ajout de `POST /follow-ups/manychat-auto-23h`.
-- Payload attendu : `{ "subscriber_id": "..." }`.
-- Recherche de la conversation via `username = subscriber_id`.
-- Verification que la relance due est bien `auto_23h`.
-- Generation du message IA puis retour JSON `{ "message": "...", "conversation_id": "...", "stage": "auto_23h" }`.
-- Marquage dans `history` avec `follow_up_stage=auto_23h` et `source=follow_up_manychat` pour eviter les doublons.
+- Added `POST /follow-ups/manychat-auto-23h`.
+- Expected payload: `{ "subscriber_id": "..." }`.
+- Looked up the conversation through `username = subscriber_id`.
+- Verified that the due follow-up is `auto_23h`.
+- Generated the AI message then returned JSON `{ "message": "...", "conversation_id": "...", "stage": "auto_23h" }`.
+- Marked history with `follow_up_stage=auto_23h` and `source=follow_up_manychat` to avoid duplicates.
 
-Verification :
+Check:
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py`
 
-Limite :
+Limit:
 
-- Si le contact teste dans ManyChat n'est pas actuellement entre 23 h et 24 h depuis son dernier message, l'endpoint renverra `409 Auto 23h follow-up is not due`.
+- If the ManyChat test contact is not currently between 23h and 24h since the last message, the endpoint returns `409 Auto 23h follow-up is not due`.
 
-### Reponse stable pour mapping ManyChat
+### Stable Response For ManyChat Mapping
 
-Contexte :
+Context:
 
-- ManyChat a besoin d'une reponse `200 OK` avec le champ `message` pour configurer le Response mapping.
-- Avec un contact hors fenetre H23, l'endpoint renvoyait `409`, ce qui bloquait le mapping.
+- ManyChat needs a `200 OK` response with the `message` field to configure Response mapping.
+- With a contact outside the H23 window, the endpoint returned `409`, blocking mapping.
 
-Fichiers modifies :
+Files modified:
 
 - `main.py`
 - `AGENT_LOG.md`
 
-Changements effectues :
+Changes made:
 
-- `POST /follow-ups/manychat-auto-23h` renvoie maintenant toujours un JSON stable.
-- Cas non eligible : `{ "ok": false, "message": "", "reason": "..." }`.
-- Cas eligible : `{ "ok": true, "message": "...", "conversation_id": "...", "stage": "auto_23h", "reason": null }`.
+- `POST /follow-ups/manychat-auto-23h` now always returns stable JSON.
+- Non-eligible case: `{ "ok": false, "message": "", "reason": "..." }`.
+- Eligible case: `{ "ok": true, "message": "...", "conversation_id": "...", "stage": "auto_23h", "reason": null }`.
 
-Verification :
+Check:
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py`
 
-Suite ManyChat :
+ManyChat next steps:
 
-- Mapper `message` vers `relance_j1_message`.
-- Ajouter une condition `relance_j1_message is not empty` avant le bloc d'envoi Instagram.
+- Map `message` to `relance_j1_message`.
+- Add a `relance_j1_message is not empty` condition before the Instagram send block.
 
-### Mode test ManyChat relance J1
+### ManyChat D+1 Follow-Up Test Mode
 
-Contexte :
+Context:
 
-- Demande utilisateur : tester le flow ManyChat en temps reel sans attendre un prospect dans la fenetre H23.
+- User request: test the ManyChat flow in real time without waiting for a prospect in the H23 window.
 
-Fichiers modifies :
+Files modified:
 
 - `main.py`
 - `AGENT_LOG.md`
 
-Changements effectues :
+Changes made:
 
-- Ajout de `force_test` et `test_only` au payload `POST /follow-ups/manychat-auto-23h`.
-- `force_test=true` permet de generer une relance meme si la conversation n'est pas entre 23 h et 24 h.
-- `test_only=true` evite de marquer la relance comme envoyee dans Supabase.
-- La reponse indique `reason: "test_mode"` et `test_only: true` en mode test.
+- Added `force_test` and `test_only` to the `POST /follow-ups/manychat-auto-23h` payload.
+- `force_test=true` allowed generating a follow-up even if the conversation was not between 23h and 24h.
+- `test_only=true` prevented marking the follow-up as sent in Supabase.
+- The response included `reason: "test_mode"` and `test_only: true` in test mode.
 
-Verification :
+Check:
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py`
 
-Important :
+Important:
 
-- Retirer `force_test` et `test_only` du body ManyChat avant publication finale du flow.
+- Remove `force_test` and `test_only` from the ManyChat body before final flow publication.
 
-### Retrait du mode test ManyChat relance J1
+### Remove ManyChat D+1 Test Mode
 
-Contexte :
+Context:
 
-- Demande utilisateur : retirer le mode test apres validation du flow.
+- User request: remove test mode after flow validation.
 
-Fichiers modifies :
+Files modified:
 
 - `main.py`
 - `AGENT_LOG.md`
 
-Changements effectues :
+Changes made:
 
-- Suppression de `force_test` et `test_only` du payload ManyChat.
-- `POST /follow-ups/manychat-auto-23h` ne genere plus de relance hors eligibilite H23.
-- Le marquage Supabase redevient systematique quand une relance est generee.
+- Removed `force_test` and `test_only` from the ManyChat payload.
+- `POST /follow-ups/manychat-auto-23h` no longer generates follow-ups outside H23 eligibility.
+- Supabase marking is systematic again when a follow-up is generated.
 
-Verification :
+Check:
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py`
 
-### Relances basees sur le prompt actif
+### Follow-Ups Based On The Active Prompt
 
-Contexte :
+Context:
 
-- Demande utilisateur : utiliser une version hybride pour les relances, avec le prompt specialise relance + le metaprompt actif.
+- User request: use a hybrid version for follow-ups, with the specialized follow-up prompt + active meta-prompt.
 
-Fichiers modifies :
+Files modified:
 
 - `main.py`
 - `AGENT_LOG.md`
 
-Changements effectues :
+Changes made:
 
-- `generate_follow_up_message()` charge maintenant `get_active_prompt()`.
-- Le prompt actif est injecte dans le contexte donne a Claude pour les relances.
-- Le prompt systeme de relance reste specialise pour garder un message court, naturel et non agressif.
+- `generate_follow_up_message()` now loads `get_active_prompt()`.
+- The active prompt is injected into the context given to Claude for follow-ups.
+- The follow-up system prompt remains specialized to keep the message short, natural, and non-aggressive.
 
-Verification :
+Check:
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/codex-pycache python3 -m py_compile main.py`
