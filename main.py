@@ -52,6 +52,66 @@ TRAINING_CENTER_PROMPT_END = "<!-- TRAINING_CENTER_PROMPT_END -->"
 AUTO_FOLLOW_UP_HOURS = 23
 MANUAL_FOLLOW_UP_1_HOURS = 72
 MANUAL_FOLLOW_UP_2_HOURS = 240
+ANGELLOS_REJECTION_REPLY = "No worries, appreciate you getting back to me."
+ANGELLOS_WHAT_IS_REPLY = (
+    "Angellos is an AI setter for Instagram DMs. It helps qualify conversations, handle replies and follow-ups, "
+    "and move serious prospects toward booked calls."
+)
+ANGELLOS_HOW_IT_WORKS_REPLY = (
+    "You connect your Instagram DM flow through ManyChat. Angellos uses your offer, qualification criteria, "
+    "FAQs and tone of voice to handle the first part of the conversation. It does not replace you completely. "
+    "It filters the noise, qualifies serious people, and pushes the right ones toward a call."
+)
+ANGELLOS_PRICE_REPLY = (
+    "For the beta, it’s free for 30 days. I’m looking for feedback, screenshots and proof that it can help "
+    "operators turn more DM conversations into calls. If it works well, we can talk about the paid version later."
+)
+ANGELLOS_INTERESTED_REPLY = (
+    "Best next step is a quick call so I can see your current DM flow and check if you’re a good fit for the beta. "
+    "I’m only taking 3 people because I want to set it up properly and follow the results closely. "
+    "Want me to send the beta page?"
+)
+ANGELLOS_OUTBOUND_REPLY = (
+    "Actually that’s still relevant. If you start the conversation manually, Angellos can help once they reply. "
+    "It can handle the next messages, qualify whether they’re a real fit, follow up if needed, and move the right "
+    "people toward a call. Once people reply to your outreach, do you already have a consistent qualification "
+    "process or do you handle it manually every time?"
+)
+ANGELLOS_INBOUND_REPLY = (
+    "Perfect. Then Angellos can help with the first part of the conversation: qualifying people, answering common "
+    "questions, following up, and moving serious prospects toward a call."
+)
+ANGELLOS_BETA_REPLY_RULES = f"""=== ANGELLOS BETA MARKET SETTINGS ===
+Market: English-speaking beta
+Default language: English
+Brand name: Angellos
+
+These rules override older base prompts, fallback prompts, tenant configuration and examples.
+- Angellos helps operators turn Instagram DM conversations into booked calls, whether the conversation starts inbound or from manual outbound.
+- Do not say Angellos is only for people who get inbound messages.
+- If the prospect says they mostly do outbound, segment the use case and explain that Angellos helps once people reply to manual outreach.
+- If the prospect says they reach out through Instagram DMs, understand that Angellos can still help with reply handling, qualification, follow-up, objection handling and moving qualified prospects toward a call.
+- If the prospect says they get inbound DMs, explain the inbound use case briefly.
+- Write in English by default.
+- Use French only when the prospect writes in French first.
+- Always spell the brand Angellos with two Ls.
+- Do not use emojis unless the prospect used emojis first.
+- Keep the tone human, direct and casual.
+- No corporate tone.
+- No hype language.
+- Never use dashes in generated messages.
+- Ask one question at a time.
+- Keep replies short.
+- Do not mention API fees unless asked about setup costs.
+- Do not overqualify too early.
+- If the prospect rejects the offer with wording like "No thanks", "not interested", "nah" or "no thanks bro", reply exactly: {ANGELLOS_REJECTION_REPLY}
+- If the prospect says they mostly do outbound or reach out through Instagram DMs, reply exactly: {ANGELLOS_OUTBOUND_REPLY}
+- If the prospect says they get inbound DMs, reply exactly: {ANGELLOS_INBOUND_REPLY}
+- If the prospect asks what Angellos is or what Angellos does, reply exactly: {ANGELLOS_WHAT_IS_REPLY}
+- If the prospect asks how it works, reply exactly: {ANGELLOS_HOW_IT_WORKS_REPLY}
+- If the prospect asks about price, reply exactly: {ANGELLOS_PRICE_REPLY}
+- If the prospect shows interest, move toward a quick call instead of over-explaining in DMs. Default reply: {ANGELLOS_INTERESTED_REPLY}
+- New beta outreach conversations stay supervised unless Thomas explicitly activates auto mode."""
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
@@ -454,6 +514,99 @@ def strip_message_metadata(messages: list) -> list:
         for msg in messages
         if msg.get("role") in {"user", "assistant"}
     ]
+
+
+def build_angellos_beta_prompt(base_prompt: str) -> str:
+    return f"{base_prompt}\n\n{ANGELLOS_BETA_REPLY_RULES}"
+
+
+def normalize_inbound_text(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())).strip()
+
+
+def get_angellos_beta_canned_reply(message: str) -> Optional[tuple[str, bool]]:
+    normalized = normalize_inbound_text(message)
+    if not normalized:
+        return None
+
+    rejection_phrases = {
+        "no",
+        "no thanks",
+        "no thank you",
+        "no thanks bro",
+        "nah",
+        "not interested",
+        "im not interested",
+        "i am not interested",
+    }
+    if (
+        normalized in rejection_phrases
+        or normalized.startswith("not interested ")
+        or normalized.startswith("no thanks ")
+        or normalized.startswith("no thank you ")
+    ):
+        return ANGELLOS_REJECTION_REPLY, True
+
+    outbound_terms = (
+        "outbound",
+        "reach out",
+        "reaching out",
+        "outreach",
+        "cold dm",
+        "cold dms",
+        "manual dm",
+        "manual dms",
+        "message people",
+        "dm people",
+    )
+    instagram_dm_terms = (
+        "instagram dm",
+        "instagram dms",
+        "ig dm",
+        "ig dms",
+        "dms",
+    )
+    if any(term in normalized for term in outbound_terms) and any(term in normalized for term in instagram_dm_terms):
+        return ANGELLOS_OUTBOUND_REPLY, False
+    if "mostly do outbound" in normalized or "mostly outbound" in normalized:
+        return ANGELLOS_OUTBOUND_REPLY, False
+
+    inbound_terms = (
+        "inbound dm",
+        "inbound dms",
+        "get inbound",
+        "getting inbound",
+        "people dm me",
+        "people message me",
+        "they dm me",
+        "they message me",
+    )
+    if any(term in normalized for term in inbound_terms):
+        return ANGELLOS_INBOUND_REPLY, False
+
+    if re.search(r"\b(what is|what s|whats|what does)\b.*\bangellos\b", normalized):
+        return ANGELLOS_WHAT_IS_REPLY, False
+    if re.search(r"\bhow\b.*\b(work|works|working)\b", normalized):
+        return ANGELLOS_HOW_IT_WORKS_REPLY, False
+    if re.search(r"\b(price|pricing|cost|costs|paid|free|how much)\b", normalized):
+        return ANGELLOS_PRICE_REPLY, False
+    if re.search(r"\b(interested|sounds good|send it|send me|beta page|tell me more|let s do it|lets do it)\b", normalized):
+        return ANGELLOS_INTERESTED_REPLY, False
+
+    return None
+
+
+def text_has_emoji(text: str) -> bool:
+    return bool(re.search(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF]", text or ""))
+
+
+def sanitize_angellos_beta_reply(reply: str, prospect_message: str) -> str:
+    cleaned = re.sub(r"[—–-]", " ", reply or "")
+    if not text_has_emoji(prospect_message):
+        cleaned = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF]", "", cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r" *\n *", "\n", cleaned)
+    return cleaned.strip()
 
 
 def is_whatsapp_test_contact(conversation: dict) -> bool:
@@ -899,6 +1052,15 @@ def validate_agent_reply(reply: str, system_prompt: str) -> str:
     return cleaned
 
 
+def split_stop_agent_reply(reply: str) -> tuple[str, bool]:
+    if "[STOP_AGENT]" not in (reply or ""):
+        return reply, False
+    before_tag = reply.split("[STOP_AGENT]", 1)[0].strip()
+    if len(before_tag) < 3:
+        return "", True
+    return before_tag, True
+
+
 def has_processed_transport_message(history: list, transport_metadata: Optional[dict]) -> bool:
     message_id = (transport_metadata or {}).get("message_id")
     if not message_id:
@@ -937,7 +1099,8 @@ async def generate_follow_up_message(conversation: dict, stage: str) -> str:
     }
     stage_label = stage_labels.get(stage, stage)
     active_prompt = await get_active_prompt(conversation.get("user_id"))
-    context = format_conversations_for_analysis([conversation], active_prompt)
+    generation_prompt = build_angellos_beta_prompt(active_prompt)
+    context = format_conversations_for_analysis([conversation], generation_prompt)
     user_message = (
         f"Follow-up stage: {stage_label}\n"
         f"Prospect: {conversation.get('display_name') or conversation.get('username')}\n"
@@ -950,12 +1113,13 @@ async def generate_follow_up_message(conversation: dict, stage: str) -> str:
     try:
         reply = generate_claude_reply(
             [{"role": "user", "content": user_message}],
-            build_follow_up_prompt(config),
+            build_angellos_beta_prompt(build_follow_up_prompt(config)),
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
 
-    return validate_agent_reply(reply, active_prompt)
+    reply = sanitize_angellos_beta_reply(reply, conversation.get("message", ""))
+    return validate_agent_reply(reply, generation_prompt)
 
 
 def format_conversations_for_analysis(conversations: list, system_prompt: str) -> str:
@@ -1179,7 +1343,8 @@ async def handle_inbound_message(
         print(f"[inbound] DISABLED channel={channel} external_id={external_contact_id}")
         return {"reply": "", "sent": False, "skipped": True, "reason": "automation_disabled"}
 
-    system_prompt = await get_active_prompt(contact.get("user_id"))
+    active_prompt = await get_active_prompt(contact.get("user_id"))
+    system_prompt = build_angellos_beta_prompt(active_prompt)
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
     if not contact.get("agent_active"):
@@ -1197,23 +1362,28 @@ async def handle_inbound_message(
         print(f"[inbound] INACTIVE_HISTORY_ONLY channel={channel} external_id={external_contact_id}")
         return {"reply": "", "sent": False, "skipped": True, "reason": "agent_inactive"}
 
-    first_turn = not history
-    prospect_label = "Prospect WhatsApp" if channel == "whatsapp" else "Prospect Instagram"
-    user_content = (
-        f"{prospect_label}: {display_name}\nReceived message: {message}"
-        if first_turn
-        else message
-    )
-    messages_for_generation = history + [{"role": "user", "content": user_content, "timestamp": received_at}]
+    canned_reply = get_angellos_beta_canned_reply(message)
+    if canned_reply:
+        reply, should_stop_agent = canned_reply
+    else:
+        first_turn = not history
+        prospect_label = "Prospect WhatsApp" if channel == "whatsapp" else "Prospect Instagram"
+        user_content = (
+            f"{prospect_label}: {display_name}\nReceived message: {message}"
+            if first_turn
+            else message
+        )
+        messages_for_generation = history + [{"role": "user", "content": user_content, "timestamp": received_at}]
 
-    try:
-        reply = generate_claude_reply(strip_message_metadata(messages_for_generation), system_prompt)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+        try:
+            reply = generate_claude_reply(strip_message_metadata(messages_for_generation), system_prompt)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+        reply, should_stop_agent = split_stop_agent_reply(reply)
+    reply = sanitize_angellos_beta_reply(reply, message)
     reply = validate_agent_reply(reply, system_prompt)
 
-    if "[STOP_AGENT]" in reply:
-        reply = reply.replace("[STOP_AGENT]", "").strip()
+    if should_stop_agent:
         if not (channel == "whatsapp" and (is_whatsapp_test_contact(contact) or is_whatsapp_test_metadata(transport_metadata))):
             patch_data["agent_active"] = False
             print(f"[inbound] STOP_AGENT channel={channel} external_id={external_contact_id}")
@@ -1683,6 +1853,7 @@ async def refine_pending(
     history = conversation.get("history") or []
     display_name = conversation.get("display_name") or conversation.get("username", "the prospect")
     active_prompt = await get_active_prompt(user_id)
+    generation_prompt = build_angellos_beta_prompt(active_prompt)
     original_message = (conversation.get("pending_message") or "").strip()
     if not original_message:
         for msg in reversed(history):
@@ -1698,12 +1869,14 @@ async def refine_pending(
         raise HTTPException(status_code=413, detail="Refinement instruction is too long")
 
     history_text = "\n".join([
-        f"{'Prospect' if m.get('role') == 'user' else 'Angelos'}: {m.get('content', '')}"
+        f"{'Prospect' if m.get('role') == 'user' else 'Angellos'}: {m.get('content', '')}"
         for m in history[-10:]
     ])
 
     refine_prompt = (
-        f"You are Angelos, TrainToRehab's Instagram setter agent.\n"
+        f"You are Angellos, the Instagram setter agent for the English-speaking beta market.\n"
+        f"Apply the Angellos beta rules exactly, including English by default, no emojis unless the prospect used them first, "
+        f"no corporate tone, no hype language and no dashes.\n"
         f"You generated this message for prospect @{display_name}:\n"
         f"<message_original>\n{original_message}\n</message_original>\n\n"
         f"Here is the recent conversation context:\n"
@@ -1717,12 +1890,17 @@ async def refine_pending(
     try:
         refined = generate_claude_reply(
             [{"role": "user", "content": refine_prompt}],
-            active_prompt,
+            generation_prompt,
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
 
-    refined = validate_agent_reply(refined, active_prompt)
+    last_prospect_message = next(
+        ((msg.get("content") or "") for msg in reversed(history) if msg.get("role") == "user"),
+        "",
+    )
+    refined = sanitize_angellos_beta_reply(refined, last_prospect_message)
+    refined = validate_agent_reply(refined, generation_prompt)
 
     updated_history = []
     patched = False
@@ -1947,7 +2125,7 @@ async def playground(
 
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
-    system_prompt = await get_active_prompt(user_id)
+    system_prompt = build_angellos_beta_prompt(await get_active_prompt(user_id))
     if payload.calendly_url or payload.sales_page_url:
         system_prompt = append_agent_options(
             system_prompt,
@@ -1958,6 +2136,11 @@ async def playground(
         reply = generate_claude_reply(payload.messages, system_prompt)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+    last_prospect_message = next(
+        ((msg.get("content") or "") for msg in reversed(payload.messages) if msg.get("role") == "user"),
+        "",
+    )
+    reply = sanitize_angellos_beta_reply(reply, last_prospect_message)
     return {"response": reply}
 
 
