@@ -1283,6 +1283,7 @@ async def handle_inbound_message(
     user_id: str,
     phone_e164: Optional[str] = None,
     transport_metadata: Optional[dict] = None,
+    auto_send_transport: bool = True,
 ) -> dict:
     received_at = now_iso()
     contact = await get_contact_by_external_id(external_contact_id, channel, user_id)
@@ -1301,7 +1302,15 @@ async def handle_inbound_message(
     history = contact.get("history") or []
     if has_processed_transport_message(history, transport_metadata):
         print(f"[inbound] DUPLICATE channel={channel} external_id={external_contact_id}")
-        return {"reply": "", "sent": False, "skipped": True, "reason": "duplicate_message"}
+        return {
+            "reply": "",
+            "sent": False,
+            "should_send": False,
+            "mode": contact.get("automation_mode") or "supervised",
+            "skipped": True,
+            "reason": "duplicate_message",
+            "conversation_id": contact.get("id"),
+        }
 
     user_message = {
         "role": "user",
@@ -1341,7 +1350,15 @@ async def handle_inbound_message(
             )
             res.raise_for_status()
         print(f"[inbound] DISABLED channel={channel} external_id={external_contact_id}")
-        return {"reply": "", "sent": False, "skipped": True, "reason": "automation_disabled"}
+        return {
+            "reply": "",
+            "sent": False,
+            "should_send": False,
+            "mode": "disabled",
+            "skipped": True,
+            "reason": "automation_disabled",
+            "conversation_id": contact.get("id"),
+        }
 
     active_prompt = await get_active_prompt(contact.get("user_id"))
     system_prompt = build_angellos_beta_prompt(active_prompt)
@@ -1360,7 +1377,15 @@ async def handle_inbound_message(
         if channel == "instagram":
             await clear_manychat_agent_response(external_contact_id)
         print(f"[inbound] INACTIVE_HISTORY_ONLY channel={channel} external_id={external_contact_id}")
-        return {"reply": "", "sent": False, "skipped": True, "reason": "agent_inactive"}
+        return {
+            "reply": "",
+            "sent": False,
+            "should_send": False,
+            "mode": automation_mode,
+            "skipped": True,
+            "reason": "agent_inactive",
+            "conversation_id": contact.get("id"),
+        }
 
     canned_reply = get_angellos_beta_canned_reply(message)
     if canned_reply:
@@ -1390,16 +1415,21 @@ async def handle_inbound_message(
         else:
             print(f"[inbound] STOP_AGENT ignored for whatsapp test contact external_id={external_contact_id}")
 
-    sent = automation_mode == "auto"
+    should_send = automation_mode == "auto"
+    delegated_to_webhook_sender = should_send and not auto_send_transport
+    sent = False
     assistant_entry = {
         "role": "assistant",
         "content": reply,
         "timestamp": now_iso(),
         "channel": channel,
-        "sent": False if automation_mode == "auto" else sent,
+        "sent": delegated_to_webhook_sender,
         "ignored": False,
-        "source": "inbound_auto" if sent else "inbound_supervised",
+        "source": "inbound_auto" if should_send else "inbound_supervised",
     }
+    if delegated_to_webhook_sender:
+        assistant_entry["send_transport"] = "manychat_webhook_response"
+        assistant_entry["send_status_code"] = 202
     new_history = messages + [assistant_entry]
     if len(new_history) > MAX_HISTORY_TURNS * 2:
         new_history = new_history[-(MAX_HISTORY_TURNS * 2):]
@@ -1416,7 +1446,7 @@ async def handle_inbound_message(
         patch_data["pending_message"] = None
         patch_data["pending_message_at"] = None
 
-    if automation_mode == "auto":
+    if automation_mode == "auto" and auto_send_transport:
         async with httpx.AsyncClient() as http:
             res = await http.patch(
                 SUPABASE_CONVERSATIONS_URL,
@@ -1428,6 +1458,7 @@ async def handle_inbound_message(
             res.raise_for_status()
 
         send_result = await send_channel_message(contact, reply)
+        sent = send_result["status_code"] < 400
         sent_history = mark_last_auto_assistant_sent(new_history, send_result["status_code"] < 400, send_result)
         followup_patch = {
             "history": sent_history,
@@ -1446,7 +1477,7 @@ async def handle_inbound_message(
         if send_result["status_code"] >= 400:
             raise HTTPException(status_code=502, detail=f"{channel} send error")
     else:
-        send_result = None
+        send_result = {"status_code": 202, "body": "delegated_to_webhook_sender"} if delegated_to_webhook_sender else None
         async with httpx.AsyncClient() as http:
             res = await http.patch(
                 SUPABASE_CONVERSATIONS_URL,
@@ -1461,6 +1492,8 @@ async def handle_inbound_message(
     return {
         "reply": reply,
         "sent": sent,
+        "should_send": should_send,
+        "mode": automation_mode,
         "skipped": False,
         "reason": None,
         "send_result": send_result,
@@ -1484,8 +1517,20 @@ async def webhook(
         message=payload.message,
         user_id=user_id,
         transport_metadata={"provider": "manychat"},
+        auto_send_transport=False,
     )
-    return {"agent_response": result["reply"] or "SKIP"}
+    should_send = bool(result.get("should_send"))
+    mode = result.get("mode") or "supervised"
+    public_mode = "off" if mode == "disabled" else mode
+    reply = result.get("reply") or ""
+    return {
+        "agent_response": reply if should_send else "",
+        "suggested_response": reply if mode == "supervised" else "",
+        "should_send": should_send,
+        "mode": public_mode,
+        "automation_mode": mode,
+        "reason": result.get("reason"),
+    }
 
 
 @app.get("/webhooks/whatsapp")

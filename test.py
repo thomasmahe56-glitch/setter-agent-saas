@@ -20,4 +20,9 @@ req = urllib.request.Request(
 
 with urllib.request.urlopen(req) as res:
     data = json.loads(res.read())
-    print(data["agent_response"])
+    print(json.dumps({
+        "agent_response": data.get("agent_response", ""),
+        "should_send": data.get("should_send"),
+        "mode": data.get("mode"),
+        "suggested_response": data.get("suggested_response", ""),
+    }, ensure_ascii=False, indent=2))

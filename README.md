@@ -68,8 +68,16 @@ Body:
   "message": "{{last input text}}",
   "subscriber_id": "{{subscriber id}}"
 }
-Read the `agent_response` field in the response to send the message 
-to the prospect.
+Map `agent_response`, `should_send`, and `mode` from the response.
+Add a condition before any Instagram send step:
+- If `should_send` is `true`, send `agent_response`.
+- If `should_send` is `false`, do not send anything.
+
+The dashboard mode is the source of truth. In `supervised` mode,
+the backend saves the suggested reply as `pending_message` but returns
+an empty `agent_response` so ManyChat cannot accidentally send it.
+In `off` mode, the backend generates nothing and returns an empty
+`agent_response`.
 
 **H23 follow-up flow (ManyChat automation):**
 POST {RAILWAY_URL}/follow-ups/manychat-auto-23h
