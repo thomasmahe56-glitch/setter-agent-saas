@@ -9,9 +9,13 @@ import hmac
 import httpx
 import hashlib
 import difflib
+import base64
+import io
 import json
 import os
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -338,6 +342,73 @@ def clean_json_value(value):
             if (cleaned := clean_json_value(val)) not in ("", None, [], {})
         }
     return value
+
+
+def merge_unique_list(existing, incoming) -> list:
+    items: list[str] = []
+    seen: set[str] = set()
+    for value in [*(existing or []), *(incoming or [])]:
+        if not isinstance(value, str):
+            continue
+        cleaned = re.sub(r"\s+", " ", value).strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(cleaned)
+    return items
+
+
+def merge_structured_patch(existing: dict, patch: dict) -> dict:
+    merged = dict(existing or {})
+    for key, value in clean_json_value(patch or {}).items():
+        if isinstance(value, list):
+            merged[key] = merge_unique_list(merged.get(key), value)
+        elif isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = merge_structured_patch(merged.get(key) or {}, value)
+        elif value not in ("", None, [], {}):
+            merged[key] = value
+    return clean_json_value(merged)
+
+
+def extract_text_from_uploaded_knowledge(file_name: str, file_base64: str) -> str:
+    if not file_base64:
+        return ""
+    try:
+        raw = base64.b64decode(file_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid uploaded file")
+    if len(raw) > 8_000_000:
+        raise HTTPException(status_code=413, detail="Uploaded file is too large")
+
+    extension = (file_name.rsplit(".", 1)[-1] if "." in file_name else "").lower()
+    if extension in {"txt", "md", "markdown", "csv"}:
+        return raw.decode("utf-8", errors="ignore").strip()
+    if extension == "docx":
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                xml = archive.read("word/document.xml")
+            root = ET.fromstring(xml)
+            paragraphs = [
+                node.text.strip()
+                for node in root.iter()
+                if node.tag.endswith("}t") and node.text and node.text.strip()
+            ]
+            return "\n".join(paragraphs).strip()
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Unable to read DOCX text: {e}")
+    if extension == "pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(raw))
+            return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+        except ImportError:
+            raise HTTPException(status_code=500, detail="PDF extraction dependency is not installed")
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Unable to read PDF text: {e}")
+    raise HTTPException(status_code=415, detail="Unsupported file type")
 
 
 def parse_llm_json(raw: str) -> dict:
@@ -1219,6 +1290,10 @@ class TrainingProfilePayload(BaseModel):
     calendly_url: str = Field(default="", max_length=1000)
     sales_page_url: str = Field(default="", max_length=1000)
     raw_notes: str = Field(default="", max_length=8000)
+    sales_process: str = Field(default="", max_length=20000)
+    next_step: str = Field(default="", max_length=5000)
+    voice_profile: str = Field(default="", max_length=10000)
+    knowledge_sources: list[str] = Field(default_factory=list)
 
 
 class AvatarGeneratePayload(BaseModel):
@@ -1248,6 +1323,21 @@ class SalesRulesGeneratePayload(BaseModel):
 
 class SalesRulesSavePayload(BaseModel):
     rules: dict
+
+
+class KnowledgeExtractPayload(BaseModel):
+    manual_process: str = Field(default="", max_length=20000)
+    pasted_text: str = Field(default="", max_length=120000)
+    file_name: str = Field(default="", max_length=300)
+    file_type: str = Field(default="", max_length=120)
+    file_base64: str = Field(default="", max_length=12_000_000)
+    category: str = Field(default="mixed", max_length=120)
+
+
+class KnowledgeTrainPayload(BaseModel):
+    profile_patch: dict = Field(default_factory=dict)
+    avatar_patch: dict = Field(default_factory=dict)
+    rules_patch: dict = Field(default_factory=dict)
 
 
 class FollowUpPreviewPayload(BaseModel):
@@ -2965,6 +3055,139 @@ async def autosave_agent_sales_rules(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Supabase upsert error: {e}")
     return {"success": True, "sales_rules": row}
+
+
+@app.post("/agent/knowledge/extract")
+async def extract_agent_knowledge(
+    payload: KnowledgeExtractPayload,
+    user_id: str = Depends(require_jwt),
+):
+    if client is None:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+
+    uploaded_text = extract_text_from_uploaded_knowledge(payload.file_name, payload.file_base64)
+    source_text = "\n\n".join(
+        part for part in [
+            f"Manual sales process:\n{payload.manual_process.strip()}" if payload.manual_process.strip() else "",
+            f"Uploaded or pasted knowledge:\n{payload.pasted_text.strip()}" if payload.pasted_text.strip() else "",
+            f"Uploaded file text:\n{uploaded_text}" if uploaded_text else "",
+        ]
+        if part
+    ).strip()
+    if len(source_text) < 20:
+        raise HTTPException(status_code=422, detail="Add a sales process or paste document text first")
+
+    system = (
+        "You extract structured sales knowledge and voice profile for Angellos, an Instagram DM setter. "
+        "Do not copy long-form transcript wording into DM replies. Learn the user's voice, then adapt it to short, natural Instagram DMs. "
+        "Return only valid JSON with no markdown."
+    )
+    user_message = (
+        f"Source name: {payload.file_name or 'manual input'}\n"
+        f"Source type: {payload.file_type or payload.category or 'mixed'}\n\n"
+        f"{source_text[:120000]}\n\n"
+        "Extract exactly this JSON shape:\n"
+        "{\n"
+        '  "profile_patch": {\n'
+        '    "raw_notes": "",\n'
+        '    "sales_process": "",\n'
+        '    "next_step": "",\n'
+        '    "voice_profile": "",\n'
+        '    "tone_rules": [],\n'
+        '    "forbidden_phrases": [],\n'
+        '    "knowledge_sources": []\n'
+        "  },\n"
+        '  "avatar_patch": {\n'
+        '    "persona_summary": "",\n'
+        '    "pain_points": [],\n'
+        '    "objections": [],\n'
+        '    "buying_triggers": [],\n'
+        '    "bad_fit": [],\n'
+        '    "exact_words": []\n'
+        "  },\n"
+        '  "rules_patch": {\n'
+        '    "qualification_questions": [],\n'
+        '    "buying_signals": [],\n'
+        '    "call_offer_conditions": [],\n'
+        '    "red_flags": [],\n'
+        '    "stop_conditions": [],\n'
+        '    "objection_responses": [],\n'
+        '    "faq_answers": [],\n'
+        '    "follow_up_rules": [],\n'
+        '    "do_not_say": [],\n'
+        '    "escalation_rules": [],\n'
+        '    "links_or_resources": []\n'
+        "  },\n"
+        '  "preview": {\n'
+        '    "sales_process_found": [],\n'
+        '    "qualification_questions_found": [],\n'
+        '    "good_fit_signals": [],\n'
+        '    "bad_fit_signals": [],\n'
+        '    "next_step": [],\n'
+        '    "objection_answers": [],\n'
+        '    "faq_answers": [],\n'
+        '    "voice_profile_found": [],\n'
+        '    "phrases_to_use": [],\n'
+        '    "phrases_to_avoid": []\n'
+        "  }\n"
+        "}\n"
+        "Keep every list item short and editable. If a field is unknown, use an empty string or empty list."
+    )
+    try:
+        raw = generate_claude_reply([{"role": "user", "content": user_message}], system)
+        extracted = clean_json_value(parse_llm_json(raw))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Knowledge extraction error: {e}")
+
+    return {
+        "profile_patch": extracted.get("profile_patch") or {},
+        "avatar_patch": extracted.get("avatar_patch") or {},
+        "rules_patch": extracted.get("rules_patch") or {},
+        "preview": extracted.get("preview") or {},
+    }
+
+
+@app.post("/agent/knowledge/train")
+async def train_agent_from_knowledge(
+    payload: KnowledgeTrainPayload,
+    user_id: str = Depends(require_jwt),
+):
+    try:
+        profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id)
+        avatar_row = await get_user_singleton_row(SUPABASE_AGENT_AVATARS_URL, user_id)
+        sales_rules_row = await get_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id)
+
+        profile = merge_structured_patch((profile_row or {}).get("profile") or {}, payload.profile_patch)
+        avatar = merge_structured_patch((avatar_row or {}).get("avatar") or {}, payload.avatar_patch)
+        rules = merge_structured_patch((sales_rules_row or {}).get("rules") or {}, payload.rules_patch)
+
+        profile_saved = await upsert_user_singleton_row(
+            SUPABASE_AGENT_PROFILES_URL,
+            user_id,
+            {"profile": profile},
+        )
+        avatar_saved = await upsert_user_singleton_row(
+            SUPABASE_AGENT_AVATARS_URL,
+            user_id,
+            {
+                "source_inputs": (avatar_row or {}).get("source_inputs") or {},
+                "avatar": avatar,
+            },
+        )
+        rules_saved = await upsert_user_singleton_row(
+            SUPABASE_AGENT_SALES_RULES_URL,
+            user_id,
+            {"rules": rules},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Knowledge save error: {e}")
+
+    return {
+        "success": True,
+        "profile": profile_saved,
+        "avatar": avatar_saved,
+        "sales_rules": rules_saved,
+    }
 
 
 @app.post("/agent/prompt/rebuild")
