@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Header, HTTPException, Depends, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -43,6 +44,70 @@ META_APP_SECRET = config.meta_app_secret
 GRAPH_API_VERSION = config.graph_api_version or "v23.0"
 WHATSAPP_SEND_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 MAX_HISTORY_TURNS = 40
+
+GENERIC_AI_USER_MESSAGE = "Angellos couldn’t generate a reply right now. Please check your AI credits or try again."
+LOW_CREDITS_USER_MESSAGE = "Angellos couldn’t generate a reply because the Anthropic account has no available credits. Add credits in Anthropic billing, then try again."
+
+
+class ProviderGenerationError(Exception):
+    def __init__(self, error_type: str, message: str, user_message: str, status_code: int = 502):
+        super().__init__(message)
+        self.error_type = error_type
+        self.message = message
+        self.user_message = user_message
+        self.status_code = status_code
+
+
+def classify_provider_error(error: Exception) -> ProviderGenerationError:
+    text = str(error)
+    lowered = text.lower()
+    if any(marker in lowered for marker in ["credit balance", "credits", "billing", "insufficient_credit"]):
+        return ProviderGenerationError(
+            "provider_billing",
+            "Anthropic credits are too low.",
+            LOW_CREDITS_USER_MESSAGE,
+            status_code=402,
+        )
+    if "rate" in lowered or "429" in lowered:
+        return ProviderGenerationError(
+            "provider_rate_limit",
+            "Anthropic is rate limiting requests.",
+            GENERIC_AI_USER_MESSAGE,
+            status_code=429,
+        )
+    if "timeout" in lowered or "timed out" in lowered:
+        return ProviderGenerationError(
+            "provider_timeout",
+            "Anthropic request timed out.",
+            GENERIC_AI_USER_MESSAGE,
+            status_code=504,
+        )
+    if "invalid request" in lowered or "400" in lowered:
+        return ProviderGenerationError(
+            "provider_invalid_request",
+            "Anthropic rejected the generation request.",
+            GENERIC_AI_USER_MESSAGE,
+            status_code=502,
+        )
+    return ProviderGenerationError(
+        "provider_error",
+        "Anthropic generation failed.",
+        GENERIC_AI_USER_MESSAGE,
+        status_code=502,
+    )
+
+
+def provider_error_payload(error: ProviderGenerationError) -> dict:
+    return {
+        "ok": False,
+        "error_type": error.error_type,
+        "message": error.message,
+        "user_message": error.user_message,
+    }
+
+
+def provider_error_response(error: ProviderGenerationError) -> JSONResponse:
+    return JSONResponse(status_code=error.status_code, content=provider_error_payload(error))
 AGENT_OPTIONS_START = "<!-- AGENT_OPTIONS_START -->"
 AGENT_OPTIONS_END = "<!-- AGENT_OPTIONS_END -->"
 AGENT_PROFILE_START = "<!-- AGENT_PROFILE_START -->"
@@ -994,13 +1059,18 @@ async def upsert_user_singleton_row(table_url: str, user_id: str, payload: dict)
 
 
 def generate_claude_reply(messages: list, system_prompt: str = "") -> str:
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=1024,
-        system=system_prompt,
-        messages=messages,
-    )
-    return response.content[0].text
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            system=system_prompt,
+            messages=messages,
+        )
+        return response.content[0].text
+    except ProviderGenerationError:
+        raise
+    except Exception as e:
+        raise classify_provider_error(e) from e
 
 
 async def send_manychat_message(subscriber_id: str, text: str) -> dict:
@@ -1186,8 +1256,8 @@ async def generate_follow_up_message(conversation: dict, stage: str) -> str:
             [{"role": "user", "content": user_message}],
             build_angellos_beta_prompt(build_follow_up_prompt(config)),
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+    except ProviderGenerationError as e:
+        raise HTTPException(status_code=e.status_code, detail=provider_error_payload(e))
 
     reply = sanitize_angellos_beta_reply(reply, conversation.get("message", ""))
     return validate_agent_reply(reply, generation_prompt)
@@ -1492,8 +1562,31 @@ async def handle_inbound_message(
 
         try:
             reply = generate_claude_reply(strip_message_metadata(messages_for_generation), system_prompt)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+        except ProviderGenerationError as e:
+            patch_data["pending_message"] = None
+            patch_data["pending_message_at"] = None
+            async with httpx.AsyncClient() as http:
+                res = await http.patch(
+                    SUPABASE_CONVERSATIONS_URL,
+                    headers={**supabase_headers(), "Prefer": "return=minimal"},
+                    params={"id": f"eq.{contact.get('id')}", "user_id": f"eq.{user_id}"},
+                    json=patch_data,
+                    timeout=10.0,
+                )
+                res.raise_for_status()
+            if channel == "instagram":
+                await clear_manychat_agent_response(external_contact_id)
+            print(f"[inbound] PROVIDER_ERROR channel={channel} external_id={external_contact_id} type={e.error_type}")
+            return {
+                "reply": "",
+                "sent": False,
+                "should_send": False,
+                "mode": automation_mode,
+                "skipped": True,
+                "reason": e.error_type,
+                "error": provider_error_payload(e),
+                "conversation_id": contact.get("id"),
+            }
         reply, should_stop_agent = split_stop_agent_reply(reply)
     reply = sanitize_angellos_beta_reply(reply, message)
     reply = validate_agent_reply(reply, system_prompt)
@@ -1620,6 +1713,8 @@ async def webhook(
         "mode": public_mode,
         "automation_mode": mode,
         "reason": result.get("reason"),
+        "ok": not bool(result.get("error")),
+        "error": result.get("error"),
     }
 
 
@@ -2027,8 +2122,8 @@ async def refine_pending(
             [{"role": "user", "content": refine_prompt}],
             generation_prompt,
         )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+    except ProviderGenerationError as e:
+        return provider_error_response(e)
 
     last_prospect_message = next(
         ((msg.get("content") or "") for msg in reversed(history) if msg.get("role") == "user"),
@@ -2269,8 +2364,8 @@ async def playground(
         )
     try:
         reply = generate_claude_reply(payload.messages, system_prompt)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+    except ProviderGenerationError as e:
+        return provider_error_response(e)
     last_prospect_message = next(
         ((msg.get("content") or "") for msg in reversed(payload.messages) if msg.get("role") == "user"),
         "",
@@ -2341,7 +2436,7 @@ async def run_feedback_loop(
         )
         raw = response.content[0].text.strip()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+        return provider_error_response(classify_provider_error(e))
 
     # 4. Parse the JSON response
     try:
@@ -2434,7 +2529,7 @@ async def preview_prompt(
         )
         raw = response.content[0].text.strip()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+        return provider_error_response(classify_provider_error(e))
 
     try:
         if raw.startswith("```"):
@@ -2578,8 +2673,10 @@ async def refine_prompt(
             )
             raw = response.content[0].text.strip()
             result = normalize_prompt_refinement_result(parse_llm_json(raw), current_prompt)
+        except ProviderGenerationError as e:
+            return provider_error_response(e)
         except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Prompt refinement error: {e}")
+            return provider_error_response(classify_provider_error(e))
 
     updated_prompt = result["updated_prompt"]
     visual_diff = build_prompt_diff(current_prompt, updated_prompt)
@@ -2916,8 +3013,10 @@ async def generate_agent_avatar(
     try:
         raw = generate_claude_reply([{"role": "user", "content": user_message}], system)
         avatar = clean_json_value(parse_llm_json(raw))
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Avatar generation error: {e}")
+    except ProviderGenerationError as e:
+        return provider_error_response(e)
+    except Exception:
+        return provider_error_response(classify_provider_error(Exception("Invalid AI response")))
 
     return {"avatar": avatar}
 
@@ -3019,8 +3118,10 @@ async def generate_agent_sales_rules(
     try:
         raw = generate_claude_reply([{"role": "user", "content": user_message}], system)
         rules = clean_json_value(parse_llm_json(raw))
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Sales rules generation error: {e}")
+    except ProviderGenerationError as e:
+        return provider_error_response(e)
+    except Exception:
+        return provider_error_response(classify_provider_error(Exception("Invalid AI response")))
 
     return {"rules": rules}
 
@@ -3136,8 +3237,10 @@ async def extract_agent_knowledge(
     try:
         raw = generate_claude_reply([{"role": "user", "content": user_message}], system)
         extracted = clean_json_value(parse_llm_json(raw))
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Knowledge extraction error: {e}")
+    except ProviderGenerationError as e:
+        return provider_error_response(e)
+    except Exception:
+        return provider_error_response(classify_provider_error(Exception("Invalid AI response")))
 
     return {
         "profile_patch": extracted.get("profile_patch") or {},
