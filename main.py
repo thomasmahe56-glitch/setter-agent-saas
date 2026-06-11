@@ -47,6 +47,8 @@ MAX_HISTORY_TURNS = 40
 
 GENERIC_AI_USER_MESSAGE = "Angellos couldn’t generate a reply right now. Please check your AI credits or try again."
 LOW_CREDITS_USER_MESSAGE = "Angellos couldn’t generate a reply because the Anthropic account has no available credits. Add credits in Anthropic billing, then try again."
+PROMPT_REFINEMENT_SAVE_USER_MESSAGE = "Angellos couldn’t save this update. Please try again."
+PROMPT_REFINEMENT_SAVE_HINT = "If the issue continues, check the Training Center database configuration."
 
 
 class ProviderGenerationError(Exception):
@@ -108,6 +110,30 @@ def provider_error_payload(error: ProviderGenerationError) -> dict:
 
 def provider_error_response(error: ProviderGenerationError) -> JSONResponse:
     return JSONResponse(status_code=error.status_code, content=provider_error_payload(error))
+
+
+def prompt_refinement_save_error_response(error: Exception) -> JSONResponse:
+    status_code = 502
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = 502
+        response = error.response
+        print(
+            "[refine-prompt:apply:error] "
+            f"status={response.status_code} url={response.request.url} body={response.text[:1000]}"
+        )
+    else:
+        print(f"[refine-prompt:apply:error] {type(error).__name__}: {error}")
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "success": False,
+            "ok": False,
+            "error_type": "prompt_refinement_save_failed",
+            "message": PROMPT_REFINEMENT_SAVE_USER_MESSAGE,
+            "user_message": PROMPT_REFINEMENT_SAVE_USER_MESSAGE,
+            "hint": PROMPT_REFINEMENT_SAVE_HINT,
+        },
+    )
 AGENT_OPTIONS_START = "<!-- AGENT_OPTIONS_START -->"
 AGENT_OPTIONS_END = "<!-- AGENT_OPTIONS_END -->"
 AGENT_PROFILE_START = "<!-- AGENT_PROFILE_START -->"
@@ -510,6 +536,34 @@ def build_prompt_diff(before: str, after: str) -> list[dict]:
     return visual_diff[:160]
 
 
+FRENCH_REFINEMENT_MARKERS = [
+    "ton rôle",
+    "ton role",
+    "votre rôle",
+    "votre role",
+    "rôle :",
+    "role :",
+    "appel",
+    "prospects instagram",
+    "page de présentation",
+    "ne vends pas",
+    "qualifier et orienter",
+    "section ciblee",
+    "section ciblée",
+]
+
+
+def looks_like_french_refinement_text(value: object) -> bool:
+    if isinstance(value, dict):
+        return any(looks_like_french_refinement_text(item) for item in value.values())
+    if isinstance(value, list):
+        return any(looks_like_french_refinement_text(item) for item in value)
+    if not isinstance(value, str):
+        return False
+    lowered = value.lower()
+    return any(marker in lowered for marker in FRENCH_REFINEMENT_MARKERS)
+
+
 def normalize_prompt_refinement_result(raw_result: dict, current_prompt: str) -> dict:
     updated_prompt = (raw_result.get("updated_prompt") or raw_result.get("prompt_updated") or "").strip()
     if not updated_prompt:
@@ -520,7 +574,7 @@ def normalize_prompt_refinement_result(raw_result: dict, current_prompt: str) ->
         raise ValueError("Claude returned a prompt that is suspiciously short")
     return {
         "updated_prompt": updated_prompt,
-        "target_section": str(raw_result.get("target_section") or "section ciblee").strip(),
+        "target_section": str(raw_result.get("target_section") or "Target section").strip(),
         "summary": str(raw_result.get("summary") or "").strip(),
         "changes": raw_result.get("changes") if isinstance(raw_result.get("changes"), list) else [],
     }
@@ -537,6 +591,8 @@ def format_training_center_for_prompt(profile: dict, avatar: dict, sales_rules: 
     parts = [
         "=== TRAINING CENTER ANGELOS ===",
         "This structured data is the business source of truth. Apply it before generic prompt examples.",
+        "Default language: English for Angellos English beta.",
+        "Use French only when the prospect writes in French first or the full business setup is explicitly French.",
     ]
     if profile:
         parts.extend([
@@ -2512,6 +2568,12 @@ async def preview_prompt(
         f"{fmt(payload.selected_suggestions, 'Selected business suggestions')}\n"
         f"{fmt(payload.selected_pain_points, 'Detected pain points to integrate into qualification')}\n"
         f"{fmt(payload.selected_objections, 'Objections to handle better in the prompt')}\n"
+        f"Language rules:\n"
+        f"- Default to English for Angellos English beta.\n"
+        f"- Return the modified prompt, diff lines, and justifications in English.\n"
+        f"- If the active prompt contains French labels, translate modified/saved labels into English.\n"
+        f"- Never output French labels like 'TON RÔLE'; use English labels like 'Your role'.\n"
+        f"- Use French only if the user's full business setup is explicitly written in French.\n"
         f'Generate the complete modified prompt, then return ONLY valid JSON:\n'
         f'{{"prompt_proposed": "<complete modified prompt>", "diff": [{{"line": "<text>", "type": "add|remove|keep", "justification": "<why>"}}]}}\n'
         f'In the diff: "add" = added or modified line, "remove" = deleted or replaced line, '
@@ -2524,7 +2586,12 @@ async def preview_prompt(
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=4096,
-            system="You are an expert in AI prompt optimization.",
+            system=(
+                "You are an expert in AI prompt optimization. "
+                "Default language is English for Angellos English beta. "
+                "Return generated prompt lines, diffs, summaries, and justifications in English. "
+                "Never use French labels like 'TON RÔLE'; use English labels like 'Your role'."
+            ),
             messages=[{"role": "user", "content": user_message}],
         )
         raw = response.content[0].text.strip()
@@ -2643,6 +2710,10 @@ async def refine_prompt(
             "You must modify an existing prompt surgically. "
             "Never rewrite the whole prompt for a minor instruction. "
             "Keep the structure, technical tags, and business data intact unless the modification targets that section. "
+            "Default language is English for Angellos English beta. "
+            "Return every generated rule, summary, change description, workflow update, target section, and saved instruction in English. "
+            "Do not write French unless the user's full business setup is explicitly written in French. "
+            "Never output French section labels such as 'TON RÔLE'; use English labels such as 'Your role'. "
             "Return only valid JSON, with no markdown."
         )
         user_message = (
@@ -2650,6 +2721,12 @@ async def refine_prompt(
             f"{instruction}\n\n"
             "Active prompt:\n"
             f"<active_prompt>\n{current_prompt}\n</active_prompt>\n\n"
+            "Language rules:\n"
+            "- Angellos is currently in the English beta, so English is the default language.\n"
+            "- Keep the updated prompt, generated rules, target_section, summary, and changes in English.\n"
+            "- If the active prompt contains French headings or rules, translate the modified/saved version into natural English.\n"
+            "- Use labels like 'Your role', 'Qualification process', and 'Orientation flow'. Never use 'TON RÔLE' or other French labels.\n"
+            "- Only use French if the user's full business setup is explicitly written in French.\n\n"
             "Analyze which section is concerned: tone, rules, qualification questions, follow-ups, price, objections, links, or guardrails.\n"
             "Apply only the minimum necessary modification. Expected examples:\n"
             '- "He uses too many emojis" => add/reinforce a zero-emoji rule in the tone section.\n'
@@ -2673,6 +2750,22 @@ async def refine_prompt(
             )
             raw = response.content[0].text.strip()
             result = normalize_prompt_refinement_result(parse_llm_json(raw), current_prompt)
+            if looks_like_french_refinement_text(result):
+                retry_message = (
+                    f"{user_message}\n\n"
+                    "The previous draft used French. Regenerate the same surgical update fully in English. "
+                    "Translate any French rule labels into English. Return only the required JSON."
+                )
+                response = client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=8192,
+                    system=system,
+                    messages=[{"role": "user", "content": retry_message}],
+                )
+                raw = response.content[0].text.strip()
+                result = normalize_prompt_refinement_result(parse_llm_json(raw), current_prompt)
+                if looks_like_french_refinement_text(result):
+                    raise ValueError("Claude returned French text for an English beta prompt refinement")
         except ProviderGenerationError as e:
             return provider_error_response(e)
         except Exception as e:
@@ -2730,7 +2823,7 @@ async def refine_prompt(
             created = res.json()
             new_version = created[0] if isinstance(created, list) else created
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Supabase prompt refinement save error: {e}")
+        return prompt_refinement_save_error_response(e)
 
     response_payload.update({
         "applied": True,
@@ -2988,6 +3081,8 @@ async def generate_agent_avatar(
     system = (
         "You are a CRM and sales enablement strategist for an Instagram setter. "
         "Transform raw answers into a client avatar usable by an AI agent. "
+        "Default language is English for Angellos English beta. "
+        "Return all summaries, rules, list items, and labels in English unless the user's full business setup is explicitly in French. "
         "Return only valid JSON, with no markdown."
     )
     user_message = (
@@ -3094,6 +3189,8 @@ async def generate_agent_sales_rules(
     system = (
         "You are an expert in Instagram DM qualification for coaches and infopreneurs. "
         "Create simple, operational, and non-aggressive rules for an AI setter agent. "
+        "Default language is English for Angellos English beta. "
+        "Return all generated rules, workflow updates, summaries, and labels in English unless the user's full business setup is explicitly in French. "
         "Return only valid JSON, with no markdown."
     )
     user_message = (
@@ -3181,6 +3278,8 @@ async def extract_agent_knowledge(
     system = (
         "You extract structured sales knowledge and voice profile for Angellos, an Instagram DM setter. "
         "Do not copy long-form transcript wording into DM replies. Learn the user's voice, then adapt it to short, natural Instagram DMs. "
+        "Default language is English for Angellos English beta. "
+        "Return extracted summaries, generated rules, workflow updates, and preview items in English unless the full source business setup is explicitly in French. "
         "Return only valid JSON with no markdown."
     )
     user_message = (

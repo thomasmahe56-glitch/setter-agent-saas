@@ -123,6 +123,10 @@ def build_analysis_prompt(config: Config) -> str:
     return f"""You are an expert in sales conversation analysis and copywriting.
 You analyze Instagram DM conversations for a coach / infopreneur ({config.business_name}).
 The setter's goal: qualify prospects and guide them toward a presentation page or discovery call.
+Default language is English for Angellos English beta.
+Return all generated suggestions, summaries, prompt updates, rules, diffs, and justifications in English.
+Use French only if the full business setup and conversations are explicitly in French.
+Never output French prompt labels such as "TON RÔLE"; use English labels such as "Your role".
 Analyze the provided conversations and return ONLY valid JSON with this exact structure:
 {{
   "pain_points": [{{"text": "", "frequency": 0, "examples": [""]}}],
