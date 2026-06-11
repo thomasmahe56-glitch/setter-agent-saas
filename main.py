@@ -416,6 +416,195 @@ def strip_training_center(prompt: str) -> str:
     ).strip()
 
 
+def extract_training_center_payload(prompt: str) -> dict:
+    block_match = re.search(
+        rf"{re.escape(TRAINING_CENTER_START)}(.*?){re.escape(TRAINING_CENTER_END)}",
+        prompt or "",
+        flags=re.DOTALL,
+    )
+    if not block_match:
+        return {}
+    try:
+        payload = json.loads(block_match.group(1).strip())
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def clean_text(value: object) -> str:
+    return re.sub(r"\s+", " ", value).strip() if isinstance(value, str) else ""
+
+
+def clean_text_list(value: object, limit: int = 8) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = []
+    cleaned: list[str] = []
+    for item in values:
+        text = clean_text(item)
+        if text:
+            cleaned.append(text)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def first_text(*values: object) -> str:
+    for value in values:
+        text = clean_text(value)
+        if text:
+            return text
+    return ""
+
+
+def sentence_join(items: list[str], empty: str) -> str:
+    if not items:
+        return empty
+    return " ".join(item.rstrip(".") + "." for item in items if item)
+
+
+def version_created_from(version: dict) -> dict:
+    source = clean_text(version.get("source")) or "Manual update"
+    instruction = clean_text(version.get("refinement_instruction"))
+    if not instruction and source.startswith("training-refine:"):
+        instruction = source.removeprefix("training-refine:").strip()
+    if instruction:
+        return {
+            "label": "Correction",
+            "detail": instruction[:220],
+        }
+    if source == "training-center":
+        return {"label": "Knowledge & voice upload", "detail": ""}
+    if source == "agent-profile":
+        return {"label": "Offer update", "detail": ""}
+    if source == "agent-options":
+        return {"label": "Link settings", "detail": ""}
+    if source == "feedback-loop":
+        return {"label": "Conversation analysis", "detail": ""}
+    return {"label": source, "detail": ""}
+
+
+def prompt_version_memory_snapshot(version: dict, previous_version: Optional[dict] = None) -> dict:
+    content = version.get("content") or ""
+    payload = extract_training_center_payload(content)
+    profile = payload.get("agent_profile") if isinstance(payload.get("agent_profile"), dict) else {}
+    avatar = payload.get("agent_avatar") if isinstance(payload.get("agent_avatar"), dict) else {}
+    rules = payload.get("agent_sales_rules") if isinstance(payload.get("agent_sales_rules"), dict) else {}
+
+    legacy_profile = extract_agent_profile(content)
+    if not profile and legacy_profile:
+        profile = legacy_profile
+
+    offer_items = [
+        first_text(profile.get("business_name"), profile.get("offer_name")),
+        first_text(profile.get("offer_promise")),
+        first_text(profile.get("offer_format")),
+        first_text(profile.get("price")),
+    ]
+    offer_summary = sentence_join([item for item in offer_items if item], "No offer details were saved in this version.")
+
+    ideal_customer_items = [
+        first_text(avatar.get("persona_summary"), profile.get("avatar_client")),
+        *clean_text_list(avatar.get("pain_points"), 3),
+        *clean_text_list(avatar.get("objections"), 2),
+    ]
+    ideal_customer = sentence_join(
+        [item for item in ideal_customer_items if item],
+        "No ideal customer summary was saved in this version.",
+    )
+
+    sales_process_raw = clean_text(profile.get("sales_process"))
+    process_steps = clean_text_list(sales_process_raw.splitlines() if sales_process_raw else [], 8)
+    if not process_steps:
+        process_steps = [
+            *clean_text_list(rules.get("qualification_questions"), 4),
+            *clean_text_list(rules.get("call_offer_conditions"), 3),
+        ]
+    sales_process = [
+        f"Step {index + 1}: {step.rstrip('.')}"
+        for index, step in enumerate(process_steps[:8])
+    ]
+
+    next_step = first_text(profile.get("next_step"))
+    if not next_step:
+        next_step = sentence_join(
+            clean_text_list(rules.get("call_offer_conditions"), 2),
+            "No specific next step was saved in this version.",
+        )
+
+    voice_items = [
+        first_text(profile.get("voice_profile")),
+        *clean_text_list(profile.get("tone_rules"), 4),
+    ]
+    voice = sentence_join(
+        [item for item in voice_items if item],
+        "Direct, human, concise. Ask one question at a time.",
+    )
+
+    conversation_rules = [
+        *clean_text_list(rules.get("qualification_questions"), 4),
+        *clean_text_list(rules.get("buying_signals"), 3),
+        *clean_text_list(rules.get("call_offer_conditions"), 3),
+        *clean_text_list(rules.get("follow_up_rules"), 3),
+        *clean_text_list(rules.get("escalation_rules"), 2),
+    ][:12]
+
+    forbidden_topics = [
+        *clean_text_list(profile.get("forbidden_phrases"), 6),
+        *clean_text_list(rules.get("do_not_say"), 6),
+        *clean_text_list(rules.get("red_flags"), 3),
+        *clean_text_list(rules.get("stop_conditions"), 3),
+    ][:12]
+
+    changes: list[str] = []
+    prompt_diff = version.get("prompt_diff") if isinstance(version.get("prompt_diff"), list) else []
+    added = [clean_text(item.get("line")) for item in prompt_diff if isinstance(item, dict) and item.get("type") == "add"]
+    removed = [clean_text(item.get("line")) for item in prompt_diff if isinstance(item, dict) and item.get("type") == "remove"]
+    if added or removed:
+        if removed:
+            changes.append(f"Before: {removed[0][:220]}")
+        if added:
+            changes.append(f"After: {added[0][:220]}")
+
+    if previous_version and not changes:
+        previous_snapshot = prompt_version_memory_snapshot(previous_version)
+        previous_next_step = previous_snapshot.get("next_step") or ""
+        if previous_next_step and previous_next_step != next_step:
+            changes.append(f"Changed next step from “{previous_next_step[:160]}” to “{next_step[:160]}”.")
+        previous_voice = previous_snapshot.get("voice") or ""
+        if previous_voice and previous_voice != voice:
+            changes.append("Updated Angellos’ voice and reply style.")
+        previous_rules = previous_snapshot.get("conversation_rules") or []
+        if previous_rules != conversation_rules:
+            changes.append("Updated how Angellos qualifies, replies, or guides prospects.")
+
+    if not changes:
+        source = clean_text(version.get("source"))
+        if source:
+            changes.append(f"Created from {version_created_from(version)['label'].lower()}.")
+
+    summary = changes[0] if changes else "This version stores what Angellos knew at that moment."
+
+    return {
+        "id": version.get("id"),
+        "created_at": version.get("created_at"),
+        "is_active": bool(version.get("is_active")),
+        "source": version_created_from(version),
+        "summary": summary,
+        "offer": offer_summary,
+        "ideal_customer": ideal_customer,
+        "sales_process": sales_process,
+        "next_step": next_step,
+        "voice": voice,
+        "conversation_rules": conversation_rules,
+        "forbidden_topics": forbidden_topics,
+        "what_changed": changes[:6],
+    }
+
+
 def append_agent_profile(prompt: str, profile: dict) -> str:
     prompt = strip_agent_profile(prompt)
     clean_profile = {
@@ -1128,6 +1317,80 @@ async def require_owned_prompt_version(version_id: str, user_id: str) -> dict:
     if not rows:
         raise HTTPException(status_code=404, detail="Prompt version not found")
     return rows[0]
+
+
+async def fetch_prompt_version_for_memory(version_id: str, user_id: str) -> dict:
+    async with httpx.AsyncClient() as http:
+        params = {
+            "id": f"eq.{version_id}",
+            **owner_scope(user_id),
+            "select": "id,created_at,is_active,source,insight_id,content,refinement_instruction,refinement_applied_at,previous_version_id,prompt_diff",
+            "limit": "1",
+        }
+        try:
+            res = await http.get(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params=params,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        except httpx.HTTPStatusError as select_error:
+            if not is_supabase_schema_cache_error(select_error):
+                raise
+            print(
+                "[prompt-version-memory:schema-fallback] "
+                f"status={select_error.response.status_code} body={select_error.response.text[:1000]}"
+            )
+            res = await http.get(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params={
+                    "id": f"eq.{version_id}",
+                    **owner_scope(user_id),
+                    "select": "id,created_at,is_active,source,insight_id,content",
+                    "limit": "1",
+                },
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        rows = res.json()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Prompt version not found")
+    return rows[0]
+
+
+async def fetch_previous_prompt_version_for_memory(version: dict, user_id: str) -> Optional[dict]:
+    previous_id = clean_text(version.get("previous_version_id"))
+    if previous_id:
+        try:
+            return await fetch_prompt_version_for_memory(previous_id, user_id)
+        except Exception as e:
+            print(f"[prompt-version-memory] previous_id lookup failed: {e}")
+
+    created_at = clean_text(version.get("created_at"))
+    if not created_at:
+        return None
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.get(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params={
+                    "created_at": f"lt.{created_at}",
+                    **owner_scope(user_id),
+                    "order": "created_at.desc",
+                    "select": "id,created_at,is_active,source,insight_id,content",
+                    "limit": "1",
+                },
+                timeout=10.0,
+            )
+            res.raise_for_status()
+            rows = res.json()
+            return rows[0] if rows else None
+    except Exception as e:
+        print(f"[prompt-version-memory] previous version lookup failed: {e}")
+        return None
 
 
 async def get_user_singleton_row(table_url: str, user_id: str, select: str = "*") -> Optional[dict]:
@@ -2950,6 +3213,22 @@ async def get_prompt_versions(
             return res.json()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
+
+
+@app.get("/prompt-versions/{version_id}/memory")
+async def get_prompt_version_memory(
+    version_id: str,
+    user_id: str = Depends(require_jwt),
+):
+    try:
+        version = await fetch_prompt_version_for_memory(version_id, user_id)
+        previous_version = await fetch_previous_prompt_version_for_memory(version, user_id)
+        return prompt_version_memory_snapshot(version, previous_version)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[prompt-version-memory:error] version_id={version_id} error={type(e).__name__}: {e}")
+        raise HTTPException(status_code=502, detail="Unable to inspect this version")
 
 
 @app.post("/prompt-versions/{version_id}/restore")
