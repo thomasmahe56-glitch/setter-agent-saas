@@ -134,6 +134,20 @@ def prompt_refinement_save_error_response(error: Exception) -> JSONResponse:
             "hint": PROMPT_REFINEMENT_SAVE_HINT,
         },
     )
+
+
+def is_supabase_schema_cache_error(error: Exception) -> bool:
+    if not isinstance(error, httpx.HTTPStatusError):
+        return False
+    if error.response.status_code != 400:
+        return False
+    body = error.response.text.lower()
+    return (
+        "schema cache" in body
+        or "could not find" in body
+        or "column" in body
+        or "pgrst204" in body
+    )
 AGENT_OPTIONS_START = "<!-- AGENT_OPTIONS_START -->"
 AGENT_OPTIONS_END = "<!-- AGENT_OPTIONS_END -->"
 AGENT_PROFILE_START = "<!-- AGENT_PROFILE_START -->"
@@ -2850,13 +2864,35 @@ async def refine_prompt(
                 "previous_version_id": active_version.get("id"),
                 "prompt_diff": visual_diff,
             }
-            res = await http.post(
-                SUPABASE_PROMPT_VERSIONS_URL,
-                headers={**supabase_headers(), "Prefer": "return=representation"},
-                json=insert_payload,
-                timeout=10.0,
-            )
-            res.raise_for_status()
+            try:
+                res = await http.post(
+                    SUPABASE_PROMPT_VERSIONS_URL,
+                    headers={**supabase_headers(), "Prefer": "return=representation"},
+                    json=insert_payload,
+                    timeout=10.0,
+                )
+                res.raise_for_status()
+            except httpx.HTTPStatusError as insert_error:
+                if not is_supabase_schema_cache_error(insert_error):
+                    raise
+                print(
+                    "[refine-prompt:apply:schema-fallback] "
+                    f"status={insert_error.response.status_code} body={insert_error.response.text[:1000]}"
+                )
+                legacy_payload = {
+                    **row_owner_fields(user_id),
+                    "content": updated_prompt,
+                    "is_active": True,
+                    "source": prompt_refinement_source(instruction),
+                    "insight_id": None,
+                }
+                res = await http.post(
+                    SUPABASE_PROMPT_VERSIONS_URL,
+                    headers={**supabase_headers(), "Prefer": "return=representation"},
+                    json=legacy_payload,
+                    timeout=10.0,
+                )
+                res.raise_for_status()
             created = res.json()
             new_version = created[0] if isinstance(created, list) else created
     except Exception as e:
@@ -2880,17 +2916,37 @@ async def get_prompt_versions(
 
     try:
         async with httpx.AsyncClient() as http:
-            res = await http.get(
-                SUPABASE_PROMPT_VERSIONS_URL,
-                headers={**supabase_headers(), "Accept": "application/json"},
-                params={
-                    "order": "created_at.desc",
-                    "select": "id,created_at,is_active,source,insight_id,refinement_instruction,refinement_applied_at,previous_version_id",
-                    **owner_scope(user_id),
-                },
-                timeout=10.0,
-            )
-            res.raise_for_status()
+            params = {
+                "order": "created_at.desc",
+                "select": "id,created_at,is_active,source,insight_id,refinement_instruction,refinement_applied_at,previous_version_id",
+                **owner_scope(user_id),
+            }
+            try:
+                res = await http.get(
+                    SUPABASE_PROMPT_VERSIONS_URL,
+                    headers={**supabase_headers(), "Accept": "application/json"},
+                    params=params,
+                    timeout=10.0,
+                )
+                res.raise_for_status()
+            except httpx.HTTPStatusError as select_error:
+                if not is_supabase_schema_cache_error(select_error):
+                    raise
+                print(
+                    "[prompt-versions:schema-fallback] "
+                    f"status={select_error.response.status_code} body={select_error.response.text[:1000]}"
+                )
+                res = await http.get(
+                    SUPABASE_PROMPT_VERSIONS_URL,
+                    headers={**supabase_headers(), "Accept": "application/json"},
+                    params={
+                        "order": "created_at.desc",
+                        "select": "id,created_at,is_active,source,insight_id",
+                        **owner_scope(user_id),
+                    },
+                    timeout=10.0,
+                )
+                res.raise_for_status()
             return res.json()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
