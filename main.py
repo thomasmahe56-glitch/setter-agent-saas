@@ -643,6 +643,43 @@ def build_training_center_prompt(base_prompt: str, profile: dict, avatar: dict, 
     )
 
 
+TRAINING_CENTER_MAIN_STEPS = [
+    {"id": "offer", "label": "Your offer"},
+    {"id": "knowledge_voice", "label": "Knowledge & voice"},
+    {"id": "ideal_customer", "label": "Ideal customer"},
+    {"id": "test_angellos", "label": "Test Angellos"},
+]
+
+
+def summarize_agent_sales_rules(sales_rules_row: Optional[dict]) -> list[str]:
+    rules = (sales_rules_row or {}).get("rules") or {}
+    if not isinstance(rules, dict):
+        return []
+
+    summaries: list[str] = []
+    summary_fields = [
+        ("qualification_questions", "Qualification questions"),
+        ("buying_signals", "Buying signals"),
+        ("call_offer_conditions", "When to guide toward the next step"),
+        ("red_flags", "Bad-fit signals"),
+        ("stop_conditions", "When to stop"),
+        ("do_not_say", "Phrases to avoid"),
+        ("follow_up_rules", "Follow-up style"),
+    ]
+    for key, label in summary_fields:
+        values = rules.get(key)
+        if not isinstance(values, list) or not values:
+            continue
+        visible_values = [
+            re.sub(r"\s+", " ", value).strip()
+            for value in values
+            if isinstance(value, str) and value.strip()
+        ][:2]
+        if visible_values:
+            summaries.append(f"{label}: {'; '.join(visible_values)}")
+    return summaries[:6]
+
+
 def format_agent_profile_for_prompt(profile: dict) -> str:
     labels = {
         "avatar_client": "Client avatar",
@@ -3011,6 +3048,7 @@ async def update_agent_profile(
 
 @app.get("/agent/training-center")
 async def get_training_center(
+    developer_mode: bool = Query(default=False),
     user_id: str = Depends(require_jwt),
 ):
     try:
@@ -3022,18 +3060,31 @@ async def get_training_center(
 
     checklist = {
         "business_setup": bool(profile and profile.get("profile")),
+        "knowledge_voice": bool(
+            (profile or {}).get("profile", {}).get("sales_process")
+            or (profile or {}).get("profile", {}).get("voice_profile")
+        ),
         "avatar_client": bool(avatar and avatar.get("avatar")),
-        "regles_dm": bool(sales_rules and sales_rules.get("rules")),
         "test_conversation": False,
     }
     completed = sum(1 for value in checklist.values() if value)
-    return {
+    response_payload = {
         "profile": profile,
         "avatar": avatar,
-        "sales_rules": sales_rules,
+        "sales_rules": sales_rules if developer_mode else None,
+        "main_steps": TRAINING_CENTER_MAIN_STEPS,
         "checklist": checklist,
         "progress_score": round((completed / len(checklist)) * 100),
+        "what_angellos_knows": {
+            "conversation_guidance": summarize_agent_sales_rules(sales_rules),
+        },
+        "advanced": {
+            "developer_mode": developer_mode,
+            "conversation_rules_available": bool(sales_rules and sales_rules.get("rules")),
+            "conversation_rules": sales_rules if developer_mode else None,
+        },
     }
+    return response_payload
 
 
 @app.post("/agent/profile/save")
