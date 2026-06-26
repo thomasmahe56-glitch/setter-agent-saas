@@ -1,28 +1,35 @@
--- Backfill: replace unresolved ManyChat/template placeholder values in display_name
--- and username with a safe fallback so they no longer appear in the dashboard.
+-- Backfill: replace invalid display_name values with a safe fallback.
 --
--- A placeholder looks like {{ig_username}}, {{username}}, {{first_name}}, etc.
--- Run this once in the Supabase SQL editor (or via the CLI).
+-- Invalid values are:
+--   1. Unresolved ManyChat/template placeholders: {{ig_username}}, {{first_name}}, etc.
+--   2. Raw numeric subscriber IDs: 612751574, 1168444660, etc. (6+ digit pure numbers)
+--
+-- Run once in the Supabase SQL editor.
 
--- 1. Update display_name when it contains a placeholder but username is a valid handle.
+-- 1. Where display_name is invalid but username looks like a real IG handle, use username.
 UPDATE conversations
 SET display_name = username
 WHERE
-  display_name ~ '\{\{[^}]*\}\}'        -- display_name is a placeholder
+  (
+    display_name ~ '\{\{[^}]*\}\}'   -- placeholder pattern
+    OR display_name ~ '^\d{6,}$'    -- pure numeric subscriber ID
+  )
   AND username IS NOT NULL
-  AND username !~ '\{\{[^}]*\}\}'       -- username is not a placeholder
+  AND username !~ '\{\{[^}]*\}\}'   -- username is not a placeholder
+  AND username !~ '^\d{6,}$'        -- username is not a numeric ID
   AND username <> '';
 
--- 2. For rows where both display_name and username are placeholders (or either is still bad),
---    fall back to "Instagram prospect".
+-- 2. Anything still invalid falls back to "Instagram prospect".
 UPDATE conversations
 SET display_name = 'Instagram prospect'
 WHERE
-  display_name ~ '\{\{[^}]*\}\}';
+  display_name ~ '\{\{[^}]*\}\}'
+  OR display_name ~ '^\d{6,}$';
 
--- 3. Sanity-check: show any remaining rows that still have a placeholder (should be 0).
+-- 3. Sanity-check: should return 0 rows.
 SELECT id, username, display_name
 FROM conversations
 WHERE
   display_name ~ '\{\{[^}]*\}\}'
-  OR username   ~ '\{\{[^}]*\}\}';
+  OR display_name ~ '^\d{6,}$'
+  OR username    ~ '\{\{[^}]*\}\}';

@@ -44,11 +44,24 @@ class TestIsPlaceholderDisplayName:
     def test_arbitrary_placeholder(self):
         assert is_placeholder_display_name("{{some_var}}") is True
 
+    def test_numeric_manychat_id_rejected(self):
+        # ManyChat subscriber IDs are long numeric strings
+        assert is_placeholder_display_name("612751574") is True
+        assert is_placeholder_display_name("1168444660") is True
+        assert is_placeholder_display_name("370303411") is True
+
+    def test_short_number_not_rejected(self):
+        # 5-digit numbers could be part of a legitimate handle
+        assert is_placeholder_display_name("12345") is False
+
     def test_valid_name_not_placeholder(self):
         assert is_placeholder_display_name("julien_runs") is False
 
     def test_real_name_not_placeholder(self):
         assert is_placeholder_display_name("Jean Dupont") is False
+
+    def test_handle_with_digits_not_placeholder(self):
+        assert is_placeholder_display_name("coach2025") is False
 
     def test_empty_string_not_placeholder(self):
         assert is_placeholder_display_name("") is False
@@ -56,12 +69,19 @@ class TestIsPlaceholderDisplayName:
     def test_none_not_placeholder(self):
         assert is_placeholder_display_name(None) is False
 
-    def test_subscriber_id_not_placeholder(self):
-        assert is_placeholder_display_name("12345678") is False
-
     def test_partial_placeholder_detected(self):
-        # A value that contains {{ anywhere is still flagged
         assert is_placeholder_display_name("Hello {{ig_username}}") is True
+
+
+class TestNormalizeDisplayNameNumericId:
+    def test_numeric_id_rejected_returns_fallback(self):
+        assert normalize_display_name("612751574") == "Instagram prospect"
+
+    def test_numeric_id_keeps_existing_valid_name(self):
+        assert normalize_display_name("612751574", existing="julien_runs") == "julien_runs"
+
+    def test_numeric_id_with_numeric_existing_returns_fallback(self):
+        assert normalize_display_name("612751574", existing="612751574") == "Instagram prospect"
 
 
 class TestNormalizeDisplayName:

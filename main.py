@@ -432,28 +432,32 @@ def extract_training_center_payload(prompt: str) -> dict:
 
 
 _PLACEHOLDER_RE = re.compile(r"\{\{[^}]*\}\}")
+# ManyChat subscriber IDs are pure numeric strings (typically 7–10 digits).
+# An Instagram handle may contain digits but is never purely numeric and long.
+_NUMERIC_ID_RE = re.compile(r"^\d{6,}$")
 
 
 def is_placeholder_display_name(value: Optional[str]) -> bool:
-    """Return True if value is an unresolved ManyChat/template placeholder such as {{ig_username}}."""
+    """Return True if value is an unresolved template placeholder or a raw numeric subscriber ID."""
     if not value:
         return False
-    return bool(_PLACEHOLDER_RE.search((value or "").strip()))
+    cleaned = (value or "").strip()
+    return bool(_PLACEHOLDER_RE.search(cleaned)) or bool(_NUMERIC_ID_RE.match(cleaned))
 
 
 def normalize_display_name(incoming: Optional[str], existing: Optional[str] = None) -> str:
-    """Return a safe display name, never an unresolved placeholder.
+    """Return a safe display name, never an unresolved placeholder or bare subscriber ID.
 
     Priority:
-    1. If incoming is valid (no placeholder), use it.
-    2. If incoming is a placeholder but existing is valid, keep existing.
+    1. If incoming is valid (no placeholder, not a numeric ID), use it.
+    2. If incoming is invalid but existing is valid, keep existing.
     3. Otherwise fall back to "Instagram prospect".
     """
     incoming_clean = (incoming or "").strip()
     if incoming_clean and not is_placeholder_display_name(incoming_clean):
         return incoming_clean
     if incoming_clean and is_placeholder_display_name(incoming_clean):
-        print(f"[display_name] rejected unresolved placeholder: {incoming_clean!r}")
+        print(f"[display_name] rejected invalid display_name: {incoming_clean!r}")
     existing_clean = (existing or "").strip()
     if existing_clean and not is_placeholder_display_name(existing_clean):
         return existing_clean
