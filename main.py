@@ -431,6 +431,35 @@ def extract_training_center_payload(prompt: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+_PLACEHOLDER_RE = re.compile(r"\{\{[^}]*\}\}")
+
+
+def is_placeholder_display_name(value: Optional[str]) -> bool:
+    """Return True if value is an unresolved ManyChat/template placeholder such as {{ig_username}}."""
+    if not value:
+        return False
+    return bool(_PLACEHOLDER_RE.search((value or "").strip()))
+
+
+def normalize_display_name(incoming: Optional[str], existing: Optional[str] = None) -> str:
+    """Return a safe display name, never an unresolved placeholder.
+
+    Priority:
+    1. If incoming is valid (no placeholder), use it.
+    2. If incoming is a placeholder but existing is valid, keep existing.
+    3. Otherwise fall back to "Instagram prospect".
+    """
+    incoming_clean = (incoming or "").strip()
+    if incoming_clean and not is_placeholder_display_name(incoming_clean):
+        return incoming_clean
+    if incoming_clean and is_placeholder_display_name(incoming_clean):
+        print(f"[display_name] rejected unresolved placeholder: {incoming_clean!r}")
+    existing_clean = (existing or "").strip()
+    if existing_clean and not is_placeholder_display_name(existing_clean):
+        return existing_clean
+    return "Instagram prospect"
+
+
 def clean_text(value: object) -> str:
     return re.sub(r"\s+", " ", value).strip() if isinstance(value, str) else ""
 
@@ -1817,10 +1846,12 @@ async def handle_inbound_message(
 ) -> dict:
     received_at = now_iso()
     contact = await get_contact_by_external_id(external_contact_id, channel, user_id)
+    existing_display_name = (contact.get("display_name") or "") if contact else ""
+    safe_display_name = normalize_display_name(display_name, existing_display_name)
     if contact is None:
         contact = await create_contact(
             external_contact_id=external_contact_id,
-            display_name=display_name,
+            display_name=safe_display_name,
             message=message,
             channel=channel,
             received_at=received_at,
@@ -1859,8 +1890,8 @@ async def handle_inbound_message(
         "history": messages,
         "last_inbound_at": received_at,
     }
-    if display_name:
-        patch_data["display_name"] = display_name
+    if safe_display_name:
+        patch_data["display_name"] = safe_display_name
     if phone_e164:
         patch_data["phone_e164"] = phone_e164
     if transport_metadata:
@@ -1924,7 +1955,7 @@ async def handle_inbound_message(
         first_turn = not history
         prospect_label = "Prospect WhatsApp" if channel == "whatsapp" else "Prospect Instagram"
         user_content = (
-            f"{prospect_label}: {display_name}\nReceived message: {message}"
+            f"{prospect_label}: {safe_display_name}\nReceived message: {message}"
             if first_turn
             else message
         )
@@ -2315,25 +2346,113 @@ async def deactivate(
     return {"status": "deactivated", "username": payload.username}
 
 
+def _last_prospect_message(history: list) -> Optional[dict]:
+    """Return the most recent user-role message, or None."""
+    for msg in reversed(history):
+        if msg.get("role") == "user":
+            return msg
+    return None
+
+
+def _needs_supervised_pending(conversation: dict) -> bool:
+    """True when activation should generate a supervised pending reply."""
+    if conversation.get("automation_mode") != "supervised":
+        return False
+    if conversation.get("pending_message"):
+        return False
+    history = conversation.get("history") or []
+    if not history:
+        return False
+    last = history[-1]
+    # Any assistant message (sent or unsent) that isn't explicitly ignored means
+    # the prospect's last message has already been handled.
+    if last.get("role") == "assistant" and not last.get("ignored"):
+        return False
+    return _last_prospect_message(history) is not None
+
+
+async def _generate_and_save_supervised_pending(
+    conversation: dict,
+    conversation_id: str,
+    user_id: str,
+) -> Optional[str]:
+    """Generate a supervised reply for the unanswered prospect message and persist it.
+
+    Returns the generated reply text, or None if generation was skipped or failed.
+    Errors from the AI provider are allowed to propagate so the caller can decide
+    whether to treat them as fatal.
+    """
+    if client is None:
+        return None
+    history = conversation.get("history") or []
+    last_user_msg = _last_prospect_message(history)
+    if last_user_msg is None:
+        return None
+
+    active_prompt = await get_active_prompt(user_id)
+    system_prompt = build_angellos_beta_prompt(active_prompt)
+
+    # Build message list up to and including the last user message
+    messages_for_gen: list[dict] = []
+    for msg in history:
+        messages_for_gen.append(msg)
+        if msg is last_user_msg:
+            break
+
+    try:
+        reply = generate_claude_reply(strip_message_metadata(messages_for_gen), system_prompt)
+    except ProviderGenerationError:
+        raise
+
+    reply, _ = split_stop_agent_reply(reply)
+    reply = sanitize_angellos_beta_reply(reply, last_user_msg.get("content", ""))
+    reply = validate_agent_reply(reply, system_prompt)
+
+    now = now_iso()
+    assistant_entry = {
+        "role": "assistant",
+        "content": reply,
+        "timestamp": now,
+        "sent": False,
+        "ignored": False,
+        "source": "activation_supervised",
+    }
+    new_history = history + [assistant_entry]
+    if len(new_history) > MAX_HISTORY_TURNS * 2:
+        new_history = new_history[-(MAX_HISTORY_TURNS * 2):]
+
+    async with httpx.AsyncClient() as http:
+        res = await http.patch(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=minimal"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
+            json={
+                "pending_message": reply,
+                "pending_message_at": now,
+                "history": new_history,
+            },
+            timeout=10.0,
+        )
+        res.raise_for_status()
+
+    print(f"[activate] supervised pending generated conversation_id={conversation_id}")
+    return reply
+
+
 @app.post("/conversations/{conversation_id}/activate")
 async def activate_conversation(
     conversation_id: str,
     user_id: str = Depends(require_jwt),
 ):
+    conversation = await get_conversation_by_id(conversation_id, user_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
 
-    async with httpx.AsyncClient() as http:
-        res = await http.get(
-            SUPABASE_CONVERSATIONS_URL,
-            headers={**supabase_headers(), "Accept": "application/json"},
-            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}", "select": "history", "limit": "1"},
-            timeout=5.0,
-        )
-        res.raise_for_status()
-        rows = res.json()
-    history = (rows[0].get("history") or []) if rows else []
+    history = conversation.get("history") or []
     patch_data: dict = {"agent_active": True}
     if not history:
         patch_data["pending_opener"] = True
+
     async with httpx.AsyncClient() as http:
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
@@ -2342,7 +2461,63 @@ async def activate_conversation(
             json=patch_data,
         )
         res.raise_for_status()
-    return {"success": True}
+
+    pending_generated = False
+    pending_message: Optional[str] = None
+
+    # Re-read conversation state with agent_active=True in mind for the check
+    activated_conversation = {**conversation, "agent_active": True}
+    if _needs_supervised_pending(activated_conversation):
+        try:
+            pending_message = await _generate_and_save_supervised_pending(
+                conversation, conversation_id, user_id
+            )
+            pending_generated = pending_message is not None
+        except ProviderGenerationError as e:
+            print(f"[activate] supervised pending generation failed: {e.error_type} {e.message}")
+        except Exception as e:
+            print(f"[activate] supervised pending generation error: {e}")
+
+    return {
+        "success": True,
+        "pending_generated": pending_generated,
+        "pending_message": pending_message,
+    }
+
+
+@app.post("/conversations/{conversation_id}/generate-pending")
+async def generate_pending(
+    conversation_id: str,
+    user_id: str = Depends(require_jwt),
+):
+    """Generate or regenerate a supervised pending reply for the latest unanswered prospect message."""
+    if client is None:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+
+    conversation = await get_conversation_by_id(conversation_id, user_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if not conversation.get("agent_active"):
+        raise HTTPException(status_code=409, detail="Agent is not active for this conversation")
+
+    if conversation.get("automation_mode") != "supervised":
+        raise HTTPException(status_code=409, detail="generate-pending only applies to supervised mode")
+
+    if not _last_prospect_message(conversation.get("history") or []):
+        raise HTTPException(status_code=409, detail="No prospect message to reply to")
+
+    try:
+        pending_message = await _generate_and_save_supervised_pending(
+            conversation, conversation_id, user_id
+        )
+    except ProviderGenerationError as e:
+        return provider_error_response(e)
+
+    if not pending_message:
+        raise HTTPException(status_code=409, detail="Could not generate a reply")
+
+    return {"success": True, "pending_message": pending_message}
 
 
 @app.post("/conversations/{conversation_id}/deactivate")
