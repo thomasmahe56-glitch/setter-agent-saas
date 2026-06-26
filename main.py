@@ -63,37 +63,45 @@ class ProviderGenerationError(Exception):
 def classify_provider_error(error: Exception) -> ProviderGenerationError:
     text = str(error)
     lowered = text.lower()
+    print(f"[provider:classify] {type(error).__name__}: {text[:500]}", flush=True)
     if any(marker in lowered for marker in ["credit balance", "credits", "billing", "insufficient_credit"]):
         return ProviderGenerationError(
             "provider_billing",
-            "Anthropic credits are too low.",
+            f"Anthropic credits exhausted: {text[:300]}",
             LOW_CREDITS_USER_MESSAGE,
             status_code=402,
         )
     if "rate" in lowered or "429" in lowered:
         return ProviderGenerationError(
             "provider_rate_limit",
-            "Anthropic is rate limiting requests.",
+            f"Anthropic rate limit: {text[:300]}",
             GENERIC_AI_USER_MESSAGE,
             status_code=429,
         )
     if "timeout" in lowered or "timed out" in lowered:
         return ProviderGenerationError(
             "provider_timeout",
-            "Anthropic request timed out.",
+            f"Anthropic timeout: {text[:300]}",
             GENERIC_AI_USER_MESSAGE,
             status_code=504,
+        )
+    if "not_found" in lowered or "404" in text:
+        return ProviderGenerationError(
+            "provider_model_not_found",
+            f"Anthropic model not found (possibly deprecated): {text[:300]}",
+            GENERIC_AI_USER_MESSAGE,
+            status_code=502,
         )
     if "invalid request" in lowered or "400" in lowered:
         return ProviderGenerationError(
             "provider_invalid_request",
-            "Anthropic rejected the generation request.",
+            f"Anthropic rejected request: {text[:300]}",
             GENERIC_AI_USER_MESSAGE,
             status_code=502,
         )
     return ProviderGenerationError(
         "provider_error",
-        "Anthropic generation failed.",
+        f"Anthropic error ({type(error).__name__}): {text[:300]}",
         GENERIC_AI_USER_MESSAGE,
         status_code=502,
     )
@@ -1464,7 +1472,7 @@ async def upsert_user_singleton_row(table_url: str, user_id: str, payload: dict)
 def generate_claude_reply(messages: list, system_prompt: str = "") -> str:
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=1024,
             system=system_prompt,
             messages=messages,
@@ -2438,7 +2446,12 @@ async def _generate_and_save_supervised_pending(
 
     try:
         reply = generate_claude_reply(strip_message_metadata(messages_for_gen), system_prompt)
-    except ProviderGenerationError:
+    except ProviderGenerationError as e:
+        print(
+            f"[generate-pending:claude] error type={e.error_type} message={e.message} "
+            f"conversation_id={conversation_id}",
+            flush=True,
+        )
         raise
 
     reply, _ = split_stop_agent_reply(reply)
@@ -2549,11 +2562,21 @@ async def generate_pending(
             conversation, conversation_id, user_id
         )
     except ProviderGenerationError as e:
+        print(
+            f"[generate-pending] provider error"
+            f" type={e.error_type}"
+            f" status={e.status_code}"
+            f" message={e.message}"
+            f" conversation_id={conversation_id}",
+            flush=True,
+        )
         return provider_error_response(e)
 
     if not pending_message:
+        print(f"[generate-pending] no reply generated conversation_id={conversation_id}", flush=True)
         raise HTTPException(status_code=409, detail="Could not generate a reply")
 
+    print(f"[generate-pending] success conversation_id={conversation_id}", flush=True)
     return {"success": True, "pending_message": pending_message}
 
 
@@ -3110,7 +3133,7 @@ async def preview_prompt(
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=4096,
             system=(
                 "You are an expert in AI prompt optimization. "
@@ -3269,7 +3292,7 @@ async def refine_prompt(
 
         try:
             response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=8192,
                 system=system,
                 messages=[{"role": "user", "content": user_message}],
@@ -3283,7 +3306,7 @@ async def refine_prompt(
                     "Translate any French rule labels into English. Return only the required JSON."
                 )
                 response = client.messages.create(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=8192,
                     system=system,
                     messages=[{"role": "user", "content": retry_message}],
