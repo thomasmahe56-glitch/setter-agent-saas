@@ -1498,6 +1498,31 @@ async def send_manychat_message(subscriber_id: str, text: str) -> dict:
     return {"status_code": res.status_code, "body": res.text}
 
 
+async def fetch_manychat_ig_username(subscriber_id: str) -> Optional[str]:
+    """Call ManyChat getInfo to resolve the real Instagram username when the webhook field is missing."""
+    if not MANYCHAT_API_KEY or not subscriber_id:
+        return None
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.get(
+                "https://api.manychat.com/fb/subscriber/getInfo",
+                headers={"Authorization": f"Bearer {MANYCHAT_API_KEY}"},
+                params={"subscriber_id": subscriber_id},
+                timeout=5.0,
+            )
+            if res.status_code != 200:
+                print(f"[manychat:getInfo] status={res.status_code} subscriber_id={subscriber_id}")
+                return None
+            data = res.json().get("data") or {}
+            ig_username = (data.get("ig_username") or "").strip()
+            if ig_username and not is_placeholder_display_name(ig_username):
+                print(f"[manychat:getInfo] resolved ig_username={ig_username!r} for subscriber_id={subscriber_id}")
+                return ig_username
+    except Exception as e:
+        print(f"[manychat:getInfo] error subscriber_id={subscriber_id}: {e}")
+    return None
+
+
 async def clear_manychat_agent_response(subscriber_id: str) -> None:
     if not MANYCHAT_API_KEY:
         return
@@ -2098,10 +2123,18 @@ async def webhook(
 ):
     user_id = await require_secret(x_webhook_secret)
 
+    # Resolve display name: if {{ig_username}} didn't resolve or sent a numeric ID,
+    # fall back to ManyChat's getInfo API which always has the real Instagram handle.
+    display_name = payload.username
+    if is_placeholder_display_name(display_name):
+        fetched = await fetch_manychat_ig_username(payload.subscriber_id)
+        if fetched:
+            display_name = fetched
+
     result = await handle_inbound_message(
         channel="instagram",
         external_contact_id=payload.subscriber_id,
-        display_name=payload.username,
+        display_name=display_name,
         message=payload.message,
         user_id=user_id,
         transport_metadata={"provider": "manychat"},
