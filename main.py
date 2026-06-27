@@ -2841,8 +2841,9 @@ async def preview_follow_up(
 @app.post("/follow-ups/manychat-auto-23h")
 async def manychat_auto_23h_follow_up(
     payload: ManyChatFollowUpPayload,
-    user_id: str = Depends(require_jwt),
+    x_webhook_secret: Optional[str] = Header(default=None),
 ):
+    user_id = await require_secret(x_webhook_secret)
 
     subscriber_id = payload.subscriber_id.strip()
     if not subscriber_id:
