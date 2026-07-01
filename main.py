@@ -1629,13 +1629,33 @@ def validate_agent_reply(reply: str, system_prompt: str) -> str:
     return cleaned
 
 
-def split_stop_agent_reply(reply: str) -> tuple[str, bool]:
-    if "[STOP_AGENT]" not in (reply or ""):
-        return reply, False
-    before_tag = reply.split("[STOP_AGENT]", 1)[0].strip()
-    if len(before_tag) < 3:
-        return "", True
-    return before_tag, True
+def split_stop_agent_reply(reply: str) -> tuple[str, bool, bool]:
+    """
+    Parse reply for [STOP_AGENT] and [HUMAN_MODE] tokens.
+    Returns (cleaned_reply, should_stop_agent, should_human_mode).
+    Both tokens are stripped from the returned reply.
+    """
+    should_stop_agent = False
+    should_human_mode = False
+
+    if not reply:
+        return reply, False, False
+
+    # Handle [STOP_AGENT]
+    if "[STOP_AGENT]" in reply:
+        before_tag = reply.split("[STOP_AGENT]", 1)[0].strip()
+        if len(before_tag) >= 3:
+            reply = before_tag
+        else:
+            reply = ""
+        should_stop_agent = True
+
+    # Handle [HUMAN_MODE] — strip it from the reply
+    if "[HUMAN_MODE]" in reply:
+        reply = reply.replace("[HUMAN_MODE]", "").strip()
+        should_human_mode = True
+
+    return reply, should_stop_agent, should_human_mode
 
 
 def has_processed_transport_message(history: list, transport_metadata: Optional[dict]) -> bool:
@@ -1998,6 +2018,7 @@ async def handle_inbound_message(
         )
         messages_for_generation = history + [{"role": "user", "content": user_content, "timestamp": received_at}]
 
+        should_human_mode = False
         try:
             reply = generate_claude_reply(strip_message_metadata(messages_for_generation), system_prompt)
         except ProviderGenerationError as e:
@@ -2025,7 +2046,7 @@ async def handle_inbound_message(
                 "error": provider_error_payload(e),
                 "conversation_id": contact.get("id"),
             }
-        reply, should_stop_agent = split_stop_agent_reply(reply)
+        reply, should_stop_agent, should_human_mode = split_stop_agent_reply(reply)
     reply = sanitize_angellos_beta_reply(reply, message)
     reply = validate_agent_reply(reply, system_prompt)
 
@@ -2035,6 +2056,10 @@ async def handle_inbound_message(
             print(f"[inbound] STOP_AGENT channel={channel} external_id={external_contact_id}")
         else:
             print(f"[inbound] STOP_AGENT ignored for whatsapp test contact external_id={external_contact_id}")
+
+    if should_human_mode:
+        patch_data["automation_mode"] = "disabled"
+        print(f"[inbound] HUMAN_MODE channel={channel} external_id={external_contact_id} -> automation_mode=disabled")
 
     should_send = automation_mode == "auto"
     delegated_to_webhook_sender = should_send and not auto_send_transport
@@ -2454,7 +2479,7 @@ async def _generate_and_save_supervised_pending(
         )
         raise
 
-    reply, _ = split_stop_agent_reply(reply)
+    reply, _, should_human_mode = split_stop_agent_reply(reply)
     reply = sanitize_angellos_beta_reply(reply, last_user_msg.get("content", ""))
     reply = validate_agent_reply(reply, system_prompt)
 
@@ -2471,16 +2496,21 @@ async def _generate_and_save_supervised_pending(
     if len(new_history) > MAX_HISTORY_TURNS * 2:
         new_history = new_history[-(MAX_HISTORY_TURNS * 2):]
 
+    patch_body = {
+        "pending_message": reply,
+        "pending_message_at": now,
+        "history": new_history,
+    }
+    if should_human_mode:
+        patch_body["automation_mode"] = "disabled"
+        print(f"[generate-pending] HUMAN_MODE conversation_id={conversation_id} -> automation_mode=disabled")
+
     async with httpx.AsyncClient() as http:
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
             params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
-            json={
-                "pending_message": reply,
-                "pending_message_at": now,
-                "history": new_history,
-            },
+            json=patch_body,
             timeout=10.0,
         )
         res.raise_for_status()
@@ -2769,6 +2799,65 @@ async def refine_pending(
 
     print(f"[refine-pending] conversation_id={conversation_id} instruction_len={len(instruction)}")
     return {"refined_message": refined}
+
+
+@app.post("/conversations/seed")
+async def seed_conversation(
+    body: dict,
+    x_dashboard_secret: Optional[str] = Header(default=None),
+) -> dict:
+    require_dashboard_secret(x_dashboard_secret)
+
+    username = (body.get("username") or "").strip().lower()
+    first_dm = (body.get("first_dm") or "").strip()
+    user_id = (body.get("user_id") or "").strip()
+
+    if not username or not first_dm:
+        raise HTTPException(status_code=422, detail="username and first_dm are required")
+    if not user_id:
+        user_id = "default"
+
+    existing = await get_contact_by_external_id(username, "instagram", user_id)
+    if existing:
+        return {"status": "already_exists", "conversation_id": existing.get("id")}
+
+    now = now_iso()
+    row = {
+        "username": username,
+        "display_name": username,
+        "message": first_dm[:200],
+        "status": "nouveau",
+        "agent_active": True,
+        "history": [
+            {"role": "assistant", "content": first_dm, "timestamp": now, "sent": True}
+        ],
+        "channel": "instagram",
+        "external_contact_id": username,
+        "user_id": user_id,
+        "automation_mode": "supervised",
+        "last_inbound_at": None,
+    }
+
+    async with httpx.AsyncClient() as http:
+        res = await http.post(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=representation"},
+            json=row,
+            timeout=10.0,
+        )
+        if res.status_code >= 400:
+            print(f"[seed_conversation] Supabase error status={res.status_code} body={res.text!r}")
+            raise HTTPException(status_code=502, detail=f"Supabase error: {res.text[:200]}")
+        created = res.json()
+
+    conversation_id = None
+    if isinstance(created, list) and created:
+        conversation_id = created[0].get("id")
+    elif isinstance(created, dict):
+        conversation_id = created.get("id")
+
+    print(f"[seed_conversation] Created conversation {conversation_id} for @{username}")
+    return {"status": "created", "conversation_id": conversation_id}
 
 
 @app.delete("/conversations/{conversation_id}")
