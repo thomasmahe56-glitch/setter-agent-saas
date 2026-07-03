@@ -20,11 +20,36 @@ os.environ.setdefault("DASHBOARD_SECRET", "test-dashboard-secret")
 import anthropic as _anthropic_mod  # already installed
 
 from main import (
+    WebhookPayload,
+    handle_inbound_message,
     is_placeholder_display_name,
     normalize_display_name,
     _needs_supervised_pending,
     _last_prospect_message,
+    webhook,
 )
+
+
+class _PatchResponse:
+    status_code = 204
+    text = ""
+
+    def raise_for_status(self):
+        return None
+
+
+class _PatchCaptureAsyncClient:
+    patches = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def patch(self, *args, **kwargs):
+        self.__class__.patches.append({"args": args, "kwargs": kwargs})
+        return _PatchResponse()
 
 
 # ===========================================================================
@@ -206,6 +231,116 @@ class TestNeedsSupervisedPending:
         ]
         conv = _make_conversation(history=history)
         assert _needs_supervised_pending(conv) is True
+
+
+# ===========================================================================
+# BUG 3 — ManyChat webhook auto mode sends directly from backend
+# ===========================================================================
+
+class TestManyChatWebhookAutoSend:
+    def test_webhook_direct_sends_and_does_not_return_duplicate_agent_response(self, monkeypatch):
+        captured = {}
+
+        async def fake_require_secret(secret):
+            return "user-1"
+
+        async def fake_handle_inbound_message(**kwargs):
+            captured.update(kwargs)
+            return {
+                "reply": "Auto reply",
+                "sent": True,
+                "should_send": True,
+                "mode": "auto",
+                "skipped": False,
+                "reason": None,
+                "send_result": {"status_code": 200, "body": "ok"},
+                "conversation_id": "conv-1",
+            }
+
+        monkeypatch.setattr("main.require_secret", fake_require_secret)
+        monkeypatch.setattr("main.handle_inbound_message", fake_handle_inbound_message)
+
+        response = asyncio.run(webhook(
+            WebhookPayload(username="real_handle", message="Hello", subscriber_id="123456789"),
+            x_webhook_secret="test-secret",
+        ))
+
+        assert captured["auto_send_transport"] is True
+        assert response["should_send"] is True
+        assert response["sent"] is True
+        assert response["automation_mode"] == "auto"
+        assert response["agent_response"] == ""
+
+    def test_webhook_returns_agent_response_when_backend_send_fails(self, monkeypatch):
+        async def fake_require_secret(secret):
+            return "user-1"
+
+        async def fake_handle_inbound_message(**kwargs):
+            return {
+                "reply": "Fallback reply",
+                "sent": False,
+                "should_send": True,
+                "mode": "auto",
+                "skipped": False,
+                "reason": None,
+                "send_result": {"status_code": 400, "body": "outside 24h"},
+                "conversation_id": "conv-1",
+            }
+
+        monkeypatch.setattr("main.require_secret", fake_require_secret)
+        monkeypatch.setattr("main.handle_inbound_message", fake_handle_inbound_message)
+
+        response = asyncio.run(webhook(
+            WebhookPayload(username="real_handle", message="Hello", subscriber_id="123456789"),
+            x_webhook_secret="test-secret",
+        ))
+
+        assert response["should_send"] is True
+        assert response["sent"] is False
+        assert response["agent_response"] == "Fallback reply"
+
+    def test_auto_mode_canned_reply_is_sent_and_marked_sent(self, monkeypatch):
+        _PatchCaptureAsyncClient.patches = []
+
+        async def fake_get_contact_by_external_id(*args, **kwargs):
+            return {
+                "id": "conv-1",
+                "user_id": "user-1",
+                "channel": "instagram",
+                "external_contact_id": "subscriber-123",
+                "username": "subscriber-123",
+                "display_name": "prospect_handle",
+                "automation_mode": "auto",
+                "agent_active": True,
+                "history": [],
+            }
+
+        async def fake_get_active_prompt(user_id):
+            return "Base prompt"
+
+        async def fake_send_channel_message(conversation, text):
+            assert text == "No worries, appreciate you getting back to me."
+            return {"status_code": 200, "body": "ok"}
+
+        monkeypatch.setattr("main.get_contact_by_external_id", fake_get_contact_by_external_id)
+        monkeypatch.setattr("main.get_active_prompt", fake_get_active_prompt)
+        monkeypatch.setattr("main.send_channel_message", fake_send_channel_message)
+        monkeypatch.setattr("main.httpx.AsyncClient", _PatchCaptureAsyncClient)
+
+        result = asyncio.run(handle_inbound_message(
+            channel="instagram",
+            external_contact_id="subscriber-123",
+            display_name="prospect_handle",
+            message="No thanks bro",
+            user_id="user-1",
+            transport_metadata={"provider": "manychat", "message_id": "msg-1"},
+            auto_send_transport=True,
+        ))
+
+        assert result["should_send"] is True
+        assert result["sent"] is True
+        assert result["mode"] == "auto"
+        assert _PatchCaptureAsyncClient.patches[-1]["kwargs"]["json"]["history"][-1]["sent"] is True
 
 
 if __name__ == "__main__":

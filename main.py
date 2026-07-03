@@ -228,7 +228,7 @@ These rules override older base prompts, fallback prompts, tenant configuration 
 - If the prospect asks how it works, reply exactly: {ANGELLOS_HOW_IT_WORKS_REPLY}
 - If the prospect asks about price, reply exactly: {ANGELLOS_PRICE_REPLY}
 - If the prospect shows interest, move toward a quick call instead of over-explaining in DMs. Default reply: {ANGELLOS_INTERESTED_REPLY}
-- New beta outreach conversations stay supervised unless Thomas explicitly activates auto mode."""
+- New beta outreach conversations run in auto mode by default because Thomas explicitly approved automatic replies on 2026-07-03."""
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
@@ -1290,6 +1290,7 @@ async def create_contact(
         "last_inbound_at": received_at,
         "transport_metadata": transport_metadata or {},
         "user_id": user_id,
+        "automation_mode": "auto",
     }
     async with httpx.AsyncClient() as http:
         res = await http.post(
@@ -2005,6 +2006,7 @@ async def handle_inbound_message(
             "conversation_id": contact.get("id"),
         }
 
+    should_human_mode = False
     canned_reply = get_angellos_beta_canned_reply(message)
     if canned_reply:
         reply, should_stop_agent = canned_reply
@@ -2018,7 +2020,6 @@ async def handle_inbound_message(
         )
         messages_for_generation = history + [{"role": "user", "content": user_content, "timestamp": received_at}]
 
-        should_human_mode = False
         try:
             reply = generate_claude_reply(strip_message_metadata(messages_for_generation), system_prompt)
         except ProviderGenerationError as e:
@@ -2121,7 +2122,11 @@ async def handle_inbound_message(
             )
             res.raise_for_status()
         if send_result["status_code"] >= 400:
-            raise HTTPException(status_code=502, detail=f"{channel} send error")
+            print(
+                f"[inbound] SEND_FAILED channel={channel} external_id={external_contact_id} "
+                f"status={send_result['status_code']}",
+                flush=True,
+            )
     else:
         send_result = {"status_code": 202, "body": "delegated_to_webhook_sender"} if delegated_to_webhook_sender else None
         async with httpx.AsyncClient() as http:
@@ -2171,16 +2176,18 @@ async def webhook(
         message=payload.message,
         user_id=user_id,
         transport_metadata={"provider": "manychat"},
-        auto_send_transport=False,
+        auto_send_transport=True,
     )
     should_send = bool(result.get("should_send"))
+    sent_by_backend = bool(result.get("sent"))
     mode = result.get("mode") or "supervised"
     public_mode = "off" if mode == "disabled" else mode
     reply = result.get("reply") or ""
     return {
-        "agent_response": reply if should_send else "",
+        "agent_response": reply if should_send and not sent_by_backend else "",
         "suggested_response": reply if mode == "supervised" else "",
         "should_send": should_send,
+        "sent": sent_by_backend,
         "mode": public_mode,
         "automation_mode": mode,
         "reason": result.get("reason"),
@@ -2834,7 +2841,7 @@ async def seed_conversation(
         "channel": "instagram",
         "external_contact_id": username,
         "user_id": user_id,
-        "automation_mode": "supervised",
+        "automation_mode": "auto",
         "last_inbound_at": None,
     }
 
