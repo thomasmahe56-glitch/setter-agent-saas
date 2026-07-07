@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from config import load_config
-from prompts import build_system_prompt, build_analysis_prompt, build_follow_up_prompt
+from prompts import build_system_prompt, build_analysis_prompt, build_follow_up_prompt, build_conversation_review_prompt
 import hmac
 import httpx
 import hashlib
@@ -32,6 +32,7 @@ SUPABASE_CONVERSATIONS_URL = f"{config.supabase_url}/conversations"
 SUPABASE_WEBHOOK_SECRETS_URL = f"{config.supabase_url}/webhook_secrets"
 SUPABASE_INSIGHTS_URL = f"{config.supabase_url}/insights"
 SUPABASE_PROMPT_VERSIONS_URL = f"{config.supabase_url}/prompt_versions"
+SUPABASE_CONVERSATION_REVIEWS_URL = f"{config.supabase_url}/conversation_reviews"
 SUPABASE_AGENT_PROFILES_URL = f"{config.supabase_url}/agent_profiles"
 SUPABASE_AGENT_AVATARS_URL = f"{config.supabase_url}/agent_avatars"
 SUPABASE_AGENT_SALES_RULES_URL = f"{config.supabase_url}/agent_sales_rules"
@@ -1180,9 +1181,10 @@ def build_follow_up_item(conversation: dict) -> Optional[dict]:
 
 
 async def get_active_prompt(user_id: Optional[str] = None) -> str:
-    """Return the active prompt from prompt_versions, or the hardcoded fallback."""
+    """Return the active prompt from prompt_versions, plus approved review lessons if available."""
     if not user_id:
         return build_system_prompt(config)
+    prompt = build_system_prompt(config)
     try:
         async with httpx.AsyncClient() as http:
             params = {
@@ -1200,10 +1202,10 @@ async def get_active_prompt(user_id: Optional[str] = None) -> str:
             res.raise_for_status()
             rows = res.json()
             if rows and rows[0].get("content"):
-                return rows[0]["content"]
+                prompt = rows[0]["content"]
     except Exception as e:
         print(f"[get_active_prompt] fallback to hardcoded prompt: {e}")
-    return build_system_prompt(config)
+    return await append_approved_review_lessons(prompt, user_id)
 
 
 async def get_active_prompt_version(user_id: str) -> dict:
@@ -1741,6 +1743,302 @@ def format_conversations_for_analysis(conversations: list, system_prompt: str) -
     return "\n".join(parts)
 
 
+def _clamp_score(value: object) -> int:
+    try:
+        score = int(str(value))
+    except (TypeError, ValueError):
+        score = 1
+    return max(1, min(score, 10))
+
+
+def normalize_conversation_review(raw_review: dict, conversation: dict) -> dict:
+    allowed_categories = {
+        "too_robotic",
+        "too_long",
+        "too_commercial",
+        "bad_emotional_read",
+        "bad_question",
+        "missed_context",
+        "should_have_handed_off",
+        "objective_reached",
+        "other",
+    }
+    objective_reached = bool(raw_review.get("objective_reached"))
+    failure_category = clean_text(raw_review.get("failure_category")) or "other"
+    if failure_category not in allowed_categories:
+        failure_category = "other"
+    if objective_reached and failure_category in {"", "other"}:
+        failure_category = "objective_reached"
+
+    return {
+        "conversation_id": conversation.get("id"),
+        "username": conversation.get("display_name") or conversation.get("username") or "unknown",
+        "objective_reached": objective_reached,
+        "objective_reason": clean_text(raw_review.get("objective_reason")),
+        "human_likeness_score": _clamp_score(raw_review.get("human_likeness_score")),
+        "sales_effectiveness_score": _clamp_score(raw_review.get("sales_effectiveness_score")),
+        "engagement_score": _clamp_score(raw_review.get("engagement_score")),
+        "moment_of_failure": clean_text(raw_review.get("moment_of_failure")) or ("none" if objective_reached else "unspecified"),
+        "failure_category": failure_category,
+        "what_angellos_did_wrong": clean_text(raw_review.get("what_angellos_did_wrong")),
+        "better_human_reply": clean_text(raw_review.get("better_human_reply")),
+        "lesson_learned": clean_text(raw_review.get("lesson_learned")),
+        "prompt_rule_candidate": clean_text(raw_review.get("prompt_rule_candidate")),
+    }
+
+
+def conversation_last_activity_at(conversation: dict) -> Optional[datetime]:
+    timestamps = [
+        parse_iso(conversation.get("updated_at")),
+        parse_iso(conversation.get("last_inbound_at")),
+        parse_iso(conversation.get("created_at")),
+    ]
+    for message in conversation.get("history") or []:
+        timestamps.append(get_message_time(message))
+    present = [value for value in timestamps if value is not None]
+    return max(present) if present else None
+
+
+def conversation_review_user_message(conversation: dict, active_prompt: str) -> str:
+    history = conversation.get("history") or []
+    lines = [
+        "Review this complete Angellos conversation.",
+        "",
+        "=== ACTIVE ANGELLOS PROMPT SUMMARY SOURCE ===",
+        active_prompt[:12000],
+        "",
+        "=== CONVERSATION METADATA ===",
+        f"conversation_id: {conversation.get('id')}",
+        f"username: {conversation.get('display_name') or conversation.get('username')}",
+        f"status: {conversation.get('status')}",
+        f"automation_mode: {conversation.get('automation_mode')}",
+        f"message_count: {len(history)}",
+        "",
+        "=== COMPLETE MESSAGE HISTORY ===",
+    ]
+    for index, message in enumerate(history, 1):
+        role = "Prospect" if message.get("role") == "user" else "Angellos"
+        timestamp = message.get("timestamp") or message.get("created_at") or "unknown_time"
+        sent = message.get("sent")
+        ignored = message.get("ignored")
+        metadata = []
+        if sent is not None:
+            metadata.append(f"sent={sent}")
+        if ignored:
+            metadata.append("ignored=true")
+        suffix = f" ({', '.join(metadata)})" if metadata else ""
+        lines.append(f"{index}. [{timestamp}] {role}{suffix}: {message.get('content', '')}")
+    return "\n".join(lines)
+
+
+def review_public_payload(review: dict) -> dict:
+    keys = [
+        "id",
+        "created_at",
+        "review_date",
+        "conversation_id",
+        "username",
+        "objective_reached",
+        "objective_reason",
+        "human_likeness_score",
+        "sales_effectiveness_score",
+        "engagement_score",
+        "moment_of_failure",
+        "failure_category",
+        "what_angellos_did_wrong",
+        "better_human_reply",
+        "lesson_learned",
+        "prompt_rule_candidate",
+        "lesson_status",
+    ]
+    return {key: review.get(key) for key in keys if key in review}
+
+
+async def get_approved_conversation_review_lessons(user_id: str, limit: int = 8) -> list[str]:
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.get(
+                SUPABASE_CONVERSATION_REVIEWS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "lesson_status": "eq.approved",
+                    "prompt_rule_candidate": "not.is.null",
+                    "order": "approved_at.desc,created_at.desc",
+                    "limit": str(limit),
+                    "select": "prompt_rule_candidate",
+                },
+                timeout=5.0,
+            )
+            res.raise_for_status()
+            rows = res.json()
+    except Exception as e:
+        print(f"[review-lessons] approved lesson lookup failed: {e}")
+        return []
+    lessons = []
+    for row in rows:
+        lesson = clean_text(row.get("prompt_rule_candidate"))
+        if lesson:
+            lessons.append(lesson)
+    return lessons[:limit]
+
+
+async def append_approved_review_lessons(prompt: str, user_id: Optional[str]) -> str:
+    if not user_id:
+        return prompt
+    lessons = await get_approved_conversation_review_lessons(user_id)
+    if not lessons:
+        return prompt
+    lines = [
+        prompt,
+        "",
+        "=== APPROVED CONVERSATION REVIEW LESSONS ===",
+        "Apply these approved lessons when they fit the conversation. Do not overrule higher-priority business rules or safety constraints.",
+    ]
+    lines.extend(f"- {lesson}" for lesson in lessons)
+    return "\n".join(lines)
+
+
+async def fetch_conversations_for_review(user_id: str, start: datetime, end: datetime, limit: int, conversation_id: Optional[str] = None) -> list[dict]:
+    params = {
+        "user_id": f"eq.{user_id}",
+        "order": "created_at.desc",
+        "limit": str(min(max(limit * 3, limit), 500)),
+        "select": "id,created_at,updated_at,username,display_name,message,status,agent_active,automation_mode,history,channel,external_contact_id,last_inbound_at",
+    }
+    if conversation_id:
+        params["id"] = f"eq.{conversation_id}"
+    async with httpx.AsyncClient() as http:
+        try:
+            res = await http.get(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params=params,
+                timeout=15.0,
+            )
+            res.raise_for_status()
+        except httpx.HTTPStatusError as select_error:
+            if not is_supabase_schema_cache_error(select_error):
+                raise
+            fallback_params = dict(params)
+            fallback_params["select"] = "id,created_at,username,display_name,message,status,agent_active,automation_mode,history,channel,external_contact_id,last_inbound_at"
+            res = await http.get(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params=fallback_params,
+                timeout=15.0,
+            )
+            res.raise_for_status()
+        rows = res.json()
+    eligible = []
+    for conversation in rows:
+        last_activity_at = conversation_last_activity_at(conversation)
+        if conversation_id or (last_activity_at and start <= last_activity_at < end):
+            conversation["_last_activity_at"] = last_activity_at.isoformat() if last_activity_at else None
+            eligible.append(conversation)
+    return eligible[:limit]
+
+
+async def review_single_conversation(conversation: dict, active_prompt: str) -> dict:
+    if client is None:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        system=build_conversation_review_prompt(config),
+        messages=[{"role": "user", "content": conversation_review_user_message(conversation, active_prompt)}],
+    )
+    raw = getattr(response.content[0], "text", "").strip()
+    return normalize_conversation_review(parse_llm_json(raw), conversation)
+
+
+async def store_conversation_review(user_id: str, review_date: str, conversation: dict, review: dict) -> dict:
+    row = {
+        **row_owner_fields(user_id),
+        "review_date": review_date,
+        "conversation_id": review["conversation_id"],
+        "username": review["username"],
+        "conversation_updated_at": conversation.get("_last_activity_at") or conversation.get("last_inbound_at") or conversation.get("created_at"),
+        "message_count": len(conversation.get("history") or []),
+        "objective_reached": review["objective_reached"],
+        "objective_reason": review["objective_reason"],
+        "human_likeness_score": review["human_likeness_score"],
+        "sales_effectiveness_score": review["sales_effectiveness_score"],
+        "engagement_score": review["engagement_score"],
+        "moment_of_failure": review["moment_of_failure"],
+        "failure_category": review["failure_category"],
+        "what_angellos_did_wrong": review["what_angellos_did_wrong"],
+        "better_human_reply": review["better_human_reply"],
+        "lesson_learned": review["lesson_learned"],
+        "prompt_rule_candidate": review["prompt_rule_candidate"],
+        "lesson_status": "candidate",
+        "reviewer_model": "claude-sonnet-4-6",
+        "raw_review": review,
+    }
+    async with httpx.AsyncClient() as http:
+        res = await http.post(
+            SUPABASE_CONVERSATION_REVIEWS_URL,
+            headers={
+                **supabase_headers(),
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            },
+            params={"on_conflict": "user_id,conversation_id,review_date"},
+            json=row,
+            timeout=10.0,
+        )
+        res.raise_for_status()
+        created = res.json()
+    if isinstance(created, list):
+        return created[0] if created else row
+    if isinstance(created, dict):
+        return created
+    return row
+
+
+async def run_daily_conversation_review_job(user_id: str, review_date: Optional[str] = None, limit: int = 200, conversation_id: Optional[str] = None) -> dict:
+    if client is None:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+    selected_date = review_date or datetime.now(timezone.utc).date().isoformat()
+    try:
+        start = datetime.fromisoformat(selected_date).replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="review_date must be YYYY-MM-DD")
+    end = start + timedelta(days=1)
+    bounded_limit = min(max(limit, 1), 200)
+    conversations = await fetch_conversations_for_review(user_id, start, end, bounded_limit, conversation_id)
+    if not conversations:
+        return {
+            "success": True,
+            "review_date": selected_date,
+            "selected": 0,
+            "stored": 0,
+            "reviews": [],
+            "lesson_injection": "Only reviews with lesson_status=approved are appended to Angellos prompt context.",
+        }
+
+    active_prompt = await get_active_prompt(user_id)
+    stored_reviews = []
+    errors = []
+    for conversation in conversations:
+        try:
+            review = await review_single_conversation(conversation, active_prompt)
+            stored = await store_conversation_review(user_id, selected_date, conversation, review)
+            stored_reviews.append(review_public_payload(stored))
+        except Exception as e:
+            print(f"[reviews:daily] failed conversation_id={conversation.get('id')} error={e}")
+            errors.append({"conversation_id": conversation.get("id"), "error": str(e)[:300]})
+
+    return {
+        "success": len(errors) == 0,
+        "review_date": selected_date,
+        "selected": len(conversations),
+        "stored": len(stored_reviews),
+        "errors": errors,
+        "reviews": stored_reviews,
+        "lesson_injection": "Only reviews with lesson_status=approved are appended to Angellos prompt context.",
+    }
+
+
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
 class WebhookPayload(BaseModel):
@@ -1762,6 +2060,17 @@ class FeedbackLoopPayload(BaseModel):
     n: int = 20  # number of conversations to analyze (max 50)
     manual_observations: Optional[str] = None
     test_conversation: Optional[str] = None
+
+
+class DailyReviewPayload(BaseModel):
+    user_id: str = Field(max_length=200)
+    review_date: Optional[str] = Field(default=None, max_length=10)
+    limit: int = 200
+    conversation_id: Optional[str] = Field(default=None, max_length=200)
+
+
+class ReviewLessonStatusPayload(BaseModel):
+    lesson_status: str
 
 
 class PreviewPromptPayload(BaseModel):
@@ -3187,6 +3496,85 @@ async def run_feedback_loop(
 
     print(f"[feedback-loop] insight created id={insight.get('id')} convs={len(convs)}")
     return insight
+
+
+@app.post("/reviews/daily")
+async def run_daily_reviews(
+    payload: DailyReviewPayload,
+    x_dashboard_secret: Optional[str] = Header(default=None),
+):
+    """Cron-compatible daily review trigger protected by DASHBOARD_SECRET."""
+    require_dashboard_secret(x_dashboard_secret)
+    user_id = payload.user_id.strip()
+    if not user_id:
+        raise HTTPException(status_code=422, detail="user_id is required")
+    result = await run_daily_conversation_review_job(
+        user_id=user_id,
+        review_date=payload.review_date,
+        limit=payload.limit,
+        conversation_id=(payload.conversation_id or None),
+    )
+    print(
+        f"[reviews:daily] user_id={user_id} date={result['review_date']} "
+        f"selected={result['selected']} stored={result['stored']} errors={len(result.get('errors', []))}"
+    )
+    return result
+
+
+@app.get("/reviews/daily")
+async def get_daily_reviews(
+    review_date: Optional[str] = Query(default=None),
+    lesson_status: Optional[str] = Query(default=None),
+    limit: int = Query(default=100),
+    user_id: str = Depends(require_jwt),
+):
+    params = {
+        "user_id": f"eq.{user_id}",
+        "order": "review_date.desc,created_at.desc",
+        "limit": str(min(max(limit, 1), 200)),
+        "select": "id,created_at,review_date,conversation_id,username,objective_reached,objective_reason,human_likeness_score,sales_effectiveness_score,engagement_score,moment_of_failure,failure_category,what_angellos_did_wrong,better_human_reply,lesson_learned,prompt_rule_candidate,lesson_status",
+    }
+    if review_date:
+        params["review_date"] = f"eq.{review_date}"
+    if lesson_status:
+        params["lesson_status"] = f"eq.{lesson_status}"
+    async with httpx.AsyncClient() as http:
+        res = await http.get(
+            SUPABASE_CONVERSATION_REVIEWS_URL,
+            headers={**supabase_headers(), "Accept": "application/json"},
+            params=params,
+            timeout=10.0,
+        )
+        res.raise_for_status()
+        return res.json()
+
+
+@app.patch("/reviews/{review_id}/lesson-status")
+async def update_review_lesson_status(
+    review_id: str,
+    payload: ReviewLessonStatusPayload,
+    user_id: str = Depends(require_jwt),
+):
+    if payload.lesson_status not in {"candidate", "approved", "rejected", "ignored"}:
+        raise HTTPException(status_code=400, detail="Invalid lesson_status")
+    patch_body: dict = {"lesson_status": payload.lesson_status}
+    if payload.lesson_status == "approved":
+        patch_body["approved_at"] = now_iso()
+    else:
+        patch_body["approved_at"] = None
+    async with httpx.AsyncClient() as http:
+        res = await http.patch(
+            SUPABASE_CONVERSATION_REVIEWS_URL,
+            headers={**supabase_headers(), "Prefer": "return=representation"},
+            params={"id": f"eq.{review_id}", "user_id": f"eq.{user_id}"},
+            json=patch_body,
+            timeout=10.0,
+        )
+        res.raise_for_status()
+        rows = res.json()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Review not found")
+    return review_public_payload(rows[0])
 
 
 @app.post("/preview-prompt")

@@ -166,6 +166,9 @@ openssl rand -hex 32   # for DASHBOARD_SECRET
 | POST | /follow-ups/preview | Preview an AI follow-up |
 | POST | /follow-ups/manychat-auto-23h | H23 follow-up from ManyChat |
 | POST | /feedback-loop | Analyze and improve the prompt |
+| POST | /reviews/daily | Cron-compatible autonomous daily conversation review, protected by DASHBOARD_SECRET |
+| GET | /reviews/daily | Dashboard/API view of stored daily reviews |
+| PATCH | /reviews/{id}/lesson-status | Approve/reject a review lesson for controlled prompt injection |
 | POST | /playground | Test the prompt in sandbox |
 | GET | /agent/training-center | Full client profile |
 | POST | /agent/profile/save | Save business profile |
@@ -175,8 +178,15 @@ openssl rand -hex 32   # for DASHBOARD_SECRET
 | POST | /agent/sales-rules/save | Save DM rules |
 | POST | /agent/prompt/rebuild | Rebuild the active prompt |
 
-All dashboard endpoints require:
-Authorization: Bearer <Supabase access_token>
+Dashboard auth: send the Supabase access token in the Authorization header.
+
+`POST /reviews/daily` is for Railway cron or an ops trigger and requires
+`X-Dashboard-Secret: {DASHBOARD_SECRET}` plus a JSON body containing
+`user_id`, optional `review_date` (`YYYY-MM-DD`), optional `limit`, and
+optional `conversation_id`. It stores every generated lesson as `candidate`.
+Only lessons later marked `approved` by `PATCH /reviews/{id}/lesson-status`
+are appended to Angellos' live prompt context, capped server-side to prevent
+prompt bloat.
 
 ---
 
