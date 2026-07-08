@@ -21,8 +21,10 @@ import anthropic as _anthropic_mod  # already installed
 
 from main import (
     WebhookPayload,
+    extract_manychat_ig_username,
     handle_inbound_message,
     is_placeholder_display_name,
+    is_real_instagram_username,
     normalize_display_name,
     _needs_supervised_pending,
     _last_prospect_message,
@@ -57,6 +59,12 @@ class _PatchCaptureAsyncClient:
 # ===========================================================================
 
 class TestIsPlaceholderDisplayName:
+    def test_instagram_prospect_placeholder(self):
+        assert is_placeholder_display_name("Instagram prospect") is True
+
+    def test_unknown_placeholder(self):
+        assert is_placeholder_display_name("unknown") is True
+
     def test_ig_username_placeholder(self):
         assert is_placeholder_display_name("{{ig_username}}") is True
 
@@ -100,13 +108,13 @@ class TestIsPlaceholderDisplayName:
 
 class TestNormalizeDisplayNameNumericId:
     def test_numeric_id_rejected_returns_fallback(self):
-        assert normalize_display_name("612751574") == "Instagram prospect"
+        assert normalize_display_name("612751574", external_contact_id="612751574") == "Unresolved Instagram contact 1574"
 
     def test_numeric_id_keeps_existing_valid_name(self):
         assert normalize_display_name("612751574", existing="julien_runs") == "julien_runs"
 
     def test_numeric_id_with_numeric_existing_returns_fallback(self):
-        assert normalize_display_name("612751574", existing="612751574") == "Instagram prospect"
+        assert normalize_display_name("612751574", existing="612751574", external_contact_id="612751574") == "Unresolved Instagram contact 1574"
 
 
 class TestNormalizeDisplayName:
@@ -114,24 +122,24 @@ class TestNormalizeDisplayName:
         assert normalize_display_name("julien_runs") == "julien_runs"
 
     def test_placeholder_rejected_returns_fallback(self):
-        result = normalize_display_name("{{ig_username}}")
-        assert result == "Instagram prospect"
+        result = normalize_display_name("{{ig_username}}", external_contact_id="123456789")
+        assert result == "Unresolved Instagram contact 6789"
 
     def test_placeholder_keeps_existing_valid_name(self):
         result = normalize_display_name("{{ig_username}}", existing="julien_runs")
         assert result == "julien_runs"
 
     def test_placeholder_existing_also_placeholder_returns_fallback(self):
-        result = normalize_display_name("{{ig_username}}", existing="{{ig_username}}")
-        assert result == "Instagram prospect"
+        result = normalize_display_name("{{ig_username}}", existing="{{ig_username}}", external_contact_id="123456789")
+        assert result == "Unresolved Instagram contact 6789"
 
     def test_none_incoming_existing_valid_returns_existing(self):
         result = normalize_display_name(None, existing="julien_runs")
         assert result == "julien_runs"
 
     def test_none_incoming_no_existing_returns_fallback(self):
-        result = normalize_display_name(None, existing=None)
-        assert result == "Instagram prospect"
+        result = normalize_display_name(None, existing=None, external_contact_id="123456789")
+        assert result == "Unresolved Instagram contact 6789"
 
     def test_valid_incoming_overrides_existing(self):
         result = normalize_display_name("new_handle", existing="old_handle")
@@ -139,6 +147,26 @@ class TestNormalizeDisplayName:
 
     def test_strips_whitespace(self):
         assert normalize_display_name("  julien_runs  ") == "julien_runs"
+
+
+class TestManyChatUsernameExtraction:
+    def test_extracts_direct_ig_username(self):
+        assert extract_manychat_ig_username({"data": {"ig_username": "real_handle"}}) == "real_handle"
+
+    def test_extracts_instagram_username(self):
+        assert extract_manychat_ig_username({"data": {"instagram_username": "@real.handle"}}) == "real.handle"
+
+    def test_extracts_custom_field_username(self):
+        payload = {"data": {"custom_fields": [{"name": "Instagram username", "value": "coach_2026"}]}}
+        assert extract_manychat_ig_username(payload) == "coach_2026"
+
+    def test_rejects_placeholder_and_numeric_candidates(self):
+        payload = {"data": {"ig_username": "Instagram prospect", "username": "123456789"}}
+        assert extract_manychat_ig_username(payload) is None
+
+    def test_real_instagram_username_rejects_numeric_id(self):
+        assert is_real_instagram_username("123456789") is False
+        assert is_real_instagram_username("coach2026") is True
 
 
 # ===========================================================================

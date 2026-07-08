@@ -444,33 +444,141 @@ _PLACEHOLDER_RE = re.compile(r"\{\{[^}]*\}\}")
 # ManyChat subscriber IDs are pure numeric strings (typically 7–10 digits).
 # An Instagram handle may contain digits but is never purely numeric and long.
 _NUMERIC_ID_RE = re.compile(r"^\d{6,}$")
+_PLACEHOLDER_DISPLAY_NAMES = {
+    "instagram prospect",
+    "prospect instagram",
+    "prospect",
+    "unknown",
+    "undefined",
+    "null",
+    "none",
+    "n/a",
+    "na",
+}
 
 
 def is_placeholder_display_name(value: Optional[str]) -> bool:
-    """Return True if value is an unresolved template placeholder or a raw numeric subscriber ID."""
+    """Return True if value is an unresolved placeholder or a raw numeric subscriber ID."""
     if not value:
         return False
     cleaned = (value or "").strip()
-    return bool(_PLACEHOLDER_RE.search(cleaned)) or bool(_NUMERIC_ID_RE.match(cleaned))
+    normalized = re.sub(r"\s+", " ", cleaned).strip().lower()
+    return (
+        bool(_PLACEHOLDER_RE.search(cleaned))
+        or bool(_NUMERIC_ID_RE.match(cleaned))
+        or normalized in _PLACEHOLDER_DISPLAY_NAMES
+    )
 
 
-def normalize_display_name(incoming: Optional[str], existing: Optional[str] = None) -> str:
+def is_real_instagram_username(value: Optional[str]) -> bool:
+    """Return True for a usable Instagram handle/display token, never for placeholders or subscriber IDs."""
+    cleaned = (value or "").strip().lstrip("@")
+    if not cleaned or is_placeholder_display_name(cleaned):
+        return False
+    if len(cleaned) > 200:
+        return False
+    return bool(re.match(r"^[A-Za-z0-9._]+$", cleaned))
+
+
+def unresolved_instagram_display_name(external_contact_id: Optional[str]) -> str:
+    suffix = re.sub(r"\D", "", external_contact_id or "")[-4:] or "pending"
+    return f"Unresolved Instagram contact {suffix}"
+
+
+def normalize_display_name(
+    incoming: Optional[str],
+    existing: Optional[str] = None,
+    external_contact_id: Optional[str] = None,
+) -> str:
     """Return a safe display name, never an unresolved placeholder or bare subscriber ID.
 
     Priority:
     1. If incoming is valid (no placeholder, not a numeric ID), use it.
     2. If incoming is invalid but existing is valid, keep existing.
-    3. Otherwise fall back to "Instagram prospect".
+    3. Otherwise fall back to a unique non-final internal label.
     """
     incoming_clean = (incoming or "").strip()
     if incoming_clean and not is_placeholder_display_name(incoming_clean):
-        return incoming_clean
+        return incoming_clean.lstrip("@")
     if incoming_clean and is_placeholder_display_name(incoming_clean):
         print(f"[display_name] rejected invalid display_name: {incoming_clean!r}")
     existing_clean = (existing or "").strip()
     if existing_clean and not is_placeholder_display_name(existing_clean):
-        return existing_clean
-    return "Instagram prospect"
+        return existing_clean.lstrip("@")
+    return unresolved_instagram_display_name(external_contact_id)
+
+
+def walk_json_values(value: object):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield str(key), item
+            yield from walk_json_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from walk_json_values(item)
+
+
+def extract_manychat_ig_username(payload: object) -> Optional[str]:
+    """Extract a real IG username from known ManyChat fields or custom fields."""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    priority_keys = (
+        "ig_username",
+        "instagram_username",
+        "instagram_user_name",
+        "instagram_handle",
+        "ig_handle",
+        "username",
+        "user_name",
+    )
+    candidates: list[str] = []
+    for key in priority_keys:
+        value = data.get(key) if isinstance(data, dict) else None
+        if isinstance(value, str):
+            candidates.append(value)
+
+    def collect_named_custom_fields(value: object) -> None:
+        if isinstance(value, dict):
+            field_name = str(value.get("name") or value.get("field_name") or value.get("key") or "")
+            field_key = field_name.lower().replace(" ", "_")
+            if any(marker in field_key for marker in ("ig_username", "instagram_username", "instagram_handle", "ig_handle", "username")):
+                for nested_key in ("value", "text"):
+                    nested_value = value.get(nested_key)
+                    if isinstance(nested_value, str):
+                        candidates.append(nested_value)
+            for nested in value.values():
+                collect_named_custom_fields(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect_named_custom_fields(nested)
+
+    collect_named_custom_fields(data)
+
+    for key, value in walk_json_values(data):
+        key_normalized = key.lower().replace(" ", "_")
+        if any(marker in key_normalized for marker in ("ig_username", "instagram_username", "instagram_handle", "ig_handle", "username")):
+            if isinstance(value, str):
+                candidates.append(value)
+            elif isinstance(value, dict):
+                for nested_key in ("value", "text", "name"):
+                    nested_value = value.get(nested_key)
+                    if isinstance(nested_value, str):
+                        candidates.append(nested_value)
+        if isinstance(value, dict):
+            field_name = str(value.get("name") or value.get("field_name") or value.get("key") or "")
+            field_key = field_name.lower().replace(" ", "_")
+            if any(marker in field_key for marker in ("ig_username", "instagram_username", "instagram_handle", "ig_handle", "username")):
+                for nested_key in ("value", "text"):
+                    nested_value = value.get(nested_key)
+                    if isinstance(nested_value, str):
+                        candidates.append(nested_value)
+
+    for candidate in candidates:
+        cleaned = candidate.strip().lstrip("@")
+        if is_real_instagram_username(cleaned):
+            return cleaned
+    return None
 
 
 def clean_text(value: object) -> str:
@@ -1249,14 +1357,11 @@ async def get_contact_by_external_id(
 ) -> Optional[dict]:
     if not user_id:
         return None
-    if channel == "instagram":
-        params = {"username": f"eq.{external_contact_id}", "limit": 1}
-    else:
-        params = {
-            "channel": f"eq.{channel}",
-            "external_contact_id": f"eq.{external_contact_id}",
-            "limit": 1,
-        }
+    params = {
+        "channel": f"eq.{channel}",
+        "external_contact_id": f"eq.{external_contact_id}",
+        "limit": 1,
+    }
     params["user_id"] = f"eq.{user_id}"
     async with httpx.AsyncClient() as http:
         res = await http.get(
@@ -1266,6 +1371,19 @@ async def get_contact_by_external_id(
         )
         res.raise_for_status()
         rows = res.json()
+        if not rows and channel == "instagram":
+            res = await http.get(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params={
+                    "username": f"eq.{external_contact_id}",
+                    "user_id": f"eq.{user_id}",
+                    "limit": 1,
+                    "order": "created_at.desc",
+                },
+            )
+            res.raise_for_status()
+            rows = res.json()
     return rows[0] if rows else None
 
 
@@ -1279,9 +1397,11 @@ async def create_contact(
     phone_e164: Optional[str] = None,
     transport_metadata: Optional[dict] = None,
 ) -> dict:
+    safe_display_name = normalize_display_name(display_name, external_contact_id=external_contact_id)
+    username = safe_display_name if channel == "instagram" and is_real_instagram_username(safe_display_name) else external_contact_id
     row = {
-        "username": external_contact_id,
-        "display_name": display_name,
+        "username": username,
+        "display_name": safe_display_name,
         "message": message,
         "status": "nouveau",
         "agent_active": True,
@@ -1519,16 +1639,16 @@ async def fetch_manychat_ig_username(subscriber_id: str) -> Optional[str]:
                 "https://api.manychat.com/fb/subscriber/getInfo",
                 headers={"Authorization": f"Bearer {MANYCHAT_API_KEY}"},
                 params={"subscriber_id": subscriber_id},
-                timeout=5.0,
+                timeout=8.0,
             )
             if res.status_code != 200:
                 print(f"[manychat:getInfo] status={res.status_code} subscriber_id={subscriber_id}")
                 return None
-            data = res.json().get("data") or {}
-            ig_username = (data.get("ig_username") or "").strip()
-            if ig_username and not is_placeholder_display_name(ig_username):
+            ig_username = extract_manychat_ig_username(res.json())
+            if ig_username:
                 print(f"[manychat:getInfo] resolved ig_username={ig_username!r} for subscriber_id={subscriber_id}")
                 return ig_username
+            print(f"[manychat:getInfo] no real instagram username found for subscriber_id={subscriber_id}")
     except Exception as e:
         print(f"[manychat:getInfo] error subscriber_id={subscriber_id}: {e}")
     return None
@@ -2214,7 +2334,7 @@ async def handle_inbound_message(
     received_at = now_iso()
     contact = await get_contact_by_external_id(external_contact_id, channel, user_id)
     existing_display_name = (contact.get("display_name") or "") if contact else ""
-    safe_display_name = normalize_display_name(display_name, existing_display_name)
+    safe_display_name = normalize_display_name(display_name, existing_display_name, external_contact_id)
     if contact is None:
         contact = await create_contact(
             external_contact_id=external_contact_id,
@@ -2259,6 +2379,8 @@ async def handle_inbound_message(
     }
     if safe_display_name:
         patch_data["display_name"] = safe_display_name
+        if channel == "instagram" and is_real_instagram_username(safe_display_name):
+            patch_data["username"] = safe_display_name
     if phone_e164:
         patch_data["phone_e164"] = phone_e164
     if transport_metadata:
@@ -2484,7 +2606,11 @@ async def webhook(
         display_name=display_name,
         message=payload.message,
         user_id=user_id,
-        transport_metadata={"provider": "manychat"},
+        transport_metadata={
+            "provider": "manychat",
+            "subscriber_id": payload.subscriber_id,
+            "webhook_username": payload.username,
+        },
         auto_send_transport=True,
     )
     should_send = bool(result.get("should_send"))
