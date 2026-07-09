@@ -170,6 +170,7 @@ TRAINING_CENTER_PROMPT_END = "<!-- TRAINING_CENTER_PROMPT_END -->"
 AUTO_FOLLOW_UP_HOURS = 23
 MANUAL_FOLLOW_UP_1_HOURS = 72
 MANUAL_FOLLOW_UP_2_HOURS = 240
+MANUAL_FOLLOW_UP_3_HOURS = 720  # j+30 (30 jours)
 ANGELLOS_REJECTION_REPLY = "No worries, appreciate you getting back to me."
 ANGELLOS_WHAT_IS_REPLY = (
     "Angellos is an AI setter for Instagram DMs. It helps qualify conversations, handle replies and follow-ups, "
@@ -1228,8 +1229,10 @@ def get_follow_up_stage(hours_since_user: float) -> Optional[dict]:
         return {"stage": "auto_23h", "label": "Auto 23 h", "mode": "auto", "sort": 1}
     if MANUAL_FOLLOW_UP_1_HOURS <= hours_since_user < MANUAL_FOLLOW_UP_2_HOURS:
         return {"stage": "j3", "label": "J+3", "mode": "manual", "sort": 2}
-    if hours_since_user >= MANUAL_FOLLOW_UP_2_HOURS:
+    if MANUAL_FOLLOW_UP_2_HOURS <= hours_since_user < MANUAL_FOLLOW_UP_3_HOURS:
         return {"stage": "j10", "label": "J+10", "mode": "manual", "sort": 3}
+    if hours_since_user >= MANUAL_FOLLOW_UP_3_HOURS:
+        return {"stage": "j30", "label": "J+30", "mode": "manual", "sort": 4}
     return None
 
 
@@ -1816,6 +1819,7 @@ async def generate_follow_up_message(conversation: dict, stage: str) -> str:
         "auto_23h": "automatic 23-hour follow-up",
         "j3": "assisted D+3 follow-up",
         "j10": "assisted D+10 follow-up",
+        "j30": "assisted D+30 follow-up",
     }
     stage_label = stage_labels.get(stage, stage)
     active_prompt = await get_active_prompt(conversation.get("user_id"))
@@ -3480,6 +3484,87 @@ async def send_auto_23h_follow_up(
         "message": message,
         "sent": True,
     }
+
+
+# ── Cron auto 23h check (remplace le trigger ManyChat) ───────────────────────
+
+
+@app.post("/follow-ups/cron-auto-check")
+async def cron_auto_follow_up_check(
+    x_dashboard_secret: Optional[str] = Header(default=None),
+):
+    """Cron endpoint: scan all conversations and send auto 23h follow-ups for due ones.
+    Replaces the ManyChat trigger that doesn't fire reliably."""
+    require_dashboard_secret(x_dashboard_secret)
+
+    results = {"checked": 0, "auto_sent": 0, "errors": 0, "details": []}
+
+    async with httpx.AsyncClient() as http:
+        res = await http.get(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Accept": "application/json"},
+            params={
+                "order": "created_at.desc",
+                "limit": "500",
+                "select": "id,created_at,username,display_name,message,status,agent_active,automation_mode,history,channel,external_contact_id,phone_e164,last_inbound_at",
+            },
+            timeout=10.0,
+        )
+        res.raise_for_status()
+        conversations = res.json()
+
+    for conv in conversations:
+        due_item = build_follow_up_item(conv)
+        if not due_item or due_item.get("stage") != "auto_23h":
+            continue
+
+        results["auto_sent"] += 1
+        try:
+            message = await generate_follow_up_message(conv, "auto_23h")
+            history = conv.get("history") or []
+            new_history = history + [{
+                "role": "assistant",
+                "content": message,
+                "timestamp": now_iso(),
+                "follow_up_stage": "auto_23h",
+                "follow_up_mode": "auto",
+                "source": "follow_up_cron",
+            }]
+            if len(new_history) > MAX_HISTORY_TURNS * 2:
+                new_history = new_history[-(MAX_HISTORY_TURNS * 2):]
+
+            send_result = await send_channel_message(conv, message)
+
+            async with httpx.AsyncClient() as http2:
+                await http2.patch(
+                    SUPABASE_CONVERSATIONS_URL,
+                    headers={**supabase_headers(), "Prefer": "return=minimal"},
+                    params={"id": f"eq.{conv['id']}"},
+                    json={
+                        "response": message,
+                        "history": new_history,
+                        "status": "en_cours",
+                    },
+                    timeout=10.0,
+                )
+
+            results["details"].append({
+                "conversation_id": conv["id"],
+                "username": conv.get("username"),
+                "sent": True,
+                "send_status": send_result.get("status_code"),
+            })
+        except Exception as e:
+            results["errors"] += 1
+            results["details"].append({
+                "conversation_id": conv["id"],
+                "username": conv.get("username"),
+                "sent": False,
+                "error": str(e)[:200],
+            })
+
+    results["checked"] = len(conversations)
+    return results
 
 
 # ── Playground endpoint ───────────────────────────────────────────────────────
