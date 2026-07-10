@@ -22,7 +22,9 @@ import anthropic as _anthropic_mod  # already installed
 from main import (
     WebhookPayload,
     extract_manychat_ig_username,
+    flush_pending_deliveries,
     handle_inbound_message,
+    is_manychat_pending_delivery_error,
     is_placeholder_display_name,
     is_real_instagram_username,
     normalize_display_name,
@@ -369,6 +371,96 @@ class TestManyChatWebhookAutoSend:
         assert result["sent"] is True
         assert result["mode"] == "auto"
         assert _PatchCaptureAsyncClient.patches[-1]["kwargs"]["json"]["history"][-1]["sent"] is True
+
+    def test_auto_mode_3011_marks_reply_pending_delivery(self, monkeypatch):
+        _PatchCaptureAsyncClient.patches = []
+
+        async def fake_get_contact_by_external_id(*args, **kwargs):
+            return {
+                "id": "conv-1",
+                "user_id": "user-1",
+                "channel": "instagram",
+                "external_contact_id": "subscriber-123",
+                "username": "subscriber-123",
+                "display_name": "prospect_handle",
+                "automation_mode": "auto",
+                "agent_active": True,
+                "history": [],
+            }
+
+        async def fake_get_active_prompt(user_id):
+            return "Base prompt"
+
+        async def fake_send_channel_message(conversation, text):
+            return {"status_code": 400, "body": '{"status":"error","code":3011,"message":"outside 24h window"}'}
+
+        monkeypatch.setattr("main.get_contact_by_external_id", fake_get_contact_by_external_id)
+        monkeypatch.setattr("main.get_active_prompt", fake_get_active_prompt)
+        monkeypatch.setattr("main.send_channel_message", fake_send_channel_message)
+        monkeypatch.setattr("main.httpx.AsyncClient", _PatchCaptureAsyncClient)
+
+        result = asyncio.run(handle_inbound_message(
+            channel="instagram",
+            external_contact_id="subscriber-123",
+            display_name="prospect_handle",
+            message="No thanks bro",
+            user_id="user-1",
+            transport_metadata={"provider": "manychat", "message_id": "msg-3011"},
+            auto_send_transport=True,
+        ))
+
+        final_patch = _PatchCaptureAsyncClient.patches[-1]["kwargs"]["json"]
+        assistant = final_patch["history"][-1]
+        assert result["should_send"] is True
+        assert result["sent"] is False
+        assert final_patch["status"] == "pending_delivery"
+        assert final_patch["pending_message"] == "No worries, appreciate you getting back to me."
+        assert assistant["pending_delivery"] is True
+        assert assistant["delivery_status"] == "pending_delivery"
+
+
+class TestPendingDeliveryHelpers:
+    def test_detects_manychat_3011_json_body(self):
+        assert is_manychat_pending_delivery_error({
+            "status_code": 400,
+            "body": '{"status":"error","code":3011,"message":"outside window"}',
+        }) is True
+
+    def test_flush_pending_delivery_marks_existing_message_sent_without_appending(self, monkeypatch):
+        _PatchCaptureAsyncClient.patches = []
+        conversation = {
+            "id": "conv-1",
+            "user_id": "user-1",
+            "channel": "instagram",
+            "external_contact_id": "subscriber-123",
+            "history": [
+                {"role": "user", "content": "hello", "timestamp": "2026-07-09T10:00:00Z"},
+                {
+                    "role": "assistant",
+                    "content": "pending reply",
+                    "timestamp": "2026-07-09T10:01:00Z",
+                    "sent": False,
+                    "pending_delivery": True,
+                    "delivery_failed": True,
+                },
+            ],
+        }
+
+        async def fake_send_channel_message(conv, text):
+            assert text == "pending reply"
+            return {"status_code": 200, "body": "ok"}
+
+        monkeypatch.setattr("main.send_channel_message", fake_send_channel_message)
+        monkeypatch.setattr("main.httpx.AsyncClient", _PatchCaptureAsyncClient)
+
+        result = asyncio.run(flush_pending_deliveries(conversation, "user-1"))
+        patch_body = _PatchCaptureAsyncClient.patches[-1]["kwargs"]["json"]
+        assert result["flushed"] == 1
+        assert len(patch_body["history"]) == 2
+        assert patch_body["history"][-1]["sent"] is True
+        assert patch_body["history"][-1]["delivery_status"] == "sent_after_inbound_retry"
+        assert patch_body["pending_message"] is None
+        assert patch_body["status"] == "en_cours"
 
 
 if __name__ == "__main__":

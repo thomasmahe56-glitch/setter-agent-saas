@@ -1712,6 +1712,105 @@ async def send_channel_message(conversation: dict, text: str) -> dict:
     return await send_manychat_message(subscriber_id, text)
 
 
+def is_manychat_pending_delivery_error(send_result: Optional[dict]) -> bool:
+    """Return True when ManyChat/Meta reports error 3011 (24h window closed)."""
+    if not send_result:
+        return False
+    if send_result.get("status_code") == 3011:
+        return True
+    body = send_result.get("body") or ""
+    try:
+        parsed = json.loads(body) if isinstance(body, str) else body
+    except json.JSONDecodeError:
+        parsed = None
+
+    def contains_3011(value: object) -> bool:
+        if isinstance(value, dict):
+            if str(value.get("code") or value.get("error_code") or "") == "3011":
+                return True
+            return any(contains_3011(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_3011(item) for item in value)
+        return str(value).strip() == "3011"
+
+    return contains_3011(parsed) if parsed is not None else "3011" in str(body)
+
+
+def pending_delivery_indices(history: list) -> list[int]:
+    return [
+        index
+        for index, message in enumerate(history)
+        if message.get("role") == "assistant"
+        and not message.get("sent")
+        and not message.get("ignored")
+        and (message.get("pending_delivery") or message.get("delivery_failed"))
+        and message.get("content")
+    ]
+
+
+def pending_delivery_status(history: list) -> tuple[bool, Optional[str], Optional[str]]:
+    indices = pending_delivery_indices(history)
+    if not indices:
+        return False, None, None
+    last_pending = history[indices[-1]]
+    return True, last_pending.get("content"), last_pending.get("timestamp") or now_iso()
+
+
+async def flush_pending_deliveries(conversation: dict, user_id: str) -> dict:
+    """Retry unsent pending-delivery assistant messages on the next inbound message."""
+    history = [dict(message) for message in (conversation.get("history") or [])]
+    indices = pending_delivery_indices(history)
+    if not indices:
+        return {"history": history, "flushed": 0, "failed": 0, "attempted": 0}
+
+    flushed = 0
+    failed = 0
+    attempted = 0
+    for index in indices:
+        message = history[index]
+        attempted += 1
+        send_result = await send_channel_message(conversation, message.get("content") or "")
+        message["send_status_code"] = send_result.get("status_code")
+        message["delivery_retry_at"] = now_iso()
+        if send_result.get("status_code", 500) < 400:
+            message["sent"] = True
+            message["pending_delivery"] = False
+            message["delivery_failed"] = False
+            message["delivery_status"] = "sent_after_inbound_retry"
+            flushed += 1
+            continue
+        failed += 1
+        message["sent"] = False
+        message["pending_delivery"] = True
+        message["delivery_failed"] = True
+        message["delivery_status"] = "pending_delivery" if is_manychat_pending_delivery_error(send_result) else "send_failed"
+        message["send_error_body"] = (send_result.get("body") or "")[:500]
+        break
+
+    has_pending, pending_message, pending_message_at = pending_delivery_status(history)
+    patch_data = {
+        "history": history,
+        "status": "pending_delivery" if has_pending else "en_cours",
+        "pending_message": pending_message,
+        "pending_message_at": pending_message_at,
+    }
+    async with httpx.AsyncClient() as http:
+        res = await http.patch(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=minimal"},
+            params={"id": f"eq.{conversation.get('id')}", "user_id": f"eq.{user_id}"},
+            json=patch_data,
+            timeout=10.0,
+        )
+        res.raise_for_status()
+    print(
+        f"[pending-delivery] attempted={attempted} flushed={flushed} failed={failed} "
+        f"conversation_id={conversation.get('id')}",
+        flush=True,
+    )
+    return {"history": history, "flushed": flushed, "failed": failed, "attempted": attempted}
+
+
 def manual_contact_url(conversation: dict) -> Optional[str]:
     channel = conversation.get("channel") or "instagram"
     if channel == "whatsapp":
@@ -1798,12 +1897,24 @@ def has_processed_transport_message(history: list, transport_metadata: Optional[
 def mark_last_auto_assistant_sent(history: list, sent: bool, send_result: Optional[dict] = None) -> list:
     updated_history = []
     patched = False
+    is_pending_delivery = is_manychat_pending_delivery_error(send_result)
     for message in reversed(history):
         if not patched and message.get("role") == "assistant" and message.get("source") == "inbound_auto":
             updated = dict(message)
             updated["sent"] = sent
             if send_result is not None:
                 updated["send_status_code"] = send_result.get("status_code")
+            if sent:
+                updated["pending_delivery"] = False
+                updated["delivery_failed"] = False
+                updated["delivery_status"] = "sent"
+            elif is_pending_delivery:
+                updated["pending_delivery"] = True
+                updated["delivery_failed"] = True
+                updated["delivery_status"] = "pending_delivery"
+                updated["send_error_body"] = (send_result.get("body") or "")[:500] if send_result else ""
+            else:
+                updated["delivery_status"] = "send_failed"
             updated_history.insert(0, updated)
             patched = True
         else:
@@ -2364,6 +2475,11 @@ async def handle_inbound_message(
             "conversation_id": contact.get("id"),
         }
 
+    pending_flush = await flush_pending_deliveries(contact, user_id)
+    if pending_flush.get("attempted"):
+        history = pending_flush.get("history") or history
+        contact = {**contact, "history": history}
+
     user_message = {
         "role": "user",
         "content": message,
@@ -2541,12 +2657,17 @@ async def handle_inbound_message(
 
         send_result = await send_channel_message(contact, reply)
         sent = send_result["status_code"] < 400
-        sent_history = mark_last_auto_assistant_sent(new_history, send_result["status_code"] < 400, send_result)
+        is_pending_delivery = is_manychat_pending_delivery_error(send_result)
+        sent_history = mark_last_auto_assistant_sent(new_history, sent, send_result)
         followup_patch = {
             "history": sent_history,
-            "pending_message": None if send_result["status_code"] < 400 else reply,
-            "pending_message_at": None if send_result["status_code"] < 400 else now_iso(),
+            "pending_message": None if sent else reply,
+            "pending_message_at": None if sent else now_iso(),
         }
+        if is_pending_delivery:
+            followup_patch["status"] = "pending_delivery"
+        elif sent:
+            followup_patch["status"] = "en_cours"
         async with httpx.AsyncClient() as http:
             res = await http.patch(
                 SUPABASE_CONVERSATIONS_URL,
@@ -3449,10 +3570,12 @@ async def send_auto_23h_follow_up(
 
     message = await generate_follow_up_message(conversation, "auto_23h")
     send_result = await send_channel_message(conversation, message)
-    if send_result["status_code"] >= 400:
+    is_pending_delivery = is_manychat_pending_delivery_error(send_result)
+    if send_result["status_code"] >= 400 and not is_pending_delivery:
         raise HTTPException(status_code=502, detail=f"Send error: {send_result['body']}")
 
     history = conversation.get("history") or []
+    sent = send_result["status_code"] < 400
     new_history = history + [{
         "role": "assistant",
         "content": message,
@@ -3460,6 +3583,12 @@ async def send_auto_23h_follow_up(
         "follow_up_stage": "auto_23h",
         "follow_up_mode": "auto",
         "source": "follow_up_auto",
+        "sent": sent,
+        "pending_delivery": is_pending_delivery,
+        "delivery_failed": is_pending_delivery,
+        "delivery_status": "pending_delivery" if is_pending_delivery else "sent",
+        "send_status_code": send_result.get("status_code"),
+        **({"send_error_body": (send_result.get("body") or "")[:500]} if is_pending_delivery else {}),
     }]
     if len(new_history) > MAX_HISTORY_TURNS * 2:
         new_history = new_history[-(MAX_HISTORY_TURNS * 2):]
@@ -3472,7 +3601,9 @@ async def send_auto_23h_follow_up(
             json={
                 "response": message,
                 "history": new_history,
-                "status": "en_cours",
+                "status": "pending_delivery" if is_pending_delivery else "en_cours",
+                "pending_message": message if is_pending_delivery else None,
+                "pending_message_at": now_iso() if is_pending_delivery else None,
             },
             timeout=10.0,
         )
@@ -3482,7 +3613,8 @@ async def send_auto_23h_follow_up(
         "conversation_id": conversation_id,
         "stage": "auto_23h",
         "message": message,
-        "sent": True,
+        "sent": sent,
+        "status": "pending_delivery" if is_pending_delivery else "sent",
     }
 
 
@@ -3521,6 +3653,12 @@ async def cron_auto_follow_up_check(
         results["auto_sent"] += 1
         try:
             message = await generate_follow_up_message(conv, "auto_23h")
+            send_result = await send_channel_message(conv, message)
+            sent = send_result.get("status_code", 500) < 400
+            is_pending_delivery = is_manychat_pending_delivery_error(send_result)
+            if not sent and not is_pending_delivery:
+                raise HTTPException(status_code=502, detail=f"Send error: {send_result.get('body')}")
+
             history = conv.get("history") or []
             new_history = history + [{
                 "role": "assistant",
@@ -3529,11 +3667,15 @@ async def cron_auto_follow_up_check(
                 "follow_up_stage": "auto_23h",
                 "follow_up_mode": "auto",
                 "source": "follow_up_cron",
+                "sent": sent,
+                "pending_delivery": is_pending_delivery,
+                "delivery_failed": is_pending_delivery,
+                "delivery_status": "pending_delivery" if is_pending_delivery else "sent",
+                "send_status_code": send_result.get("status_code"),
+                **({"send_error_body": (send_result.get("body") or "")[:500]} if is_pending_delivery else {}),
             }]
             if len(new_history) > MAX_HISTORY_TURNS * 2:
                 new_history = new_history[-(MAX_HISTORY_TURNS * 2):]
-
-            send_result = await send_channel_message(conv, message)
 
             async with httpx.AsyncClient() as http2:
                 await http2.patch(
@@ -3543,7 +3685,9 @@ async def cron_auto_follow_up_check(
                     json={
                         "response": message,
                         "history": new_history,
-                        "status": "en_cours",
+                        "status": "pending_delivery" if is_pending_delivery else "en_cours",
+                        "pending_message": message if is_pending_delivery else None,
+                        "pending_message_at": now_iso() if is_pending_delivery else None,
                     },
                     timeout=10.0,
                 )
@@ -3551,7 +3695,8 @@ async def cron_auto_follow_up_check(
             results["details"].append({
                 "conversation_id": conv["id"],
                 "username": conv.get("username"),
-                "sent": True,
+                "sent": sent,
+                "status": "pending_delivery" if is_pending_delivery else "sent",
                 "send_status": send_result.get("status_code"),
             })
         except Exception as e:
