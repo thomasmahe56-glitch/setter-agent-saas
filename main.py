@@ -441,6 +441,87 @@ def extract_training_center_payload(prompt: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def normalize_tenant_language(value: object) -> str:
+    lowered = str(value or "").strip().lower()
+    if lowered in {"fr", "français", "francais", "french"}:
+        return "fr"
+    return "en"
+
+
+def tenant_language_label(language: str) -> str:
+    return "French" if normalize_tenant_language(language) == "fr" else "English"
+
+
+def training_center_profile(prompt: str) -> dict:
+    payload = extract_training_center_payload(prompt)
+    profile = payload.get("agent_profile") if isinstance(payload, dict) else {}
+    return profile if isinstance(profile, dict) else {}
+
+
+def tenant_language_from_prompt(prompt: str) -> str:
+    profile = training_center_profile(prompt)
+    return normalize_tenant_language(
+        profile.get("language")
+        or profile.get("preferred_language")
+        or profile.get("default_language")
+    )
+
+
+def is_angellos_acquisition_prompt(prompt: str) -> bool:
+    profile = training_center_profile(prompt)
+    use_case = str(
+        profile.get("agent_use_case")
+        or profile.get("mode")
+        or profile.get("use_case")
+        or ""
+    ).strip().lower()
+    if profile.get("is_angellos_acquisition") is True or use_case in {"acquisition", "angellos_acquisition", "angellos-beta", "angellos_beta"}:
+        return True
+    if profile:
+        return False
+    return True
+
+
+def strip_angellos_beta_defaults(prompt: str) -> str:
+    return re.sub(
+        r"\n*ANGELLOS BETA DEFAULTS\n.*?(?=\nQUALIFICATION PROCESS\n)",
+        "\n",
+        prompt or "",
+        flags=re.DOTALL,
+    ).strip()
+
+
+def tenant_reply_rules(language: str) -> str:
+    language = normalize_tenant_language(language)
+    default_language = tenant_language_label(language)
+    french_line = "- Write natural, short French by default. Use another language only when the prospect clearly uses it first." if language == "fr" else "- Write natural, short English by default. Mirror another language only when the prospect clearly uses it first."
+    return f"""=== TENANT CLIENT MODE — SOURCE OF TRUTH ===
+Mode: tenant client setter
+Default tenant language: {default_language}
+
+These tenant rules override any older Angellos beta defaults, fallback prompts, canned examples, or generic acquisition copy.
+- You are replying as this client's setter for this client's prospects.
+- Use the Training Center data as the source of truth: niche, offer, price, qualification rules, tone, forbidden phrases, and next step.
+- Never pitch Angellos, the Angellos beta, or a free 30-day beta unless the Training Center explicitly says the client's offer is Angellos.
+- If the prospect asks price, answer from the client's Training Center price/terms only. If missing, say you need to check fit first or that the operator will confirm, but do not invent a price.
+- If the prospect asks what it is or how it works, explain the client's offer/process, not Angellos.
+- Move toward the client's configured next step: calendly_url, sales_page_url, or next_step.
+{french_line}
+- Keep replies conversational, concise, and human. Ask one question maximum.
+- Do not use Angellos acquisition canned replies in tenant mode."""
+
+
+def build_tenant_prompt(base_prompt: str) -> str:
+    clean_prompt = strip_angellos_beta_defaults(base_prompt)
+    return f"{clean_prompt}\n\n{tenant_reply_rules(tenant_language_from_prompt(base_prompt))}"
+
+
+def build_generation_prompt(base_prompt: str) -> str:
+    if is_angellos_acquisition_prompt(base_prompt):
+        return build_angellos_beta_prompt(base_prompt)
+    return build_tenant_prompt(base_prompt)
+
+
 _PLACEHOLDER_RE = re.compile(r"\{\{[^}]*\}\}")
 # ManyChat subscriber IDs are pure numeric strings (typically 7–10 digits).
 # An Instagram handle may contain digits but is never purely numeric and long.
@@ -942,11 +1023,16 @@ def prompt_refinement_source(instruction: str) -> str:
 
 
 def format_training_center_for_prompt(profile: dict, avatar: dict, sales_rules: dict) -> str:
+    language = normalize_tenant_language(
+        (profile or {}).get("language")
+        or (profile or {}).get("preferred_language")
+        or (profile or {}).get("default_language")
+    )
     parts = [
         "=== TRAINING CENTER ANGELOS ===",
         "This structured data is the business source of truth. Apply it before generic prompt examples.",
-        "Default language: English for Angellos English beta.",
-        "Use French only when the prospect writes in French first or the full business setup is explicitly French.",
+        f"Tenant default language: {tenant_language_label(language)}.",
+        "Use the tenant default language unless the prospect clearly uses another language first.",
     ]
     if profile:
         parts.extend([
@@ -1934,7 +2020,7 @@ async def generate_follow_up_message(conversation: dict, stage: str) -> str:
     }
     stage_label = stage_labels.get(stage, stage)
     active_prompt = await get_active_prompt(conversation.get("user_id"))
-    generation_prompt = build_angellos_beta_prompt(active_prompt)
+    generation_prompt = build_generation_prompt(active_prompt)
     context = format_conversations_for_analysis([conversation], generation_prompt)
     user_message = (
         f"Follow-up stage: {stage_label}\n"
@@ -1948,7 +2034,7 @@ async def generate_follow_up_message(conversation: dict, stage: str) -> str:
     try:
         reply = generate_claude_reply(
             [{"role": "user", "content": user_message}],
-            build_angellos_beta_prompt(build_follow_up_prompt(config)),
+            generation_prompt,
         )
     except ProviderGenerationError as e:
         raise HTTPException(status_code=e.status_code, detail=provider_error_payload(e))
@@ -2348,6 +2434,7 @@ class AgentProfilePayload(BaseModel):
 
 
 class TrainingProfilePayload(BaseModel):
+    language: str = Field(default="en", max_length=20)
     business_name: str = Field(default="", max_length=300)
     coach_name: str = Field(default="", max_length=300)
     niche: str = Field(default="", max_length=1000)
@@ -2531,7 +2618,7 @@ async def handle_inbound_message(
         }
 
     active_prompt = await get_active_prompt(contact.get("user_id"))
-    system_prompt = build_angellos_beta_prompt(active_prompt)
+    system_prompt = build_generation_prompt(active_prompt)
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
     if not contact.get("agent_active"):
@@ -2558,7 +2645,7 @@ async def handle_inbound_message(
         }
 
     should_human_mode = False
-    canned_reply = get_angellos_beta_canned_reply(message)
+    canned_reply = get_angellos_beta_canned_reply(message) if is_angellos_acquisition_prompt(active_prompt) else None
     if canned_reply:
         reply, should_stop_agent = canned_reply
     else:
@@ -3027,7 +3114,7 @@ async def _generate_and_save_supervised_pending(
         return None
 
     active_prompt = await get_active_prompt(user_id)
-    system_prompt = build_angellos_beta_prompt(active_prompt)
+    system_prompt = build_generation_prompt(active_prompt)
 
     # Build message list up to and including the last user message
     messages_for_gen: list[dict] = []
@@ -3285,7 +3372,7 @@ async def refine_pending(
     history = conversation.get("history") or []
     display_name = conversation.get("display_name") or conversation.get("username", "the prospect")
     active_prompt = await get_active_prompt(user_id)
-    generation_prompt = build_angellos_beta_prompt(active_prompt)
+    generation_prompt = build_generation_prompt(active_prompt)
     original_message = (conversation.get("pending_message") or "").strip()
     if not original_message:
         for msg in reversed(history):
@@ -3722,7 +3809,7 @@ async def playground(
 
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
-    system_prompt = build_angellos_beta_prompt(await get_active_prompt(user_id))
+    system_prompt = build_generation_prompt(await get_active_prompt(user_id))
     if payload.calendly_url or payload.sales_page_url:
         system_prompt = append_agent_options(
             system_prompt,

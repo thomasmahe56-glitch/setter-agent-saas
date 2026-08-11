@@ -20,7 +20,10 @@ os.environ.setdefault("DASHBOARD_SECRET", "test-dashboard-secret")
 import anthropic as _anthropic_mod  # already installed
 
 from main import (
+    ANGELLOS_BETA_REPLY_RULES,
     WebhookPayload,
+    build_generation_prompt,
+    build_training_center_prompt,
     extract_manychat_ig_username,
     flush_pending_deliveries,
     handle_inbound_message,
@@ -28,6 +31,9 @@ from main import (
     is_placeholder_display_name,
     is_real_instagram_username,
     normalize_display_name,
+    get_angellos_beta_canned_reply,
+    is_angellos_acquisition_prompt,
+    tenant_language_from_prompt,
     _needs_supervised_pending,
     _last_prospect_message,
     webhook,
@@ -461,6 +467,59 @@ class TestPendingDeliveryHelpers:
         assert patch_body["history"][-1]["delivery_status"] == "sent_after_inbound_retry"
         assert patch_body["pending_message"] is None
         assert patch_body["status"] == "en_cours"
+
+
+class TestTenantFirstFrenchPrompt:
+    def _tenant_prompt(self, **profile_overrides):
+        profile = {
+            "language": "fr",
+            "business_name": "Cabinet Croissance Kiné",
+            "niche": "consultants growth français pour cabinets de kinés",
+            "offer_name": "Sprint Acquisition Patients",
+            "offer_promise": "remplir l'agenda avec des demandes qualifiées",
+            "price": "2500 EUR",
+            "calendly_url": "https://calendly.com/client/demo",
+            "next_step": "proposer un audit de 20 minutes",
+            **profile_overrides,
+        }
+        return build_training_center_prompt("BASE PROMPT", profile, {"persona_summary": "kiné premium"}, {"qualification_questions": ["budget", "ville"]})
+
+    def test_final_tenant_prompt_contains_training_center_data_and_french_instruction(self):
+        prompt = build_generation_prompt(self._tenant_prompt())
+        assert "Sprint Acquisition Patients" in prompt
+        assert "2500 EUR" in prompt
+        assert "Default tenant language: French" in prompt
+        assert "Write natural, short French by default" in prompt
+
+    def test_tenant_prompt_excludes_angellos_beta_canned_lines(self):
+        prompt = build_generation_prompt(self._tenant_prompt())
+        forbidden = [
+            "For the beta, it’s free for 30 days",
+            "Angellos is an AI setter",
+            "Want me to send the beta page",
+        ]
+        for line in forbidden:
+            assert line not in prompt
+
+    def test_acquisition_prompt_still_contains_beta_rules(self):
+        prompt = build_generation_prompt(self._tenant_prompt(is_angellos_acquisition=True))
+        assert ANGELLOS_BETA_REPLY_RULES in prompt
+        assert "For the beta, it’s free for 30 days" in prompt
+
+    def test_canned_replies_are_available_only_for_acquisition_mode(self):
+        tenant_prompt = self._tenant_prompt()
+        acquisition_prompt = self._tenant_prompt(is_angellos_acquisition=True)
+        assert is_angellos_acquisition_prompt(tenant_prompt) is False
+        assert is_angellos_acquisition_prompt(acquisition_prompt) is True
+        assert get_angellos_beta_canned_reply("what is Angellos?") is not None
+        assert "Angellos is an AI setter" not in build_generation_prompt(tenant_prompt)
+
+    def test_prompt_builder_respects_per_profile_language_and_mode(self):
+        tenant_prompt = self._tenant_prompt(language="fr")
+        acquisition_prompt = self._tenant_prompt(language="en", agent_use_case="acquisition")
+        assert tenant_language_from_prompt(tenant_prompt) == "fr"
+        assert "TENANT CLIENT MODE" in build_generation_prompt(tenant_prompt)
+        assert "ANGELLOS BETA MARKET SETTINGS" in build_generation_prompt(acquisition_prompt)
 
 
 if __name__ == "__main__":
