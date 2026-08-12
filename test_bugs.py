@@ -501,6 +501,12 @@ class TestTenantFirstFrenchPrompt:
         for line in forbidden:
             assert line not in prompt
 
+    def test_unconfigured_prompt_defaults_to_tenant_mode(self):
+        prompt = build_generation_prompt("BASE PROMPT")
+        assert "TENANT CLIENT MODE" in prompt
+        assert "ANGELLOS BETA MARKET SETTINGS" not in prompt
+        assert is_angellos_acquisition_prompt("BASE PROMPT") is False
+
     def test_acquisition_prompt_still_contains_beta_rules(self):
         prompt = build_generation_prompt(self._tenant_prompt(is_angellos_acquisition=True))
         assert ANGELLOS_BETA_REPLY_RULES in prompt

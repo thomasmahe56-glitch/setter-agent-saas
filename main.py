@@ -477,9 +477,7 @@ def is_angellos_acquisition_prompt(prompt: str) -> bool:
     ).strip().lower()
     if profile.get("is_angellos_acquisition") is True or use_case in {"acquisition", "angellos_acquisition", "angellos-beta", "angellos_beta"}:
         return True
-    if profile:
-        return False
-    return True
+    return False
 
 
 def strip_angellos_beta_defaults(prompt: str) -> str:
