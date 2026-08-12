@@ -352,7 +352,7 @@ class TestManyChatWebhookAutoSend:
             }
 
         async def fake_get_active_prompt(user_id):
-            return "Base prompt"
+            return build_training_center_prompt("Base prompt", {"is_angellos_acquisition": True}, {}, {})
 
         async def fake_send_channel_message(conversation, text):
             assert text == "No worries, appreciate you getting back to me."
@@ -395,7 +395,7 @@ class TestManyChatWebhookAutoSend:
             }
 
         async def fake_get_active_prompt(user_id):
-            return "Base prompt"
+            return build_training_center_prompt("Base prompt", {"is_angellos_acquisition": True}, {}, {})
 
         async def fake_send_channel_message(conversation, text):
             return {"status_code": 400, "body": '{"status":"error","code":3011,"message":"outside 24h window"}'}
