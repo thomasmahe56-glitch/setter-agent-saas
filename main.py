@@ -4674,7 +4674,10 @@ async def get_training_center(
     response_payload = {
         "profile": profile,
         "avatar": avatar,
-        "sales_rules": sales_rules if developer_mode else None,
+        # The standard Training Center UI needs learned rules to render
+        # user-facing sections like "Do not say". Developer mode only controls
+        # the raw advanced JSON editor below.
+        "sales_rules": sales_rules,
         "main_steps": TRAINING_CENTER_MAIN_STEPS,
         "checklist": checklist,
         "progress_score": round((completed / len(checklist)) * 100),
