@@ -1081,6 +1081,104 @@ def build_training_center_prompt(base_prompt: str, profile: dict, avatar: dict, 
     )
 
 
+PRICE_LEARNING_MARKERS = (
+    "ne donne jamais le prix",
+    "ne pas donner le prix",
+    "pas donner le prix",
+    "prix uniquement",
+    "prix seulement",
+    "appel de vente",
+    "sales call",
+    "don't give the price",
+    "do not give the price",
+    "never give the price",
+)
+
+
+def durable_rule_from_refinement_instruction(instruction: str) -> Optional[str]:
+    clean_instruction = re.sub(r"\s+", " ", instruction or "").strip()
+    lowered = clean_instruction.lower()
+    if any(marker in lowered for marker in PRICE_LEARNING_MARKERS):
+        return (
+            "Ne jamais donner le prix directement en DM. Si le prospect demande le prix, "
+            "répondre que le tarif dépend du contexte et qu'il sera confirmé pendant l'audit/appel, "
+            "puis poser une question de qualification simple."
+        )
+    if not clean_instruction:
+        return None
+    return clean_instruction[:500]
+
+
+def merge_rule_list(existing: object, rule: str) -> list[str]:
+    values = [item for item in (existing if isinstance(existing, list) else []) if isinstance(item, str) and item.strip()]
+    normalized_rule = re.sub(r"\s+", " ", rule).strip()
+    if not normalized_rule:
+        return values
+    if not any(item.strip().lower() == normalized_rule.lower() for item in values):
+        values.append(normalized_rule)
+    return values
+
+
+async def learn_refinement_rule(user_id: str, instruction: str) -> dict:
+    rule = durable_rule_from_refinement_instruction(instruction)
+    if not rule:
+        return {"learned": False, "rule": ""}
+
+    try:
+        sales_rules_row = await get_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id)
+        rules = dict((sales_rules_row or {}).get("rules") or {})
+        profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id)
+        profile = (profile_row or {}).get("profile") or {}
+
+        rules["do_not_say"] = merge_rule_list(rules.get("do_not_say"), rule)
+        rules["objection_responses"] = merge_rule_list(rules.get("objection_responses"), rule)
+        rules["qualification_questions"] = merge_rule_list(
+            rules.get("qualification_questions"),
+            "Avant de parler tarif, qualifier le type de besoin, la situation actuelle et l'urgence du prospect.",
+        )
+
+        await upsert_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id, {"rules": clean_json_value(rules)})
+
+        active_prompt = await get_active_prompt(user_id)
+        avatar_row = await get_user_singleton_row(SUPABASE_AGENT_AVATARS_URL, user_id)
+        avatar = (avatar_row or {}).get("avatar") or {}
+        next_prompt = build_training_center_prompt(active_prompt, profile, avatar, rules)
+
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"is_active": "eq.true", **owner_scope(user_id)},
+                json={"is_active": False},
+                timeout=10.0,
+            )
+            res.raise_for_status()
+            res = await http.post(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=representation"},
+                json={
+                    **row_owner_fields(user_id),
+                    "content": next_prompt,
+                    "is_active": True,
+                    "source": f"refine-learn: {rule[:72]}",
+                    "insight_id": None,
+                },
+                timeout=10.0,
+            )
+            res.raise_for_status()
+            created = res.json()
+            if isinstance(created, list):
+                version = created[0] if created else {}
+            elif isinstance(created, dict):
+                version = created
+            else:
+                version = {}
+        return {"learned": True, "rule": rule, "prompt_version_id": version.get("id")}
+    except Exception as e:
+        print(f"[refine-learn] failed user_id={user_id}: {e}", flush=True)
+        return {"learned": False, "rule": rule, "error": str(e)[:300]}
+
+
 TRAINING_CENTER_MAIN_STEPS = [
     {"id": "offer", "label": "Your offer"},
     {"id": "knowledge_voice", "label": "Knowledge & voice"},
@@ -2512,6 +2610,7 @@ class AutomationModePayload(BaseModel):
 class RefineMessagePayload(BaseModel):
     instruction: str = Field(max_length=1000)
     original_message: str = Field(default="", max_length=4000)
+    learn: bool = True
 
 
 class PlaygroundPayload(BaseModel):
@@ -3449,8 +3548,16 @@ async def refine_pending(
         )
         res.raise_for_status()
 
-    print(f"[refine-pending] conversation_id={conversation_id} instruction_len={len(instruction)}")
-    return {"refined_message": refined}
+    learning_result = {"learned": False, "rule": ""}
+    if payload.learn:
+        learning_result = await learn_refinement_rule(user_id, instruction)
+
+    print(
+        f"[refine-pending] conversation_id={conversation_id} instruction_len={len(instruction)} "
+        f"learned={learning_result.get('learned')}",
+        flush=True,
+    )
+    return {"refined_message": refined, "learning": learning_result}
 
 
 @app.post("/conversations/seed")

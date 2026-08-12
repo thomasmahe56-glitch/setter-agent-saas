@@ -24,6 +24,7 @@ from main import (
     WebhookPayload,
     build_generation_prompt,
     build_training_center_prompt,
+    durable_rule_from_refinement_instruction,
     extract_manychat_ig_username,
     flush_pending_deliveries,
     handle_inbound_message,
@@ -33,6 +34,8 @@ from main import (
     normalize_display_name,
     get_angellos_beta_canned_reply,
     is_angellos_acquisition_prompt,
+    learn_refinement_rule,
+    merge_rule_list,
     tenant_language_from_prompt,
     _needs_supervised_pending,
     _last_prospect_message,
@@ -526,6 +529,102 @@ class TestTenantFirstFrenchPrompt:
         assert tenant_language_from_prompt(tenant_prompt) == "fr"
         assert "TENANT CLIENT MODE" in build_generation_prompt(tenant_prompt)
         assert "ANGELLOS BETA MARKET SETTINGS" in build_generation_prompt(acquisition_prompt)
+
+
+class TestRefinePendingLearning:
+    def test_price_instruction_becomes_durable_sales_rule(self):
+        rule = durable_rule_from_refinement_instruction(
+            "Ne donne jamais le prix directement, il faut le garder pour l'appel de vente."
+        )
+
+        assert rule == (
+            "Ne jamais donner le prix directement en DM. Si le prospect demande le prix, "
+            "répondre que le tarif dépend du contexte et qu'il sera confirmé pendant l'audit/appel, "
+            "puis poser une question de qualification simple."
+        )
+
+    def test_generic_instruction_is_kept_as_short_rule(self):
+        assert durable_rule_from_refinement_instruction("Rends la réponse plus chaleureuse") == "Rends la réponse plus chaleureuse"
+
+    def test_merge_rule_list_deduplicates_case_insensitively(self):
+        assert merge_rule_list(["Ne donne jamais le prix"], " ne DONNE jamais le prix ") == [
+            "Ne donne jamais le prix"
+        ]
+
+    def test_learn_refinement_rule_updates_sales_rules_and_creates_prompt_version(self):
+        calls = {"get": [], "upsert": [], "active_prompt": 0}
+
+        async def fake_get_user_singleton_row(table_url, user_id, select="*"):
+            calls["get"].append((table_url, user_id, select))
+            if table_url.endswith("/agent_sales_rules"):
+                return {"rules": {"do_not_say": ["Pas de hype"], "qualification_questions": ["budget"]}}
+            if table_url.endswith("/agent_profiles"):
+                return {"profile": {"language": "fr", "offer_name": "Audit Growth", "price": "2500 EUR"}}
+            if table_url.endswith("/agent_avatars"):
+                return {"avatar": {"persona_summary": "coach français"}}
+            return None
+
+        async def fake_upsert_user_singleton_row(table_url, user_id, payload):
+            calls["upsert"].append((table_url, user_id, payload))
+            return {"id": "rules-row", **payload, "user_id": user_id}
+
+        async def fake_get_active_prompt(user_id):
+            calls["active_prompt"] += 1
+            return "BASE PROMPT"
+
+        class _PromptResponse:
+            def __init__(self, payload=None):
+                self._payload = payload or []
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class _PromptClient:
+            posts = []
+            patches = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def patch(self, *args, **kwargs):
+                self.__class__.patches.append({"args": args, "kwargs": kwargs})
+                return _PromptResponse()
+
+            async def post(self, *args, **kwargs):
+                self.__class__.posts.append({"args": args, "kwargs": kwargs})
+                return _PromptResponse([{"id": "prompt-version-1"}])
+
+        _PromptClient.posts = []
+        _PromptClient.patches = []
+
+        with patch("main.get_user_singleton_row", fake_get_user_singleton_row), \
+            patch("main.upsert_user_singleton_row", fake_upsert_user_singleton_row), \
+            patch("main.get_active_prompt", fake_get_active_prompt), \
+            patch("main.httpx.AsyncClient", _PromptClient):
+            result = asyncio.run(
+                learn_refinement_rule(
+                    "user-123",
+                    "Ne donne jamais le prix directement, garde ça pour l'appel de vente.",
+                )
+            )
+
+        assert result["learned"] is True
+        assert result["prompt_version_id"] == "prompt-version-1"
+        assert calls["active_prompt"] == 1
+        saved_rules = calls["upsert"][0][2]["rules"]
+        assert "Pas de hype" in saved_rules["do_not_say"]
+        assert result["rule"] in saved_rules["do_not_say"]
+        assert result["rule"] in saved_rules["objection_responses"]
+        assert "Avant de parler tarif" in saved_rules["qualification_questions"][-1]
+        created_prompt = _PromptClient.posts[0]["kwargs"]["json"]
+        assert created_prompt["source"].startswith("refine-learn:")
+        assert result["rule"] in created_prompt["content"]
 
 
 if __name__ == "__main__":
