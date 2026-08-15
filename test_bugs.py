@@ -24,6 +24,7 @@ from main import (
     WebhookPayload,
     build_generation_prompt,
     build_training_center_prompt,
+    default_automation_mode_for_prompt,
     durable_rule_from_refinement_instruction,
     extract_manychat_ig_username,
     flush_pending_deliveries,
@@ -529,6 +530,12 @@ class TestTenantFirstFrenchPrompt:
         assert tenant_language_from_prompt(tenant_prompt) == "fr"
         assert "TENANT CLIENT MODE" in build_generation_prompt(tenant_prompt)
         assert "ANGELLOS BETA MARKET SETTINGS" in build_generation_prompt(acquisition_prompt)
+
+    def test_tenant_beta_conversations_default_supervised(self):
+        assert default_automation_mode_for_prompt(self._tenant_prompt()) == "supervised"
+
+    def test_acquisition_conversations_keep_auto_default(self):
+        assert default_automation_mode_for_prompt(self._tenant_prompt(is_angellos_acquisition=True)) == "auto"
 
 
 class TestRefinePendingLearning:

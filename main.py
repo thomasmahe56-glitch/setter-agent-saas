@@ -480,6 +480,11 @@ def is_angellos_acquisition_prompt(prompt: str) -> bool:
     return False
 
 
+def default_automation_mode_for_prompt(prompt: str) -> str:
+    """Keep Thomas' acquisition flow auto, but tenant beta client accounts supervised by default."""
+    return "auto" if is_angellos_acquisition_prompt(prompt) else "supervised"
+
+
 def strip_angellos_beta_defaults(prompt: str) -> str:
     return re.sub(
         r"\n*ANGELLOS BETA DEFAULTS\n.*?(?=\nQUALIFICATION PROCESS\n)",
@@ -1584,6 +1589,7 @@ async def create_contact(
 ) -> dict:
     safe_display_name = normalize_display_name(display_name, external_contact_id=external_contact_id)
     username = safe_display_name if channel == "instagram" and is_real_instagram_username(safe_display_name) else external_contact_id
+    default_automation_mode = default_automation_mode_for_prompt(await get_active_prompt(user_id))
     row = {
         "username": username,
         "display_name": safe_display_name,
@@ -1597,7 +1603,7 @@ async def create_contact(
         "last_inbound_at": received_at,
         "transport_metadata": transport_metadata or {},
         "user_id": user_id,
-        "automation_mode": "auto",
+        "automation_mode": default_automation_mode,
     }
     async with httpx.AsyncClient() as http:
         res = await http.post(
@@ -3580,6 +3586,7 @@ async def seed_conversation(
     if existing:
         return {"status": "already_exists", "conversation_id": existing.get("id")}
 
+    default_automation_mode = default_automation_mode_for_prompt(await get_active_prompt(user_id))
     now = now_iso()
     row = {
         "username": username,
@@ -3593,7 +3600,7 @@ async def seed_conversation(
         "channel": "instagram",
         "external_contact_id": username,
         "user_id": user_id,
-        "automation_mode": "auto",
+        "automation_mode": default_automation_mode,
         "last_inbound_at": None,
     }
 
