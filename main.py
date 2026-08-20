@@ -36,6 +36,8 @@ SUPABASE_CONVERSATION_REVIEWS_URL = f"{config.supabase_url}/conversation_reviews
 SUPABASE_AGENT_PROFILES_URL = f"{config.supabase_url}/agent_profiles"
 SUPABASE_AGENT_AVATARS_URL = f"{config.supabase_url}/agent_avatars"
 SUPABASE_AGENT_SALES_RULES_URL = f"{config.supabase_url}/agent_sales_rules"
+SUPABASE_BETA_AI_USAGE_URL = f"{config.supabase_url}/beta_ai_usage"
+SUPABASE_BETA_ACCOUNT_SETTINGS_URL = f"{config.supabase_url}/beta_account_settings"
 MANYCHAT_API_KEY = config.manychat_token
 MANYCHAT_SEND_URL = "https://api.manychat.com/fb/sending/sendContent"
 WHATSAPP_ACCESS_TOKEN = config.whatsapp_access_token
@@ -45,6 +47,10 @@ META_APP_SECRET = config.meta_app_secret
 GRAPH_API_VERSION = config.graph_api_version or "v23.0"
 WHATSAPP_SEND_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 MAX_HISTORY_TURNS = 40
+DEFAULT_BETA_COST_CAP_EUR = float(os.environ.get("DEFAULT_BETA_COST_CAP_EUR", "50"))
+CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN", "2.75"))
+CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN", "13.75"))
+AI_COST_BLOCK_USER_MESSAGE = "Angellos a atteint le plafond de coût IA configuré pour ce compte. Les nouvelles réponses automatiques sont arrêtées par sécurité."
 
 GENERIC_AI_USER_MESSAGE = "Angellos couldn’t generate a reply right now. Please check your AI credits or try again."
 LOW_CREDITS_USER_MESSAGE = "Angellos couldn’t generate a reply because the Anthropic account has no available credits. Add credits in Anthropic billing, then try again."
@@ -59,6 +65,15 @@ class ProviderGenerationError(Exception):
         self.message = message
         self.user_message = user_message
         self.status_code = status_code
+
+
+class CostCapExceededError(Exception):
+    def __init__(self, user_id: str, spent_eur: float, cap_eur: float):
+        super().__init__(f"AI cost cap reached for user {user_id}: {spent_eur:.4f}/{cap_eur:.2f} EUR")
+        self.user_id = user_id
+        self.spent_eur = spent_eur
+        self.cap_eur = cap_eur
+        self.user_message = AI_COST_BLOCK_USER_MESSAGE
 
 
 def classify_provider_error(error: Exception) -> ProviderGenerationError:
@@ -318,6 +333,111 @@ def owner_scope(user_id: Optional[str] = None) -> dict:
 
 def row_owner_fields(user_id: Optional[str] = None) -> dict:
     return {"user_id": user_id} if user_id else {}
+
+
+def estimate_token_count(text: str) -> int:
+    # Deterministic approximation when provider billing usage is not persisted: ~4 chars/token.
+    return max(1, (len(text or "") + 3) // 4)
+
+
+def estimate_claude_cost_eur(input_text: str, output_text: str) -> float:
+    input_tokens = estimate_token_count(input_text)
+    output_tokens = estimate_token_count(output_text)
+    return (input_tokens / 1_000_000 * CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN) + (
+        output_tokens / 1_000_000 * CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN
+    )
+
+
+async def get_beta_cost_settings(user_id: str) -> dict:
+    settings = {"cap_eur": DEFAULT_BETA_COST_CAP_EUR, "enabled": True}
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.get(
+                SUPABASE_BETA_ACCOUNT_SETTINGS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params={"user_id": f"eq.{user_id}", "select": "ai_cost_cap_eur,ai_cost_guardrail_enabled", "limit": "1"},
+                timeout=5.0,
+            )
+            if res.status_code == 404:
+                return settings
+            if res.status_code >= 400:
+                print(f"[ai-cost:settings] fallback status={res.status_code} body={res.text[:200]}", flush=True)
+                return settings
+            rows = res.json()
+            if rows:
+                row = rows[0]
+                if row.get("ai_cost_cap_eur") is not None:
+                    settings["cap_eur"] = float(row["ai_cost_cap_eur"])
+                if row.get("ai_cost_guardrail_enabled") is not None:
+                    settings["enabled"] = bool(row["ai_cost_guardrail_enabled"])
+    except Exception as e:
+        print(f"[ai-cost:settings] fallback error={type(e).__name__}: {e}", flush=True)
+    return settings
+
+
+async def get_estimated_ai_spend_eur(user_id: str) -> float:
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.get(
+                SUPABASE_BETA_AI_USAGE_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params={"user_id": f"eq.{user_id}", "select": "estimated_cost_eur", "limit": "10000"},
+                timeout=8.0,
+            )
+            if res.status_code >= 400:
+                print(f"[ai-cost:usage] unavailable status={res.status_code} body={res.text[:200]}", flush=True)
+                return 0.0
+            return sum(float(row.get("estimated_cost_eur") or 0) for row in res.json())
+    except Exception as e:
+        print(f"[ai-cost:usage] unavailable error={type(e).__name__}: {e}", flush=True)
+        return 0.0
+
+
+async def enforce_ai_cost_cap(user_id: str) -> dict:
+    settings = await get_beta_cost_settings(user_id)
+    spent = await get_estimated_ai_spend_eur(user_id)
+    cap = float(settings["cap_eur"])
+    if settings.get("enabled", True) and spent >= cap:
+        raise CostCapExceededError(user_id, spent, cap)
+    return {"spent_eur": spent, "cap_eur": cap, "enabled": settings.get("enabled", True)}
+
+
+async def record_ai_usage_event(user_id: str, feature: str, input_text: str, output_text: str, model: str = "claude-sonnet-4-6") -> dict:
+    input_tokens = estimate_token_count(input_text)
+    output_tokens = estimate_token_count(output_text)
+    cost = estimate_claude_cost_eur(input_text, output_text)
+    row = {
+        "user_id": user_id,
+        "feature": feature,
+        "model": model,
+        "input_tokens_estimated": input_tokens,
+        "output_tokens_estimated": output_tokens,
+        "estimated_cost_eur": round(cost, 8),
+    }
+    try:
+        async with httpx.AsyncClient() as http:
+            res = await http.post(
+                SUPABASE_BETA_AI_USAGE_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                json=row,
+                timeout=5.0,
+            )
+            if res.status_code >= 400:
+                print(f"[ai-cost:record] unavailable status={res.status_code} body={res.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"[ai-cost:record] unavailable error={type(e).__name__}: {e}", flush=True)
+    return row
+
+
+def cost_cap_error_payload(error: CostCapExceededError) -> dict:
+    return {
+        "ok": False,
+        "error_type": "ai_cost_cap_reached",
+        "message": error.user_message,
+        "user_message": error.user_message,
+        "spent_eur": round(error.spent_eur, 4),
+        "cap_eur": round(error.cap_eur, 2),
+    }
 
 
 def require_dashboard_secret(x_dashboard_secret: Optional[str]) -> None:
@@ -2613,6 +2733,10 @@ class AutomationModePayload(BaseModel):
     automation_mode: str  # "auto" | "supervised" | "disabled"
 
 
+class BulkAutomationModePayload(BaseModel):
+    automation_mode: str = "auto"
+
+
 class RefineMessagePayload(BaseModel):
     instruction: str = Field(max_length=1000)
     original_message: str = Field(default="", max_length=4000)
@@ -2720,6 +2844,31 @@ async def handle_inbound_message(
             "conversation_id": contact.get("id"),
         }
 
+    try:
+        await enforce_ai_cost_cap(user_id)
+    except CostCapExceededError as e:
+        patch_data["pending_message"] = None
+        patch_data["pending_message_at"] = None
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{contact.get('id')}", "user_id": f"eq.{user_id}"},
+                json=patch_data,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        return {
+            "reply": "",
+            "sent": False,
+            "should_send": False,
+            "mode": automation_mode,
+            "skipped": True,
+            "reason": "ai_cost_cap_reached",
+            "error": cost_cap_error_payload(e),
+            "conversation_id": contact.get("id"),
+        }
+
     active_prompt = await get_active_prompt(contact.get("user_id"))
     system_prompt = build_generation_prompt(active_prompt)
     if client is None:
@@ -2791,6 +2940,7 @@ async def handle_inbound_message(
         reply, should_stop_agent, should_human_mode = split_stop_agent_reply(reply)
     reply = sanitize_angellos_beta_reply(reply, message)
     reply = validate_agent_reply(reply, system_prompt)
+    await record_ai_usage_event(user_id, "inbound_reply", json.dumps(strip_message_metadata(messages_for_generation), ensure_ascii=False) if not canned_reply else message, reply)
 
     if should_stop_agent:
         if not (channel == "whatsapp" and (is_whatsapp_test_contact(contact) or is_whatsapp_test_metadata(transport_metadata))):
@@ -3422,6 +3572,67 @@ async def update_automation_mode(
     return {"success": True}
 
 
+@app.post("/conversations/bulk-automation-mode")
+async def bulk_update_automation_mode(
+    payload: BulkAutomationModePayload = BulkAutomationModePayload(),
+    user_id: str = Depends(require_jwt),
+):
+    target_mode = payload.automation_mode
+    if target_mode != "auto":
+        raise HTTPException(status_code=400, detail="Bulk action only supports switching supervised conversations to auto")
+
+    async with httpx.AsyncClient() as http:
+        read_res = await http.get(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Accept": "application/json"},
+            params={
+                "user_id": f"eq.{user_id}",
+                "select": "id,automation_mode",
+                "limit": "10000",
+            },
+            timeout=10.0,
+        )
+        read_res.raise_for_status()
+        conversations = read_res.json()
+
+        eligible_ids = [row["id"] for row in conversations if (row.get("automation_mode") or "supervised") == "supervised"]
+        skipped_off_disabled = sum(1 for row in conversations if (row.get("automation_mode") or "supervised") in {"disabled", "off", "paused"})
+        skipped_other = max(0, len(conversations) - len(eligible_ids) - skipped_off_disabled)
+
+        switched = 0
+        failed = 0
+        failed_ids: list[str] = []
+        for conversation_id in eligible_ids:
+            try:
+                patch_res = await http.patch(
+                    SUPABASE_CONVERSATIONS_URL,
+                    headers={**supabase_headers(), "Prefer": "return=minimal"},
+                    params={
+                        "id": f"eq.{conversation_id}",
+                        "user_id": f"eq.{user_id}",
+                        "automation_mode": "eq.supervised",
+                    },
+                    json={"automation_mode": "auto"},
+                    timeout=10.0,
+                )
+                patch_res.raise_for_status()
+                switched += 1
+            except Exception as e:
+                failed += 1
+                failed_ids.append(conversation_id)
+                print(f"[bulk-auto] failed conversation_id={conversation_id}: {type(e).__name__}: {e}", flush=True)
+
+    return {
+        "success": failed == 0,
+        "target_mode": "auto",
+        "switched_to_auto": switched,
+        "skipped_off_disabled": skipped_off_disabled,
+        "skipped_other": skipped_other,
+        "failed": failed,
+        "failed_ids": failed_ids[:20],
+    }
+
+
 @app.post("/conversations/{conversation_id}/ignore-pending")
 async def ignore_pending(
     conversation_id: str,
@@ -3642,6 +3853,26 @@ async def delete_conversation(
     return {"status": "deleted"}
 
 
+@app.get("/beta/ai-cost")
+async def get_beta_ai_cost(user_id: str = Depends(require_jwt)):
+    settings = await get_beta_cost_settings(user_id)
+    spent = await get_estimated_ai_spend_eur(user_id)
+    cap = float(settings["cap_eur"])
+    return {
+        "spent_eur": round(spent, 4),
+        "cap_eur": round(cap, 2),
+        "remaining_eur": round(max(0.0, cap - spent), 4),
+        "guardrail_enabled": settings.get("enabled", True),
+        "cap_reached": settings.get("enabled", True) and spent >= cap,
+        "pricing_assumption": {
+            "model": "claude-sonnet-4-6",
+            "input_eur_per_million_tokens": CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN,
+            "output_eur_per_million_tokens": CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN,
+            "token_estimation": "ceil(characters / 4) when provider usage is not persisted",
+        },
+    }
+
+
 # ── Follow-up endpoints ───────────────────────────────────────────────────────
 
 @app.get("/follow-ups/due")
@@ -3657,7 +3888,7 @@ async def get_due_follow_ups(
                 "order": "created_at.desc",
                 "limit": "500",
                 "user_id": f"eq.{user_id}",
-                "select": "id,created_at,username,display_name,message,status,agent_active,automation_mode,history,channel,external_contact_id,phone_e164,last_inbound_at",
+                "select": "id,created_at,user_id,username,display_name,message,status,agent_active,automation_mode,history,channel,external_contact_id,phone_e164,last_inbound_at",
             },
             timeout=10.0,
         )
@@ -3767,7 +3998,12 @@ async def send_auto_23h_follow_up(
     if not due_item or due_item.get("stage") != "auto_23h":
         raise HTTPException(status_code=409, detail="Auto 23h follow-up is not due")
 
+    try:
+        await enforce_ai_cost_cap(user_id)
+    except CostCapExceededError as e:
+        raise HTTPException(status_code=402, detail=cost_cap_error_payload(e))
     message = await generate_follow_up_message(conversation, "auto_23h")
+    await record_ai_usage_event(user_id, "follow_up_auto_23h", json.dumps(conversation.get("history") or [], ensure_ascii=False), message)
     send_result = await send_channel_message(conversation, message)
     is_pending_delivery = is_manychat_pending_delivery_error(send_result)
     if send_result["status_code"] >= 400 and not is_pending_delivery:
@@ -3851,7 +4087,12 @@ async def cron_auto_follow_up_check(
 
         results["auto_sent"] += 1
         try:
+            conv_user_id = conv.get("user_id")
+            if conv_user_id:
+                await enforce_ai_cost_cap(conv_user_id)
             message = await generate_follow_up_message(conv, "auto_23h")
+            if conv_user_id:
+                await record_ai_usage_event(conv_user_id, "follow_up_cron_auto_23h", json.dumps(conv.get("history") or [], ensure_ascii=False), message)
             send_result = await send_channel_message(conv, message)
             sent = send_result.get("status_code", 500) < 400
             is_pending_delivery = is_manychat_pending_delivery_error(send_result)

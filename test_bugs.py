@@ -41,6 +41,12 @@ from main import (
     _needs_supervised_pending,
     _last_prospect_message,
     webhook,
+    bulk_update_automation_mode,
+    BulkAutomationModePayload,
+    CostCapExceededError,
+    estimate_token_count,
+    estimate_claude_cost_eur,
+    enforce_ai_cost_cap,
 )
 
 
@@ -632,6 +638,71 @@ class TestRefinePendingLearning:
         created_prompt = _PromptClient.posts[0]["kwargs"]["json"]
         assert created_prompt["source"].startswith("refine-learn:")
         assert result["rule"] in created_prompt["content"]
+
+
+class TestNounesBetaReadinessControls:
+    def test_cost_estimator_is_deterministic_and_positive(self):
+        assert estimate_token_count("abcd") == 1
+        assert estimate_token_count("abcde") == 2
+        assert estimate_claude_cost_eur("hello", "bonjour") > 0
+
+    def test_cost_cap_raises_when_spend_reaches_cap(self):
+        async def fake_settings(user_id):
+            return {"cap_eur": 50.0, "enabled": True}
+
+        async def fake_spend(user_id):
+            return 50.0
+
+        with patch("main.get_beta_cost_settings", fake_settings), patch("main.get_estimated_ai_spend_eur", fake_spend):
+            with pytest.raises(CostCapExceededError):
+                asyncio.run(enforce_ai_cost_cap("user-123"))
+
+    def test_bulk_auto_only_patches_supervised_and_counts_off_disabled_paused(self):
+        class _Response:
+            def __init__(self, payload=None):
+                self.status_code = 200
+                self.text = ""
+                self._payload = payload or []
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class _BulkClient:
+            patches = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def get(self, *args, **kwargs):
+                return _Response([
+                    {"id": "supervised-1", "automation_mode": "supervised"},
+                    {"id": "auto-1", "automation_mode": "auto"},
+                    {"id": "disabled-1", "automation_mode": "disabled"},
+                    {"id": "off-1", "automation_mode": "off"},
+                    {"id": "paused-1", "automation_mode": "paused"},
+                ])
+
+            async def patch(self, *args, **kwargs):
+                self.__class__.patches.append({"args": args, "kwargs": kwargs})
+                return _Response()
+
+        _BulkClient.patches = []
+        with patch("main.httpx.AsyncClient", _BulkClient):
+            result = asyncio.run(bulk_update_automation_mode(BulkAutomationModePayload(), user_id="user-123"))
+
+        assert result["switched_to_auto"] == 1
+        assert result["skipped_off_disabled"] == 3
+        assert result["skipped_other"] == 1
+        assert result["failed"] == 0
+        assert len(_BulkClient.patches) == 1
+        assert _BulkClient.patches[0]["kwargs"]["params"]["id"] == "eq.supervised-1"
+        assert _BulkClient.patches[0]["kwargs"]["params"]["automation_mode"] == "eq.supervised"
 
 
 if __name__ == "__main__":
