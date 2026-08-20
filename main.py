@@ -359,9 +359,27 @@ async def get_beta_cost_settings(user_id: str) -> dict:
                 timeout=5.0,
             )
             if res.status_code == 404:
+                try:
+                    profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
+                    profile = (profile_row or {}).get("profile") or {}
+                    if profile.get("beta_ai_cost_cap_eur") is not None:
+                        settings["cap_eur"] = float(profile["beta_ai_cost_cap_eur"])
+                    if profile.get("beta_ai_cost_guardrail_enabled") is not None:
+                        settings["enabled"] = bool(profile["beta_ai_cost_guardrail_enabled"])
+                except Exception as profile_error:
+                    print(f"[ai-cost:settings] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
                 return settings
             if res.status_code >= 400:
                 print(f"[ai-cost:settings] fallback status={res.status_code} body={res.text[:200]}", flush=True)
+                try:
+                    profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
+                    profile = (profile_row or {}).get("profile") or {}
+                    if profile.get("beta_ai_cost_cap_eur") is not None:
+                        settings["cap_eur"] = float(profile["beta_ai_cost_cap_eur"])
+                    if profile.get("beta_ai_cost_guardrail_enabled") is not None:
+                        settings["enabled"] = bool(profile["beta_ai_cost_guardrail_enabled"])
+                except Exception as profile_error:
+                    print(f"[ai-cost:settings] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
                 return settings
             rows = res.json()
             if rows:
@@ -385,12 +403,24 @@ async def get_estimated_ai_spend_eur(user_id: str) -> float:
                 timeout=8.0,
             )
             if res.status_code >= 400:
-                print(f"[ai-cost:usage] unavailable status={res.status_code} body={res.text[:200]}", flush=True)
-                return 0.0
+                print(f"[ai-cost:usage] table unavailable status={res.status_code} body={res.text[:200]}", flush=True)
+                try:
+                    profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
+                    profile = (profile_row or {}).get("profile") or {}
+                    return float(profile.get("beta_ai_estimated_spend_eur") or 0.0)
+                except Exception as profile_error:
+                    print(f"[ai-cost:usage] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
+                    return 0.0
             return sum(float(row.get("estimated_cost_eur") or 0) for row in res.json())
     except Exception as e:
-        print(f"[ai-cost:usage] unavailable error={type(e).__name__}: {e}", flush=True)
-        return 0.0
+        print(f"[ai-cost:usage] fallback error={type(e).__name__}: {e}", flush=True)
+        try:
+            profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
+            profile = (profile_row or {}).get("profile") or {}
+            return float(profile.get("beta_ai_estimated_spend_eur") or 0.0)
+        except Exception as profile_error:
+            print(f"[ai-cost:usage] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
+            return 0.0
 
 
 async def enforce_ai_cost_cap(user_id: str) -> dict:
@@ -423,9 +453,29 @@ async def record_ai_usage_event(user_id: str, feature: str, input_text: str, out
                 timeout=5.0,
             )
             if res.status_code >= 400:
-                print(f"[ai-cost:record] unavailable status={res.status_code} body={res.text[:200]}", flush=True)
+                print(f"[ai-cost:record] table unavailable status={res.status_code} body={res.text[:200]}", flush=True)
+                try:
+                    profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
+                    profile = dict((profile_row or {}).get("profile") or {})
+                    profile["beta_ai_estimated_spend_eur"] = round(float(profile.get("beta_ai_estimated_spend_eur") or 0.0) + cost, 8)
+                    profile["beta_ai_last_usage_event"] = {**row, "created_at": now_iso()}
+                    profile.setdefault("beta_ai_cost_cap_eur", DEFAULT_BETA_COST_CAP_EUR)
+                    profile.setdefault("beta_ai_cost_guardrail_enabled", True)
+                    await upsert_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, {"profile": profile})
+                except Exception as profile_error:
+                    print(f"[ai-cost:record] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
     except Exception as e:
-        print(f"[ai-cost:record] unavailable error={type(e).__name__}: {e}", flush=True)
+        print(f"[ai-cost:record] fallback error={type(e).__name__}: {e}", flush=True)
+        try:
+            profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
+            profile = dict((profile_row or {}).get("profile") or {})
+            profile["beta_ai_estimated_spend_eur"] = round(float(profile.get("beta_ai_estimated_spend_eur") or 0.0) + cost, 8)
+            profile["beta_ai_last_usage_event"] = {**row, "created_at": now_iso()}
+            profile.setdefault("beta_ai_cost_cap_eur", DEFAULT_BETA_COST_CAP_EUR)
+            profile.setdefault("beta_ai_cost_guardrail_enabled", True)
+            await upsert_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, {"profile": profile})
+        except Exception as profile_error:
+            print(f"[ai-cost:record] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
     return row
 
 
