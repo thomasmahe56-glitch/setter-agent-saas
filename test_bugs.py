@@ -2,6 +2,7 @@
 import asyncio
 import types
 import pytest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,10 @@ from main import (
     estimate_token_count,
     estimate_claude_cost_eur,
     enforce_ai_cost_cap,
+    configured_follow_up_stage,
+    is_within_allowed_send_window,
+    next_allowed_send_at,
+    normalize_beta_account_settings,
 )
 
 
@@ -645,6 +650,47 @@ class TestNounesBetaReadinessControls:
         assert estimate_token_count("abcd") == 1
         assert estimate_token_count("abcde") == 2
         assert estimate_claude_cost_eur("hello", "bonjour") > 0
+
+    def test_beta_account_settings_normalize_cap_windows_and_followups(self):
+        settings = normalize_beta_account_settings(row={
+            "ai_cost_cap_eur": "50.00",
+            "ai_cost_guardrail_enabled": True,
+            "allowed_send_start": "08:00",
+            "allowed_send_end": "22:00",
+            "min_auto_delay_seconds": 30,
+            "random_auto_delay_seconds": 90,
+            "follow_up_config": [
+                {"stage": "j2", "delay_hours": 48, "mode": "manual"},
+                {"stage": "auto_23h", "delay_hours": 23, "mode": "auto"},
+            ],
+        })
+
+        assert settings["cap_eur"] == 50.0
+        assert settings["allowed_send_start"] == "08:00"
+        assert settings["allowed_send_end"] == "22:00"
+        assert settings["min_auto_delay_seconds"] == 30
+        assert settings["random_auto_delay_seconds"] == 90
+        assert [item["stage"] for item in settings["follow_up_config"]] == ["auto_23h", "j2"]
+
+    def test_allowed_send_window_blocks_after_hours_and_returns_next_window(self):
+        settings = normalize_beta_account_settings(row={"allowed_send_start": "08:00", "allowed_send_end": "22:00"})
+        assert is_within_allowed_send_window(datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc), settings) is True
+        after_hours = datetime(2026, 8, 20, 23, 15, tzinfo=timezone.utc)
+        assert is_within_allowed_send_window(after_hours, settings) is False
+        assert next_allowed_send_at(after_hours, settings).isoformat() == "2026-08-21T08:00:00+00:00"
+
+    def test_configurable_follow_up_stage_uses_account_delays(self):
+        settings = normalize_beta_account_settings(row={
+            "follow_up_config": [
+                {"stage": "h12", "delay_hours": 12, "mode": "auto"},
+                {"stage": "j2", "delay_hours": 48, "mode": "manual"},
+            ]
+        })
+
+        h12 = configured_follow_up_stage(13, settings)
+        j2 = configured_follow_up_stage(49, settings)
+        assert h12 and h12["stage"] == "h12"
+        assert j2 and j2["stage"] == "j2"
 
     def test_cost_cap_raises_when_spend_reaches_cap(self):
         async def fake_settings(user_id):

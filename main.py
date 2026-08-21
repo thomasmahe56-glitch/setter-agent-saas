@@ -51,6 +51,20 @@ DEFAULT_BETA_COST_CAP_EUR = float(os.environ.get("DEFAULT_BETA_COST_CAP_EUR", "5
 CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN", "2.75"))
 CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN", "13.75"))
 AI_COST_BLOCK_USER_MESSAGE = "Angellos a atteint le plafond de coût IA configuré pour ce compte. Les nouvelles réponses automatiques sont arrêtées par sécurité."
+DEFAULT_BETA_ACCOUNT_SETTINGS = {
+    "cap_eur": DEFAULT_BETA_COST_CAP_EUR,
+    "enabled": True,
+    "allowed_send_start": "08:00",
+    "allowed_send_end": "22:00",
+    "min_auto_delay_seconds": 0,
+    "random_auto_delay_seconds": 0,
+    "follow_up_config": [
+        {"stage": "auto_23h", "delay_hours": 23, "mode": "auto"},
+        {"stage": "j3", "delay_hours": 72, "mode": "manual"},
+        {"stage": "j10", "delay_hours": 240, "mode": "manual"},
+        {"stage": "j30", "delay_hours": 720, "mode": "manual"},
+    ],
+}
 
 GENERIC_AI_USER_MESSAGE = "Angellos couldn’t generate a reply right now. Please check your AI credits or try again."
 LOW_CREDITS_USER_MESSAGE = "Angellos couldn’t generate a reply because the Anthropic account has no available credits. Add credits in Anthropic billing, then try again."
@@ -348,24 +362,72 @@ def estimate_claude_cost_eur(input_text: str, output_text: str) -> float:
     )
 
 
+def normalize_beta_account_settings(row: Optional[dict] = None, profile: Optional[dict] = None) -> dict:
+    settings = dict(DEFAULT_BETA_ACCOUNT_SETTINGS)
+    row = row or {}
+    profile = profile or {}
+
+    if row.get("ai_cost_cap_eur") is not None:
+        settings["cap_eur"] = float(row["ai_cost_cap_eur"])
+    elif profile.get("beta_ai_cost_cap_eur") is not None:
+        settings["cap_eur"] = float(profile["beta_ai_cost_cap_eur"])
+
+    if row.get("ai_cost_guardrail_enabled") is not None:
+        settings["enabled"] = bool(row["ai_cost_guardrail_enabled"])
+    elif profile.get("beta_ai_cost_guardrail_enabled") is not None:
+        settings["enabled"] = bool(profile["beta_ai_cost_guardrail_enabled"])
+
+    for key in ("allowed_send_start", "allowed_send_end"):
+        value = row.get(key) or profile.get(f"beta_{key}")
+        if isinstance(value, str) and re.match(r"^\d{2}:\d{2}$", value.strip()):
+            settings[key] = value.strip()
+
+    for key in ("min_auto_delay_seconds", "random_auto_delay_seconds"):
+        value = row.get(key, profile.get(f"beta_{key}"))
+        if value is not None:
+            settings[key] = max(0, int(value))
+
+    follow_up_config = row.get("follow_up_config") or profile.get("beta_follow_up_config")
+    if isinstance(follow_up_config, list):
+        normalized = []
+        for index, item in enumerate(follow_up_config[:8]):
+            if not isinstance(item, dict):
+                continue
+            stage = str(item.get("stage") or f"custom_{index + 1}").strip()[:40]
+            mode = str(item.get("mode") or "manual").strip().lower()
+            if mode not in {"auto", "manual", "assisted"}:
+                mode = "manual"
+            try:
+                raw_delay = item.get("delay_hours")
+                if raw_delay is None:
+                    continue
+                delay_hours = float(raw_delay)
+            except (TypeError, ValueError):
+                continue
+            if stage and delay_hours >= 0:
+                normalized.append({"stage": stage, "delay_hours": delay_hours, "mode": "manual" if mode == "assisted" else mode})
+        if normalized:
+            normalized.sort(key=lambda item: item["delay_hours"])
+            settings["follow_up_config"] = normalized
+
+    return settings
+
+
 async def get_beta_cost_settings(user_id: str) -> dict:
-    settings = {"cap_eur": DEFAULT_BETA_COST_CAP_EUR, "enabled": True}
+    settings = dict(DEFAULT_BETA_ACCOUNT_SETTINGS)
     try:
         async with httpx.AsyncClient() as http:
             res = await http.get(
                 SUPABASE_BETA_ACCOUNT_SETTINGS_URL,
                 headers={**supabase_headers(), "Accept": "application/json"},
-                params={"user_id": f"eq.{user_id}", "select": "ai_cost_cap_eur,ai_cost_guardrail_enabled", "limit": "1"},
+                params={"user_id": f"eq.{user_id}", "select": "*", "limit": "1"},
                 timeout=5.0,
             )
             if res.status_code == 404:
                 try:
                     profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
                     profile = (profile_row or {}).get("profile") or {}
-                    if profile.get("beta_ai_cost_cap_eur") is not None:
-                        settings["cap_eur"] = float(profile["beta_ai_cost_cap_eur"])
-                    if profile.get("beta_ai_cost_guardrail_enabled") is not None:
-                        settings["enabled"] = bool(profile["beta_ai_cost_guardrail_enabled"])
+                    settings = normalize_beta_account_settings(profile=profile)
                 except Exception as profile_error:
                     print(f"[ai-cost:settings] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
                 return settings
@@ -374,20 +436,13 @@ async def get_beta_cost_settings(user_id: str) -> dict:
                 try:
                     profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
                     profile = (profile_row or {}).get("profile") or {}
-                    if profile.get("beta_ai_cost_cap_eur") is not None:
-                        settings["cap_eur"] = float(profile["beta_ai_cost_cap_eur"])
-                    if profile.get("beta_ai_cost_guardrail_enabled") is not None:
-                        settings["enabled"] = bool(profile["beta_ai_cost_guardrail_enabled"])
+                    settings = normalize_beta_account_settings(profile=profile)
                 except Exception as profile_error:
                     print(f"[ai-cost:settings] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
                 return settings
             rows = res.json()
             if rows:
-                row = rows[0]
-                if row.get("ai_cost_cap_eur") is not None:
-                    settings["cap_eur"] = float(row["ai_cost_cap_eur"])
-                if row.get("ai_cost_guardrail_enabled") is not None:
-                    settings["enabled"] = bool(row["ai_cost_guardrail_enabled"])
+                settings = normalize_beta_account_settings(row=rows[0])
     except Exception as e:
         print(f"[ai-cost:settings] fallback error={type(e).__name__}: {e}", flush=True)
     return settings
@@ -1448,6 +1503,60 @@ def parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def parse_hhmm(value: str, fallback: str) -> tuple[int, int]:
+    raw = value if isinstance(value, str) and re.match(r"^\d{2}:\d{2}$", value) else fallback
+    hour, minute = raw.split(":", 1)
+    hour_int = max(0, min(23, int(hour)))
+    minute_int = max(0, min(59, int(minute)))
+    return hour_int, minute_int
+
+
+def _minutes_since_midnight(value: datetime) -> int:
+    return value.hour * 60 + value.minute
+
+
+def is_within_allowed_send_window(now: datetime, settings: dict) -> bool:
+    start_h, start_m = parse_hhmm(settings.get("allowed_send_start", "08:00"), "08:00")
+    end_h, end_m = parse_hhmm(settings.get("allowed_send_end", "22:00"), "22:00")
+    start = start_h * 60 + start_m
+    end = end_h * 60 + end_m
+    current = _minutes_since_midnight(now.astimezone(timezone.utc))
+    if start == end:
+        return True
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def next_allowed_send_at(now: datetime, settings: dict) -> datetime:
+    now = now.astimezone(timezone.utc)
+    if is_within_allowed_send_window(now, settings):
+        return now
+    start_h, start_m = parse_hhmm(settings.get("allowed_send_start", "08:00"), "08:00")
+    candidate = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def configured_follow_up_stage(hours_since_user: float, settings: dict) -> Optional[dict]:
+    config = settings.get("follow_up_config") or DEFAULT_BETA_ACCOUNT_SETTINGS["follow_up_config"]
+    stages = [item for item in config if isinstance(item, dict) and item.get("stage")]
+    stages.sort(key=lambda item: float(item.get("delay_hours") or 0))
+    for index, item in enumerate(stages):
+        delay = float(item.get("delay_hours") or 0)
+        next_delay = float(stages[index + 1].get("delay_hours") or 10**9) if index + 1 < len(stages) else 10**9
+        if delay <= hours_since_user < next_delay:
+            stage = str(item["stage"])
+            return {
+                "stage": stage,
+                "label": stage.replace("_", " ").upper() if stage != "auto_23h" else "Auto 23 h",
+                "mode": "auto" if item.get("mode") == "auto" else "manual",
+                "sort": index + 1,
+            }
+    return None
+
+
 def strip_message_metadata(messages: list) -> list:
     return [
         {"role": msg.get("role"), "content": msg.get("content", "")}
@@ -1597,7 +1706,7 @@ def has_follow_up_stage(history: list, stage: str) -> bool:
     return any(message.get("follow_up_stage") == stage for message in history)
 
 
-def build_follow_up_item(conversation: dict) -> Optional[dict]:
+async def build_follow_up_item(conversation: dict) -> Optional[dict]:
     if not conversation.get("agent_active"):
         return None
     if conversation.get("automation_mode") == "disabled":
@@ -1614,13 +1723,46 @@ def build_follow_up_item(conversation: dict) -> Optional[dict]:
     if last_agent_at and last_user_at > last_agent_at:
         return None
 
+    user_id = conversation.get("user_id")
+    settings = await get_beta_cost_settings(user_id) if user_id else dict(DEFAULT_BETA_ACCOUNT_SETTINGS)
     now = datetime.now(timezone.utc)
     hours_since_user = (now - last_user_at).total_seconds() / 3600
-    stage = get_follow_up_stage(hours_since_user)
+    stage = configured_follow_up_stage(hours_since_user, settings) or get_follow_up_stage(hours_since_user)
     if not stage:
         return None
     if has_follow_up_stage(history, stage["stage"]):
         return None
+
+    delay_seconds = int(settings.get("min_auto_delay_seconds") or 0) + int(settings.get("random_auto_delay_seconds") or 0)
+    eligible_at = last_agent_at + timedelta(seconds=delay_seconds) if last_agent_at and delay_seconds else now
+    if now < eligible_at:
+        return None
+    next_window = next_allowed_send_at(now, settings)
+    if stage["mode"] == "auto" and next_window > now:
+        return {
+            "conversation_id": conversation.get("id"),
+            "id": conversation.get("id"),
+            "created_at": conversation.get("created_at"),
+            "username": conversation.get("username"),
+            "channel": conversation.get("channel") or "instagram",
+            "external_contact_id": conversation.get("external_contact_id") or conversation.get("username"),
+            "phone_e164": conversation.get("phone_e164"),
+            "display_name": conversation.get("display_name"),
+            "message": conversation.get("message"),
+            "status": conversation.get("status"),
+            "agent_active": conversation.get("agent_active"),
+            "automation_mode": conversation.get("automation_mode") or "supervised",
+            "manual_contact_url": manual_contact_url(conversation),
+            "stage": stage["stage"],
+            "stage_label": stage["label"],
+            "mode": stage["mode"],
+            "sort": stage["sort"],
+            "hours_since_user": round(hours_since_user, 1),
+            "last_user_message_at": last_user_at.isoformat(),
+            "last_agent_message_at": last_agent_at.isoformat() if last_agent_at else None,
+            "queued_until": next_window.isoformat(),
+            "send_blocked_reason": "outside_allowed_send_window",
+        }
 
     return {
         "conversation_id": conversation.get("id"),
@@ -1643,6 +1785,8 @@ def build_follow_up_item(conversation: dict) -> Optional[dict]:
         "hours_since_user": round(hours_since_user, 1),
         "last_user_message_at": last_user_at.isoformat(),
         "last_agent_message_at": last_agent_at.isoformat() if last_agent_at else None,
+        "queued_until": None,
+        "send_blocked_reason": None,
     }
 
 
@@ -3004,6 +3148,15 @@ async def handle_inbound_message(
         print(f"[inbound] HUMAN_MODE channel={channel} external_id={external_contact_id} -> automation_mode=disabled")
 
     should_send = automation_mode == "auto"
+    auto_blocked_by_window = False
+    queued_until = None
+    if should_send:
+        send_settings = await get_beta_cost_settings(user_id)
+        current_time = datetime.now(timezone.utc)
+        if not is_within_allowed_send_window(current_time, send_settings):
+            auto_blocked_by_window = True
+            queued_until = next_allowed_send_at(current_time, send_settings).isoformat()
+            should_send = False
     delegated_to_webhook_sender = should_send and not auto_send_transport
     sent = False
     assistant_entry = {
@@ -3013,8 +3166,11 @@ async def handle_inbound_message(
         "channel": channel,
         "sent": delegated_to_webhook_sender,
         "ignored": False,
-        "source": "inbound_auto" if should_send else "inbound_supervised",
+        "source": "inbound_auto_queued" if auto_blocked_by_window else ("inbound_auto" if should_send else "inbound_supervised"),
     }
+    if auto_blocked_by_window:
+        assistant_entry["queued_until"] = queued_until
+        assistant_entry["send_blocked_reason"] = "outside_allowed_send_window"
     if delegated_to_webhook_sender:
         assistant_entry["send_transport"] = "manychat_webhook_response"
         assistant_entry["send_status_code"] = 202
@@ -3027,9 +3183,11 @@ async def handle_inbound_message(
         "history": new_history,
         "status": "en_cours",
     })
-    if automation_mode == "supervised":
+    if automation_mode == "supervised" or auto_blocked_by_window:
         patch_data["pending_message"] = reply
         patch_data["pending_message_at"] = now_iso()
+        if auto_blocked_by_window:
+            patch_data["status"] = "pending_delivery"
     elif automation_mode == "auto":
         patch_data["pending_message"] = None
         patch_data["pending_message_at"] = None
@@ -3092,7 +3250,8 @@ async def handle_inbound_message(
         "should_send": should_send,
         "mode": automation_mode,
         "skipped": False,
-        "reason": None,
+        "reason": "outside_allowed_send_window" if auto_blocked_by_window else None,
+        "queued_until": queued_until,
         "send_result": send_result,
         "conversation_id": contact.get("id"),
     }
@@ -3914,6 +4073,11 @@ async def get_beta_ai_cost(user_id: str = Depends(require_jwt)):
         "remaining_eur": round(max(0.0, cap - spent), 4),
         "guardrail_enabled": settings.get("enabled", True),
         "cap_reached": settings.get("enabled", True) and spent >= cap,
+        "allowed_send_start": settings.get("allowed_send_start"),
+        "allowed_send_end": settings.get("allowed_send_end"),
+        "min_auto_delay_seconds": settings.get("min_auto_delay_seconds"),
+        "random_auto_delay_seconds": settings.get("random_auto_delay_seconds"),
+        "follow_up_config": settings.get("follow_up_config"),
         "pricing_assumption": {
             "model": "claude-sonnet-4-6",
             "input_eur_per_million_tokens": CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN,
@@ -3945,7 +4109,11 @@ async def get_due_follow_ups(
         res.raise_for_status()
         conversations = res.json()
 
-    items = [item for conv in conversations if (item := build_follow_up_item(conv))]
+    items = []
+    for conv in conversations:
+        item = await build_follow_up_item(conv)
+        if item:
+            items.append(item)
     items.sort(key=lambda item: (item["sort"], -item["hours_since_user"]))
     return items
 
@@ -3989,9 +4157,11 @@ async def manychat_auto_23h_follow_up(
     if not conversation:
         return {"ok": False, "message": "", "reason": "Conversation not found"}
 
-    due_item = build_follow_up_item(conversation)
+    due_item = await build_follow_up_item(conversation)
     if not due_item or due_item.get("stage") != "auto_23h":
         return {"ok": False, "message": "", "reason": "Auto 23h follow-up is not due"}
+    if due_item.get("send_blocked_reason"):
+        return {"ok": False, "message": "", "reason": due_item["send_blocked_reason"], "queued_until": due_item.get("queued_until")}
 
     message = await generate_follow_up_message(conversation, "auto_23h")
     history = conversation.get("history") or []
@@ -4044,9 +4214,11 @@ async def send_auto_23h_follow_up(
     if channel == "whatsapp" and (not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID):
         raise HTTPException(status_code=500, detail="WhatsApp API is not configured")
 
-    due_item = build_follow_up_item(conversation)
+    due_item = await build_follow_up_item(conversation)
     if not due_item or due_item.get("stage") != "auto_23h":
         raise HTTPException(status_code=409, detail="Auto 23h follow-up is not due")
+    if due_item.get("send_blocked_reason"):
+        raise HTTPException(status_code=409, detail={"reason": due_item["send_blocked_reason"], "queued_until": due_item.get("queued_until")})
 
     try:
         await enforce_ai_cost_cap(user_id)
@@ -4123,7 +4295,7 @@ async def cron_auto_follow_up_check(
             params={
                 "order": "created_at.desc",
                 "limit": "500",
-                "select": "id,created_at,username,display_name,message,status,agent_active,automation_mode,history,channel,external_contact_id,phone_e164,last_inbound_at",
+                "select": "id,created_at,user_id,username,display_name,message,status,agent_active,automation_mode,history,channel,external_contact_id,phone_e164,last_inbound_at",
             },
             timeout=10.0,
         )
@@ -4131,8 +4303,17 @@ async def cron_auto_follow_up_check(
         conversations = res.json()
 
     for conv in conversations:
-        due_item = build_follow_up_item(conv)
+        due_item = await build_follow_up_item(conv)
         if not due_item or due_item.get("stage") != "auto_23h":
+            continue
+        if due_item.get("send_blocked_reason"):
+            results["details"].append({
+                "conversation_id": conv["id"],
+                "username": conv.get("username"),
+                "sent": False,
+                "queued_until": due_item.get("queued_until"),
+                "reason": due_item["send_blocked_reason"],
+            })
             continue
 
         results["auto_sent"] += 1
