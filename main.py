@@ -6,6 +6,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from config import load_config
 from prompts import build_system_prompt, build_analysis_prompt, build_follow_up_prompt, build_conversation_review_prompt
+from dataclasses import dataclass
 import hmac
 import httpx
 import hashlib
@@ -18,7 +19,7 @@ import re
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 load_dotenv()
 config = load_config()
@@ -50,6 +51,9 @@ MAX_HISTORY_TURNS = 40
 DEFAULT_BETA_COST_CAP_EUR = float(os.environ.get("DEFAULT_BETA_COST_CAP_EUR", "50"))
 CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN", "2.75"))
 CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN", "13.75"))
+CLAUDE_SONNET_4_6_CACHE_CREATION_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_CACHE_CREATION_INPUT_EUR_PER_MTOKEN", "0"))
+CLAUDE_SONNET_4_6_CACHE_READ_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_CACHE_READ_INPUT_EUR_PER_MTOKEN", "0"))
+AI_USAGE_PRICING_VERSION = "anthropic-usage-eur-env-2026-08-22"
 AI_COST_BLOCK_USER_MESSAGE = "Angellos a atteint le plafond de coût IA configuré pour ce compte. Les nouvelles réponses automatiques sont arrêtées par sécurité."
 DEFAULT_BETA_ACCOUNT_SETTINGS = {
     "cap_eur": DEFAULT_BETA_COST_CAP_EUR,
@@ -88,6 +92,63 @@ class CostCapExceededError(Exception):
         self.spent_eur = spent_eur
         self.cap_eur = cap_eur
         self.user_message = AI_COST_BLOCK_USER_MESSAGE
+
+
+@dataclass
+class AiGenerationUsage:
+    provider: str
+    provider_response_id: Optional[str]
+    model: str
+    input_tokens: Optional[int]
+    output_tokens: Optional[int]
+    cache_creation_input_tokens: Optional[int]
+    cache_read_input_tokens: Optional[int]
+    usage_raw: Optional[dict[str, Any]]
+
+
+@dataclass
+class AiGenerationResult:
+    text: str
+    usage: Optional[AiGenerationUsage] = None
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _object_to_plain_json(value: Any) -> Optional[dict[str, Any]]:
+    if value is None:
+        return None
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    elif not isinstance(value, dict):
+        value = {key: getattr(value, key) for key in dir(value) if not key.startswith("_") and not callable(getattr(value, key, None))}
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except Exception:
+        return None
+
+
+def extract_anthropic_usage(response: Any) -> AiGenerationUsage:
+    usage_obj = getattr(response, "usage", None)
+    usage_raw = _object_to_plain_json(usage_obj)
+    usage_source = usage_raw if isinstance(usage_raw, dict) else {}
+    response_model = str(getattr(response, "model", "") or "claude-sonnet-4-6")
+    return AiGenerationUsage(
+        provider="anthropic",
+        provider_response_id=getattr(response, "id", None),
+        model=response_model,
+        input_tokens=_coerce_int(usage_source.get("input_tokens", getattr(usage_obj, "input_tokens", None))),
+        output_tokens=_coerce_int(usage_source.get("output_tokens", getattr(usage_obj, "output_tokens", None))),
+        cache_creation_input_tokens=_coerce_int(usage_source.get("cache_creation_input_tokens", getattr(usage_obj, "cache_creation_input_tokens", None))),
+        cache_read_input_tokens=_coerce_int(usage_source.get("cache_read_input_tokens", getattr(usage_obj, "cache_read_input_tokens", None))),
+        usage_raw=usage_raw,
+    )
 
 
 def classify_provider_error(error: Exception) -> ProviderGenerationError:
@@ -362,6 +423,31 @@ def estimate_claude_cost_eur(input_text: str, output_text: str) -> float:
     )
 
 
+def calculate_anthropic_usage_cost_eur(usage: AiGenerationUsage) -> float:
+    input_tokens = usage.input_tokens or 0
+    output_tokens = usage.output_tokens or 0
+    cache_creation_tokens = usage.cache_creation_input_tokens or 0
+    cache_read_tokens = usage.cache_read_input_tokens or 0
+    return (
+        input_tokens / 1_000_000 * CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN
+        + output_tokens / 1_000_000 * CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN
+        + cache_creation_tokens / 1_000_000 * CLAUDE_SONNET_4_6_CACHE_CREATION_INPUT_EUR_PER_MTOKEN
+        + cache_read_tokens / 1_000_000 * CLAUDE_SONNET_4_6_CACHE_READ_INPUT_EUR_PER_MTOKEN
+    )
+
+
+def usage_total_tokens(usage: AiGenerationUsage) -> int:
+    return sum(
+        value or 0
+        for value in (
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+        )
+    )
+
+
 def normalize_beta_account_settings(row: Optional[dict] = None, profile: Optional[dict] = None) -> dict:
     settings = dict(DEFAULT_BETA_ACCOUNT_SETTINGS)
     row = row or {}
@@ -448,13 +534,20 @@ async def get_beta_cost_settings(user_id: str) -> dict:
     return settings
 
 
-async def get_estimated_ai_spend_eur(user_id: str) -> float:
+async def get_ai_spend_breakdown(user_id: str) -> dict:
+    empty = {
+        "spent_eur": 0.0,
+        "spent_eur_provider_usage": 0.0,
+        "spent_eur_estimated_fallback": 0.0,
+        "cost_source_breakdown": {},
+        "provider_breakdown": {},
+    }
     try:
         async with httpx.AsyncClient() as http:
             res = await http.get(
                 SUPABASE_BETA_AI_USAGE_URL,
                 headers={**supabase_headers(), "Accept": "application/json"},
-                params={"user_id": f"eq.{user_id}", "select": "estimated_cost_eur", "limit": "10000"},
+                params={"user_id": f"eq.{user_id}", "select": "provider,cost_source,cost_eur,estimated_cost_eur", "limit": "10000"},
                 timeout=8.0,
             )
             if res.status_code >= 400:
@@ -462,20 +555,43 @@ async def get_estimated_ai_spend_eur(user_id: str) -> float:
                 try:
                     profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
                     profile = (profile_row or {}).get("profile") or {}
-                    return float(profile.get("beta_ai_estimated_spend_eur") or 0.0)
+                    fallback = float(profile.get("beta_ai_estimated_spend_eur") or 0.0)
+                    return {**empty, "spent_eur": fallback, "spent_eur_estimated_fallback": fallback, "cost_source_breakdown": {"profile_estimated_fallback": fallback}}
                 except Exception as profile_error:
                     print(f"[ai-cost:usage] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
-                    return 0.0
-            return sum(float(row.get("estimated_cost_eur") or 0) for row in res.json())
+                    return empty
+            breakdown = {**empty, "cost_source_breakdown": {}, "provider_breakdown": {}}
+            for row in res.json():
+                source = row.get("cost_source") or ("provider_usage_priced" if row.get("cost_eur") is not None else "estimated_fallback")
+                provider = row.get("provider") or "unknown"
+                cost_eur = float(row.get("cost_eur") if row.get("cost_eur") is not None else row.get("estimated_cost_eur") or 0)
+                breakdown["spent_eur"] += cost_eur
+                breakdown["cost_source_breakdown"][source] = breakdown["cost_source_breakdown"].get(source, 0.0) + cost_eur
+                breakdown["provider_breakdown"][provider] = breakdown["provider_breakdown"].get(provider, 0.0) + cost_eur
+                if row.get("cost_eur") is not None:
+                    breakdown["spent_eur_provider_usage"] += cost_eur
+                else:
+                    breakdown["spent_eur_estimated_fallback"] += cost_eur
+            for key in ("cost_source_breakdown", "provider_breakdown"):
+                breakdown[key] = {k: round(v, 8) for k, v in breakdown[key].items()}
+            breakdown["spent_eur"] = round(breakdown["spent_eur"], 8)
+            breakdown["spent_eur_provider_usage"] = round(breakdown["spent_eur_provider_usage"], 8)
+            breakdown["spent_eur_estimated_fallback"] = round(breakdown["spent_eur_estimated_fallback"], 8)
+            return breakdown
     except Exception as e:
         print(f"[ai-cost:usage] fallback error={type(e).__name__}: {e}", flush=True)
         try:
             profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
             profile = (profile_row or {}).get("profile") or {}
-            return float(profile.get("beta_ai_estimated_spend_eur") or 0.0)
+            fallback = float(profile.get("beta_ai_estimated_spend_eur") or 0.0)
+            return {**empty, "spent_eur": fallback, "spent_eur_estimated_fallback": fallback, "cost_source_breakdown": {"profile_estimated_fallback": fallback}}
         except Exception as profile_error:
             print(f"[ai-cost:usage] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
-            return 0.0
+            return empty
+
+
+async def get_estimated_ai_spend_eur(user_id: str) -> float:
+    return float((await get_ai_spend_breakdown(user_id)).get("spent_eur") or 0.0)
 
 
 async def enforce_ai_cost_cap(user_id: str) -> dict:
@@ -487,18 +603,49 @@ async def enforce_ai_cost_cap(user_id: str) -> dict:
     return {"spent_eur": spent, "cap_eur": cap, "enabled": settings.get("enabled", True)}
 
 
-async def record_ai_usage_event(user_id: str, feature: str, input_text: str, output_text: str, model: str = "claude-sonnet-4-6") -> dict:
+async def record_ai_usage_event(
+    user_id: str,
+    feature: str,
+    input_text: str,
+    output_text: str,
+    model: str = "claude-sonnet-4-6",
+    usage: Optional[AiGenerationUsage] = None,
+    conversation_id: Optional[str] = None,
+    request_kind: Optional[str] = None,
+) -> dict:
     input_tokens = estimate_token_count(input_text)
     output_tokens = estimate_token_count(output_text)
-    cost = estimate_claude_cost_eur(input_text, output_text)
+    estimated_cost = estimate_claude_cost_eur(input_text, output_text)
+    usage_cost = calculate_anthropic_usage_cost_eur(usage) if usage else None
     row = {
         "user_id": user_id,
         "feature": feature,
-        "model": model,
+        "model": usage.model if usage else model,
         "input_tokens_estimated": input_tokens,
         "output_tokens_estimated": output_tokens,
-        "estimated_cost_eur": round(cost, 8),
+        "estimated_cost_eur": round(estimated_cost, 8),
+        "provider": usage.provider if usage else "anthropic",
+        "provider_response_id": usage.provider_response_id if usage else None,
+        "input_tokens": usage.input_tokens if usage else None,
+        "output_tokens": usage.output_tokens if usage else None,
+        "total_tokens": usage_total_tokens(usage) if usage else None,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens if usage else None,
+        "cache_read_input_tokens": usage.cache_read_input_tokens if usage else None,
+        "prompt_cache_hit_tokens": usage.cache_read_input_tokens if usage else None,
+        "prompt_cache_miss_tokens": usage.cache_creation_input_tokens if usage else None,
+        "reasoning_tokens": None,
+        "usage_raw": usage.usage_raw if usage else None,
+        "provider_currency": "EUR" if usage else None,
+        "provider_cost": round(usage_cost, 8) if usage_cost is not None else None,
+        "cost_eur": round(usage_cost, 8) if usage_cost is not None else None,
+        "exchange_rate_to_eur": 1.0 if usage else None,
+        "pricing_version": AI_USAGE_PRICING_VERSION if usage else "estimated-char-div-4",
+        "cost_source": "provider_usage_priced" if usage else "estimated_fallback",
+        "conversation_id": conversation_id,
+        "status": "recorded",
+        "request_kind": request_kind or feature,
     }
+    row = {key: value for key, value in row.items() if value is not None}
     try:
         async with httpx.AsyncClient() as http:
             res = await http.post(
@@ -512,7 +659,7 @@ async def record_ai_usage_event(user_id: str, feature: str, input_text: str, out
                 try:
                     profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
                     profile = dict((profile_row or {}).get("profile") or {})
-                    profile["beta_ai_estimated_spend_eur"] = round(float(profile.get("beta_ai_estimated_spend_eur") or 0.0) + cost, 8)
+                    profile["beta_ai_estimated_spend_eur"] = round(float(profile.get("beta_ai_estimated_spend_eur") or 0.0) + (usage_cost if usage_cost is not None else estimated_cost), 8)
                     profile["beta_ai_last_usage_event"] = {**row, "created_at": now_iso()}
                     profile.setdefault("beta_ai_cost_cap_eur", DEFAULT_BETA_COST_CAP_EUR)
                     profile.setdefault("beta_ai_cost_guardrail_enabled", True)
@@ -524,7 +671,7 @@ async def record_ai_usage_event(user_id: str, feature: str, input_text: str, out
         try:
             profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id, select="profile")
             profile = dict((profile_row or {}).get("profile") or {})
-            profile["beta_ai_estimated_spend_eur"] = round(float(profile.get("beta_ai_estimated_spend_eur") or 0.0) + cost, 8)
+            profile["beta_ai_estimated_spend_eur"] = round(float(profile.get("beta_ai_estimated_spend_eur") or 0.0) + (usage_cost if usage_cost is not None else estimated_cost), 8)
             profile["beta_ai_last_usage_event"] = {**row, "created_at": now_iso()}
             profile.setdefault("beta_ai_cost_cap_eur", DEFAULT_BETA_COST_CAP_EUR)
             profile.setdefault("beta_ai_cost_guardrail_enabled", True)
@@ -2141,19 +2288,24 @@ async def upsert_user_singleton_row(table_url: str, user_id: str, payload: dict)
     return created[0] if isinstance(created, list) and created else created
 
 
-def generate_claude_reply(messages: list, system_prompt: str = "") -> str:
+def generate_claude_generation(messages: list, system_prompt: str = "", model: str = "claude-sonnet-4-6", max_tokens: int = 1024) -> AiGenerationResult:
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
+            model=model,
+            max_tokens=max_tokens,
             system=system_prompt,
             messages=messages,
         )
-        return response.content[0].text
+        text_block = next((block for block in response.content if getattr(block, "type", None) == "text"), response.content[0])
+        return AiGenerationResult(text=str(getattr(text_block, "text", "")), usage=extract_anthropic_usage(response))
     except ProviderGenerationError:
         raise
     except Exception as e:
         raise classify_provider_error(e) from e
+
+
+def generate_claude_reply(messages: list, system_prompt: str = "") -> str:
+    return generate_claude_generation(messages, system_prompt).text
 
 
 async def send_manychat_message(subscriber_id: str, text: str) -> dict:
@@ -2468,12 +2620,12 @@ def mark_last_auto_assistant_sent(history: list, sent: bool, send_result: Option
     return updated_history
 
 
-async def generate_follow_up_message(
+async def generate_follow_up_result(
     conversation: dict,
     stage: str,
     ai_instruction: Optional[str] = None,
     follow_up_delay_label: Optional[str] = None,
-) -> str:
+) -> AiGenerationResult:
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
 
@@ -2501,15 +2653,24 @@ async def generate_follow_up_message(
     )
 
     try:
-        reply = generate_claude_reply(
+        generation = generate_claude_generation(
             [{"role": "user", "content": user_message}],
             generation_prompt,
         )
     except ProviderGenerationError as e:
         raise HTTPException(status_code=e.status_code, detail=provider_error_payload(e))
 
-    reply = sanitize_angellos_beta_reply(reply, conversation.get("message", ""))
-    return validate_agent_reply(reply, generation_prompt)
+    reply = sanitize_angellos_beta_reply(generation.text, conversation.get("message", ""))
+    return AiGenerationResult(text=validate_agent_reply(reply, generation_prompt), usage=generation.usage)
+
+
+async def generate_follow_up_message(
+    conversation: dict,
+    stage: str,
+    ai_instruction: Optional[str] = None,
+    follow_up_delay_label: Optional[str] = None,
+) -> str:
+    return (await generate_follow_up_result(conversation, stage, ai_instruction, follow_up_delay_label)).text
 
 
 def format_conversations_for_analysis(conversations: list, system_prompt: str) -> str:
@@ -3158,6 +3319,8 @@ async def handle_inbound_message(
         }
 
     should_human_mode = False
+    generation_usage: Optional[AiGenerationUsage] = None
+    messages_for_generation: list[dict] = []
     canned_reply = get_angellos_beta_canned_reply(message) if is_angellos_acquisition_prompt(active_prompt) else None
     if canned_reply:
         reply, should_stop_agent = canned_reply
@@ -3172,7 +3335,9 @@ async def handle_inbound_message(
         messages_for_generation = history + [{"role": "user", "content": user_content, "timestamp": received_at}]
 
         try:
-            reply = generate_claude_reply(strip_message_metadata(messages_for_generation), system_prompt)
+            generation = generate_claude_generation(strip_message_metadata(messages_for_generation), system_prompt)
+            reply = generation.text
+            generation_usage = generation.usage
         except ProviderGenerationError as e:
             patch_data["pending_message"] = None
             patch_data["pending_message_at"] = None
@@ -3201,7 +3366,16 @@ async def handle_inbound_message(
         reply, should_stop_agent, should_human_mode = split_stop_agent_reply(reply)
     reply = sanitize_angellos_beta_reply(reply, message)
     reply = validate_agent_reply(reply, system_prompt)
-    await record_ai_usage_event(user_id, "inbound_reply", json.dumps(strip_message_metadata(messages_for_generation), ensure_ascii=False) if not canned_reply else message, reply)
+    if not canned_reply:
+        await record_ai_usage_event(
+            user_id,
+            "inbound_reply",
+            json.dumps(strip_message_metadata(messages_for_generation), ensure_ascii=False),
+            reply,
+            usage=generation_usage,
+            conversation_id=contact.get("id"),
+            request_kind="inbound_reply",
+        )
 
     if should_stop_agent:
         if not (channel == "whatsapp" and (is_whatsapp_test_contact(contact) or is_whatsapp_test_metadata(transport_metadata))):
@@ -3653,7 +3827,8 @@ async def _generate_and_save_supervised_pending(
             break
 
     try:
-        reply = generate_claude_reply(strip_message_metadata(messages_for_gen), system_prompt)
+        generation = generate_claude_generation(strip_message_metadata(messages_for_gen), system_prompt)
+        reply = generation.text
     except ProviderGenerationError as e:
         print(
             f"[generate-pending:claude] error type={e.error_type} message={e.message} "
@@ -3665,6 +3840,16 @@ async def _generate_and_save_supervised_pending(
     reply, _, should_human_mode = split_stop_agent_reply(reply)
     reply = sanitize_angellos_beta_reply(reply, last_user_msg.get("content", ""))
     reply = validate_agent_reply(reply, system_prompt)
+
+    await record_ai_usage_event(
+        user_id,
+        "activation_supervised",
+        json.dumps(strip_message_metadata(messages_for_gen), ensure_ascii=False),
+        reply,
+        usage=generation.usage,
+        conversation_id=conversation_id,
+        request_kind="activation_supervised",
+    )
 
     now = now_iso()
     assistant_entry = {
@@ -4136,10 +4321,15 @@ async def get_beta_ai_cost(user_id: str = Depends(require_jwt)):
 
 async def beta_ai_cost_status(user_id: str) -> dict:
     settings = await get_beta_cost_settings(user_id)
-    spent = await get_estimated_ai_spend_eur(user_id)
+    spend = await get_ai_spend_breakdown(user_id)
+    spent = float(spend.get("spent_eur") or 0.0)
     cap = float(settings["cap_eur"])
     return {
         "spent_eur": round(spent, 4),
+        "spent_eur_provider_usage": round(float(spend.get("spent_eur_provider_usage") or 0.0), 4),
+        "spent_eur_estimated_fallback": round(float(spend.get("spent_eur_estimated_fallback") or 0.0), 4),
+        "cost_source_breakdown": spend.get("cost_source_breakdown") or {},
+        "provider_breakdown": spend.get("provider_breakdown") or {},
         "cap_eur": round(cap, 2),
         "remaining_eur": round(max(0.0, cap - spent), 4),
         "guardrail_enabled": settings.get("enabled", True),
@@ -4153,8 +4343,13 @@ async def beta_ai_cost_status(user_id: str) -> dict:
             "model": "claude-sonnet-4-6",
             "input_eur_per_million_tokens": CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN,
             "output_eur_per_million_tokens": CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN,
+            "cache_creation_input_eur_per_million_tokens": CLAUDE_SONNET_4_6_CACHE_CREATION_INPUT_EUR_PER_MTOKEN,
+            "cache_read_input_eur_per_million_tokens": CLAUDE_SONNET_4_6_CACHE_READ_INPUT_EUR_PER_MTOKEN,
+            "pricing_version": AI_USAGE_PRICING_VERSION,
+            "provider_usage": "Anthropic response.usage tokens when present; cost_eur falls back to estimated_cost_eur for legacy rows",
             "token_estimation": "ceil(characters / 4) when provider usage is not persisted",
         },
+        "pricing_version": AI_USAGE_PRICING_VERSION,
     }
 
 
@@ -4276,7 +4471,17 @@ async def manychat_auto_23h_follow_up(
     if due_item.get("send_blocked_reason"):
         return {"ok": False, "message": "", "reason": due_item["send_blocked_reason"], "queued_until": due_item.get("queued_until")}
 
-    message = await generate_follow_up_message(conversation, "auto_23h")
+    generation = await generate_follow_up_result(conversation, "auto_23h")
+    message = generation.text
+    await record_ai_usage_event(
+        user_id,
+        "follow_up_manychat_auto_23h",
+        json.dumps(conversation.get("history") or [], ensure_ascii=False),
+        message,
+        usage=generation.usage,
+        conversation_id=conversation.get("id"),
+        request_kind="follow_up_manychat_auto_23h",
+    )
     history = conversation.get("history") or []
     new_history = history + [{
         "role": "assistant",
@@ -4343,13 +4548,22 @@ async def send_auto_23h_follow_up(
         await enforce_ai_cost_cap(user_id)
     except CostCapExceededError as e:
         raise HTTPException(status_code=402, detail=cost_cap_error_payload(e))
-    message = await generate_follow_up_message(
+    generation = await generate_follow_up_result(
         conversation,
         "auto_23h",
         payload.ai_instruction if payload else None,
         payload.follow_up_delay_label if payload else None,
     )
-    await record_ai_usage_event(user_id, "follow_up_auto_23h", json.dumps(conversation.get("history") or [], ensure_ascii=False), message)
+    message = generation.text
+    await record_ai_usage_event(
+        user_id,
+        "follow_up_auto_23h",
+        json.dumps(conversation.get("history") or [], ensure_ascii=False),
+        message,
+        usage=generation.usage,
+        conversation_id=conversation_id,
+        request_kind="follow_up_auto_23h",
+    )
     send_result = await send_channel_message(conversation, message)
     is_pending_delivery = is_manychat_pending_delivery_error(send_result)
     if send_result["status_code"] >= 400 and not is_pending_delivery:
@@ -4445,9 +4659,18 @@ async def cron_auto_follow_up_check(
             conv_user_id = conv.get("user_id")
             if conv_user_id:
                 await enforce_ai_cost_cap(conv_user_id)
-            message = await generate_follow_up_message(conv, "auto_23h")
+            generation = await generate_follow_up_result(conv, "auto_23h")
+            message = generation.text
             if conv_user_id:
-                await record_ai_usage_event(conv_user_id, "follow_up_cron_auto_23h", json.dumps(conv.get("history") or [], ensure_ascii=False), message)
+                await record_ai_usage_event(
+                    conv_user_id,
+                    "follow_up_cron_auto_23h",
+                    json.dumps(conv.get("history") or [], ensure_ascii=False),
+                    message,
+                    usage=generation.usage,
+                    conversation_id=conv.get("id"),
+                    request_kind="follow_up_cron_auto_23h",
+                )
             send_result = await send_channel_message(conv, message)
             sent = send_result.get("status_code", 500) < 400
             is_pending_delivery = is_manychat_pending_delivery_error(send_result)

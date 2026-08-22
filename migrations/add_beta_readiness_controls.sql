@@ -28,6 +28,32 @@ create table if not exists public.beta_ai_usage (
 
 create index if not exists beta_ai_usage_user_created_idx on public.beta_ai_usage(user_id, created_at desc);
 
+alter table public.beta_ai_usage add column if not exists provider text;
+alter table public.beta_ai_usage add column if not exists provider_response_id text;
+alter table public.beta_ai_usage add column if not exists input_tokens integer;
+alter table public.beta_ai_usage add column if not exists output_tokens integer;
+alter table public.beta_ai_usage add column if not exists total_tokens integer;
+alter table public.beta_ai_usage add column if not exists cache_creation_input_tokens integer;
+alter table public.beta_ai_usage add column if not exists cache_read_input_tokens integer;
+alter table public.beta_ai_usage add column if not exists prompt_cache_hit_tokens integer;
+alter table public.beta_ai_usage add column if not exists prompt_cache_miss_tokens integer;
+alter table public.beta_ai_usage add column if not exists reasoning_tokens integer;
+alter table public.beta_ai_usage add column if not exists usage_raw jsonb;
+alter table public.beta_ai_usage add column if not exists provider_currency text;
+alter table public.beta_ai_usage add column if not exists provider_cost numeric(18,8);
+alter table public.beta_ai_usage add column if not exists cost_eur numeric(18,8);
+alter table public.beta_ai_usage add column if not exists exchange_rate_to_eur numeric(18,8);
+alter table public.beta_ai_usage add column if not exists pricing_version text;
+alter table public.beta_ai_usage add column if not exists cost_source text;
+alter table public.beta_ai_usage add column if not exists conversation_id uuid;
+alter table public.beta_ai_usage add column if not exists status text;
+alter table public.beta_ai_usage add column if not exists request_kind text;
+alter table public.beta_ai_usage add column if not exists retry_group_id uuid;
+alter table public.beta_ai_usage add column if not exists idempotency_key text;
+
+create index if not exists beta_ai_usage_user_cost_source_idx on public.beta_ai_usage(user_id, cost_source, created_at desc);
+create index if not exists beta_ai_usage_provider_idx on public.beta_ai_usage(provider, created_at desc);
+
 alter table public.beta_account_settings enable row level security;
 alter table public.beta_ai_usage enable row level security;
 
