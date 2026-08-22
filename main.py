@@ -1511,6 +1511,16 @@ def parse_hhmm(value: str, fallback: str) -> tuple[int, int]:
     return hour_int, minute_int
 
 
+def validate_hhmm(value: str, field_name: str) -> str:
+    raw = (value or "").strip()
+    if not re.match(r"^\d{2}:\d{2}$", raw):
+        raise HTTPException(status_code=422, detail=f"{field_name} must use HH:MM format")
+    hour, minute = raw.split(":", 1)
+    if int(hour) > 23 or int(minute) > 59:
+        raise HTTPException(status_code=422, detail=f"{field_name} must be a valid time")
+    return raw
+
+
 def _minutes_since_midnight(value: datetime) -> int:
     return value.hour * 60 + value.minute
 
@@ -2931,6 +2941,11 @@ class BulkAutomationModePayload(BaseModel):
     automation_mode: str = "auto"
 
 
+class BetaSettingsPayload(BaseModel):
+    allowed_send_start: str = Field(max_length=5)
+    allowed_send_end: str = Field(max_length=5)
+
+
 class RefineMessagePayload(BaseModel):
     instruction: str = Field(max_length=1000)
     original_message: str = Field(default="", max_length=4000)
@@ -4064,6 +4079,10 @@ async def delete_conversation(
 
 @app.get("/beta/ai-cost")
 async def get_beta_ai_cost(user_id: str = Depends(require_jwt)):
+    return await beta_ai_cost_status(user_id)
+
+
+async def beta_ai_cost_status(user_id: str) -> dict:
     settings = await get_beta_cost_settings(user_id)
     spent = await get_estimated_ai_spend_eur(user_id)
     cap = float(settings["cap_eur"])
@@ -4085,6 +4104,28 @@ async def get_beta_ai_cost(user_id: str = Depends(require_jwt)):
             "token_estimation": "ceil(characters / 4) when provider usage is not persisted",
         },
     }
+
+
+@app.patch("/beta/settings")
+async def update_beta_settings(
+    payload: BetaSettingsPayload,
+    user_id: str = Depends(require_jwt),
+):
+    allowed_send_start = validate_hhmm(payload.allowed_send_start, "allowed_send_start")
+    allowed_send_end = validate_hhmm(payload.allowed_send_end, "allowed_send_end")
+    existing = await get_beta_cost_settings(user_id)
+    row = {
+        "ai_cost_cap_eur": float(existing.get("cap_eur", DEFAULT_BETA_COST_CAP_EUR)),
+        "ai_cost_guardrail_enabled": bool(existing.get("enabled", True)),
+        "allowed_send_start": allowed_send_start,
+        "allowed_send_end": allowed_send_end,
+        "min_auto_delay_seconds": int(existing.get("min_auto_delay_seconds") or 0),
+        "random_auto_delay_seconds": int(existing.get("random_auto_delay_seconds") or 0),
+        "follow_up_config": existing.get("follow_up_config") or DEFAULT_BETA_ACCOUNT_SETTINGS["follow_up_config"],
+        "updated_at": now_iso(),
+    }
+    await upsert_user_singleton_row(SUPABASE_BETA_ACCOUNT_SETTINGS_URL, user_id, row)
+    return await beta_ai_cost_status(user_id)
 
 
 # ── Follow-up endpoints ───────────────────────────────────────────────────────
