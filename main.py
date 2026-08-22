@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Header, HTTPException, Depends, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from config import load_config
@@ -1521,6 +1521,18 @@ def validate_hhmm(value: str, field_name: str) -> str:
     return raw
 
 
+def validate_delay_seconds(value: Optional[int], field_name: str, fallback: int) -> int:
+    if value is None:
+        return int(fallback or 0)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise HTTPException(status_code=422, detail=f"{field_name} must be an integer number of seconds")
+    if value < 0:
+        raise HTTPException(status_code=422, detail=f"{field_name} must be greater than or equal to 0")
+    if value > 86_400:
+        raise HTTPException(status_code=422, detail=f"{field_name} must be 86400 seconds or less")
+    return value
+
+
 def _minutes_since_midnight(value: datetime) -> int:
     return value.hour * 60 + value.minute
 
@@ -2944,6 +2956,8 @@ class BulkAutomationModePayload(BaseModel):
 class BetaSettingsPayload(BaseModel):
     allowed_send_start: str = Field(max_length=5)
     allowed_send_end: str = Field(max_length=5)
+    min_auto_delay_seconds: Optional[StrictInt] = None
+    random_auto_delay_seconds: Optional[StrictInt] = None
 
 
 class RefineMessagePayload(BaseModel):
@@ -4114,13 +4128,23 @@ async def update_beta_settings(
     allowed_send_start = validate_hhmm(payload.allowed_send_start, "allowed_send_start")
     allowed_send_end = validate_hhmm(payload.allowed_send_end, "allowed_send_end")
     existing = await get_beta_cost_settings(user_id)
+    min_auto_delay_seconds = validate_delay_seconds(
+        payload.min_auto_delay_seconds,
+        "min_auto_delay_seconds",
+        int(existing.get("min_auto_delay_seconds") or 0),
+    )
+    random_auto_delay_seconds = validate_delay_seconds(
+        payload.random_auto_delay_seconds,
+        "random_auto_delay_seconds",
+        int(existing.get("random_auto_delay_seconds") or 0),
+    )
     row = {
         "ai_cost_cap_eur": float(existing.get("cap_eur", DEFAULT_BETA_COST_CAP_EUR)),
         "ai_cost_guardrail_enabled": bool(existing.get("enabled", True)),
         "allowed_send_start": allowed_send_start,
         "allowed_send_end": allowed_send_end,
-        "min_auto_delay_seconds": int(existing.get("min_auto_delay_seconds") or 0),
-        "random_auto_delay_seconds": int(existing.get("random_auto_delay_seconds") or 0),
+        "min_auto_delay_seconds": min_auto_delay_seconds,
+        "random_auto_delay_seconds": random_auto_delay_seconds,
         "follow_up_config": existing.get("follow_up_config") or DEFAULT_BETA_ACCOUNT_SETTINGS["follow_up_config"],
         "updated_at": now_iso(),
     }
