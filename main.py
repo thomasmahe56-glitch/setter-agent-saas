@@ -1712,15 +1712,37 @@ def conversation_activity(conversation: dict) -> dict:
     return {"last_user_at": last_user_at, "last_agent_at": last_agent_at}
 
 
-def get_follow_up_stage(hours_since_user: float) -> Optional[dict]:
-    if AUTO_FOLLOW_UP_HOURS <= hours_since_user < 24:
-        return {"stage": "auto_23h", "label": "Auto 23 h", "mode": "auto", "sort": 1}
-    if MANUAL_FOLLOW_UP_1_HOURS <= hours_since_user < MANUAL_FOLLOW_UP_2_HOURS:
-        return {"stage": "j3", "label": "J+3", "mode": "manual", "sort": 2}
-    if MANUAL_FOLLOW_UP_2_HOURS <= hours_since_user < MANUAL_FOLLOW_UP_3_HOURS:
-        return {"stage": "j10", "label": "J+10", "mode": "manual", "sort": 3}
-    if hours_since_user >= MANUAL_FOLLOW_UP_3_HOURS:
-        return {"stage": "j30", "label": "J+30", "mode": "manual", "sort": 4}
+def follow_up_schedule_config(
+    auto_hours: int = AUTO_FOLLOW_UP_HOURS,
+    manual1_days: int = 3,
+    manual2_days: int = 10,
+    manual3_days: int = 30,
+) -> dict:
+    auto_hours = max(1, min(23, int(auto_hours)))
+    manual1_days = max(1, min(60, int(manual1_days)))
+    manual2_days = max(manual1_days + 1, min(90, int(manual2_days)))
+    manual3_days = max(manual2_days + 1, min(180, int(manual3_days)))
+    return {
+        "auto_hours": auto_hours,
+        "manual1_hours": manual1_days * 24,
+        "manual2_hours": manual2_days * 24,
+        "manual3_hours": manual3_days * 24,
+        "manual1_days": manual1_days,
+        "manual2_days": manual2_days,
+        "manual3_days": manual3_days,
+    }
+
+
+def get_follow_up_stage(hours_since_user: float, schedule: Optional[dict] = None) -> Optional[dict]:
+    schedule = schedule or follow_up_schedule_config()
+    if schedule["auto_hours"] <= hours_since_user < 24:
+        return {"stage": "auto_23h", "label": f"Auto {schedule['auto_hours']} h", "mode": "auto", "sort": 1}
+    if schedule["manual1_hours"] <= hours_since_user < schedule["manual2_hours"]:
+        return {"stage": "j3", "label": f"J+{schedule['manual1_days']}", "mode": "manual", "sort": 2}
+    if schedule["manual2_hours"] <= hours_since_user < schedule["manual3_hours"]:
+        return {"stage": "j10", "label": f"J+{schedule['manual2_days']}", "mode": "manual", "sort": 3}
+    if hours_since_user >= schedule["manual3_hours"]:
+        return {"stage": "j30", "label": f"J+{schedule['manual3_days']}", "mode": "manual", "sort": 4}
     return None
 
 
@@ -1728,7 +1750,7 @@ def has_follow_up_stage(history: list, stage: str) -> bool:
     return any(message.get("follow_up_stage") == stage for message in history)
 
 
-async def build_follow_up_item(conversation: dict) -> Optional[dict]:
+async def build_follow_up_item(conversation: dict, schedule: Optional[dict] = None) -> Optional[dict]:
     if not conversation.get("agent_active"):
         return None
     if conversation.get("automation_mode") == "disabled":
@@ -1749,7 +1771,7 @@ async def build_follow_up_item(conversation: dict) -> Optional[dict]:
     settings = await get_beta_cost_settings(user_id) if user_id else dict(DEFAULT_BETA_ACCOUNT_SETTINGS)
     now = datetime.now(timezone.utc)
     hours_since_user = (now - last_user_at).total_seconds() / 3600
-    stage = configured_follow_up_stage(hours_since_user, settings) or get_follow_up_stage(hours_since_user)
+    stage = get_follow_up_stage(hours_since_user, schedule) if schedule else (configured_follow_up_stage(hours_since_user, settings) or get_follow_up_stage(hours_since_user))
     if not stage:
         return None
     if has_follow_up_stage(history, stage["stage"]):
@@ -2446,7 +2468,12 @@ def mark_last_auto_assistant_sent(history: list, sent: bool, send_result: Option
     return updated_history
 
 
-async def generate_follow_up_message(conversation: dict, stage: str) -> str:
+async def generate_follow_up_message(
+    conversation: dict,
+    stage: str,
+    ai_instruction: Optional[str] = None,
+    follow_up_delay_label: Optional[str] = None,
+) -> str:
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
 
@@ -2457,11 +2484,15 @@ async def generate_follow_up_message(conversation: dict, stage: str) -> str:
         "j30": "assisted D+30 follow-up",
     }
     stage_label = stage_labels.get(stage, stage)
+    delay_context = f"Configured delay: {follow_up_delay_label}\n" if follow_up_delay_label else ""
+    instruction_context = f"AI guidance for this follow-up: {ai_instruction.strip()}\n" if ai_instruction and ai_instruction.strip() else ""
     active_prompt = await get_active_prompt(conversation.get("user_id"))
     generation_prompt = build_generation_prompt(active_prompt)
     context = format_conversations_for_analysis([conversation], generation_prompt)
     user_message = (
         f"Follow-up stage: {stage_label}\n"
+        f"{delay_context}"
+        f"{instruction_context}"
         f"Prospect: {conversation.get('display_name') or conversation.get('username')}\n"
         f"Last known message: {conversation.get('message', '')}\n\n"
         f"Respect the active prompt as the general framework, but write only a short follow-up adapted to the stage.\n\n"
@@ -2939,6 +2970,13 @@ class KnowledgeTrainPayload(BaseModel):
 class FollowUpPreviewPayload(BaseModel):
     conversation_id: str
     stage: str
+    ai_instruction: Optional[str] = Field(default=None, max_length=1000)
+    follow_up_delay_label: Optional[str] = Field(default=None, max_length=120)
+
+
+class FollowUpGenerationPayload(BaseModel):
+    ai_instruction: Optional[str] = Field(default=None, max_length=1000)
+    follow_up_delay_label: Optional[str] = Field(default=None, max_length=120)
 
 
 class ManyChatFollowUpPayload(BaseModel):
@@ -4157,7 +4195,12 @@ async def update_beta_settings(
 @app.get("/follow-ups/due")
 async def get_due_follow_ups(
     user_id: str = Depends(require_jwt),
+    auto_hours: int = Query(default=AUTO_FOLLOW_UP_HOURS, ge=1, le=23),
+    manual1_days: int = Query(default=3, ge=1, le=60),
+    manual2_days: int = Query(default=10, ge=2, le=90),
+    manual3_days: int = Query(default=30, ge=3, le=180),
 ):
+    schedule = follow_up_schedule_config(auto_hours, manual1_days, manual2_days, manual3_days)
 
     async with httpx.AsyncClient() as http:
         res = await http.get(
@@ -4176,7 +4219,7 @@ async def get_due_follow_ups(
 
     items = []
     for conv in conversations:
-        item = await build_follow_up_item(conv)
+        item = await build_follow_up_item(conv, schedule)
         if item:
             items.append(item)
     items.sort(key=lambda item: (item["sort"], -item["hours_since_user"]))
@@ -4197,7 +4240,12 @@ async def preview_follow_up(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     history = conversation.get("history") or []
-    reply = await generate_follow_up_message(conversation, payload.stage)
+    reply = await generate_follow_up_message(
+        conversation,
+        payload.stage,
+        payload.ai_instruction,
+        payload.follow_up_delay_label,
+    )
 
     return {
         "conversation_id": payload.conversation_id,
@@ -4267,8 +4315,14 @@ async def manychat_auto_23h_follow_up(
 @app.post("/follow-ups/{conversation_id}/send-auto-23h")
 async def send_auto_23h_follow_up(
     conversation_id: str,
+    payload: Optional[FollowUpGenerationPayload] = None,
     user_id: str = Depends(require_jwt),
+    auto_hours: int = Query(default=AUTO_FOLLOW_UP_HOURS, ge=1, le=23),
+    manual1_days: int = Query(default=3, ge=1, le=60),
+    manual2_days: int = Query(default=10, ge=2, le=90),
+    manual3_days: int = Query(default=30, ge=3, le=180),
 ):
+    schedule = follow_up_schedule_config(auto_hours, manual1_days, manual2_days, manual3_days)
 
     conversation = await get_conversation_by_id(conversation_id, user_id)
     if not conversation:
@@ -4279,7 +4333,7 @@ async def send_auto_23h_follow_up(
     if channel == "whatsapp" and (not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID):
         raise HTTPException(status_code=500, detail="WhatsApp API is not configured")
 
-    due_item = await build_follow_up_item(conversation)
+    due_item = await build_follow_up_item(conversation, schedule)
     if not due_item or due_item.get("stage") != "auto_23h":
         raise HTTPException(status_code=409, detail="Auto 23h follow-up is not due")
     if due_item.get("send_blocked_reason"):
@@ -4289,7 +4343,12 @@ async def send_auto_23h_follow_up(
         await enforce_ai_cost_cap(user_id)
     except CostCapExceededError as e:
         raise HTTPException(status_code=402, detail=cost_cap_error_payload(e))
-    message = await generate_follow_up_message(conversation, "auto_23h")
+    message = await generate_follow_up_message(
+        conversation,
+        "auto_23h",
+        payload.ai_instruction if payload else None,
+        payload.follow_up_delay_label if payload else None,
+    )
     await record_ai_usage_event(user_id, "follow_up_auto_23h", json.dumps(conversation.get("history") or [], ensure_ascii=False), message)
     send_result = await send_channel_message(conversation, message)
     is_pending_delivery = is_manychat_pending_delivery_error(send_result)
