@@ -56,6 +56,9 @@ from main import (
     deterministic_simulator_reply,
     run_simulator_scenario,
     score_simulated_reply,
+    judge_simulated_reply_quality,
+    QUALITY_JUDGE_DECISIONS,
+    QUALITY_JUDGE_SCORE_KEYS,
 )
 
 
@@ -797,7 +800,34 @@ class TestAngellosConversationSimulator:
         assert result["response_source"] == "current_canned_logic"
         assert isinstance(result["quality_score"], int)
         assert result["recommendation"] in {"pass", "retry", "human_review"}
+        assert set(result["quality_judge"]["scores"].keys()) == set(QUALITY_JUDGE_SCORE_KEYS)
         assert result["transcript"][-1]["role"] == "assistant"
+
+    def test_quality_judge_structure_is_returned_for_all_eight_scenarios(self):
+        results = [
+            asyncio.run(run_simulator_scenario(scenario, "user-123", use_ai=False))
+            for scenario in SIMULATOR_SCENARIOS
+        ]
+
+        assert len(results) == 8
+        for result in results:
+            judge = result["quality_judge"]
+            assert set(judge.keys()) == {"overall_score", "decision", "scores", "why", "suggested_rewrite"}
+            assert 0 <= judge["overall_score"] <= 100
+            assert judge["decision"] in QUALITY_JUDGE_DECISIONS
+            assert set(judge["scores"].keys()) == set(QUALITY_JUDGE_SCORE_KEYS)
+            assert all(1 <= score <= 10 for score in judge["scores"].values())
+            assert isinstance(judge["why"], str) and judge["why"]
+            assert isinstance(judge["suggested_rewrite"], str) and judge["suggested_rewrite"]
+
+    def test_quality_judge_escalates_bad_business_reply(self):
+        scenario = next(item for item in SIMULATOR_SCENARIOS if item["id"] == "skeptical-ai")
+        scoring = score_simulated_reply(scenario, "Absolutely, let’s book a quick call and discuss the paid version.")
+        judge = judge_simulated_reply_quality(scenario, "Absolutely, let’s book a quick call and discuss the paid version.", scoring["flags"])
+
+        assert judge["decision"] == "human_review"
+        assert judge["scores"]["risque_business"] <= 4
+        assert "automated" in judge["suggested_rewrite"]
 
 
 if __name__ == "__main__":

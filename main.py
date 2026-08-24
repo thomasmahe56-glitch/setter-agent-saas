@@ -3305,6 +3305,187 @@ def score_simulated_reply(scenario: dict, reply: str) -> dict:
     return {"quality_score": score, "flags": flags, "recommendation": recommendation}
 
 
+QUALITY_JUDGE_SCORE_KEYS = (
+    "naturalite",
+    "contexte",
+    "progression",
+    "timing",
+    "risque_ia",
+    "risque_business",
+)
+
+QUALITY_JUDGE_DECISIONS = {"pass", "retry", "human_review"}
+
+
+def clamp_quality_subscore(value: int) -> int:
+    return max(1, min(10, int(value)))
+
+
+def quality_judge_suggested_rewrite(scenario: dict, reply: str, scores: dict[str, int]) -> str:
+    scenario_id = str(scenario.get("id") or "")
+    rewrites = {
+        "skeptical-ai": "yeah fair question. it is automated, but not here to spam you. was just curious if DMs are a bottleneck for you right now?",
+        "interested-vague": "nice. what does your current DM flow look like right now?",
+        "price-objection": "for the beta it’s free for 30 days. before I send details, how many DM conversations do you handle in a normal week?",
+        "send-info": "can do. quick context first, are your DMs mostly inbound or are you reaching out manually?",
+        "ghost-after-reply": "quick bump on this. still worth taking a look or should I leave it?",
+        "not-qualified": "fair. probably too early for this then. once you have a steady flow of DM conversations, it’ll make more sense.",
+        "hot-prospect": "sounds like a real fit. best next step is a quick call so I can see your DM flow. want me to send the beta page?",
+        "cold-negative": "No worries, appreciate you getting back to me.",
+    }
+    if min(scores.values()) >= 8:
+        return reply
+    return rewrites.get(scenario_id) or "got it. what does your current DM flow look like right now?"
+
+
+def judge_simulated_reply_quality(scenario: dict, reply: str, flags: Optional[dict] = None) -> dict:
+    """Deterministic DM Quality Judge v1 for the internal simulator only."""
+    flags = flags or {}
+    normalized_reply = normalize_inbound_text(reply)
+    history = scenario.get("history") or []
+    last_user_message = simulator_last_user_message(history)
+    normalized_user = normalize_inbound_text(last_user_message)
+    transcript_text = " ".join((msg.get("content") or "") for msg in history)
+    normalized_transcript = normalize_inbound_text(transcript_text)
+    sentences = [part.strip() for part in re.split(r"[.!?]\s+|\n+", (reply or "").strip()) if part.strip()]
+    question_count = (reply or "").count("?")
+    reply_len = len(reply or "")
+
+    ai_template_markers = (
+        "absolutely",
+        "great question",
+        "glad to hear",
+        "i understand",
+        "as an ai",
+        "i hope this message finds you well",
+        "revolutionize",
+        "leverage",
+        "streamline",
+    )
+    sales_markers = ("quick call", "booked call", "send the beta page", "paid version", "calendly")
+    warm_markers = ("interested", "try", "asap", "send", "tell me more", "sounds good")
+    qualification_markers = (
+        "dm flow",
+        "dms",
+        "conversations",
+        "inbound",
+        "outbound",
+        "qualification",
+        "process",
+        "normal week",
+        "bottleneck",
+    )
+
+    naturalite = 9
+    if flags.get("trop_ia") or any(marker in normalized_reply for marker in ai_template_markers):
+        naturalite -= 3
+    if reply_len > 240:
+        naturalite -= 2
+    if len(sentences) > 3:
+        naturalite -= 1
+    if re.search(r"[—–]", reply or ""):
+        naturalite -= 1
+    if not reply.strip():
+        naturalite = 1
+
+    contexte = 7
+    scenario_id = str(scenario.get("id") or "")
+    if scenario_id == "skeptical-ai":
+        contexte = 9 if any(marker in normalized_reply for marker in ("ai", "automated", "fair question", "honestly")) else 3
+    elif scenario_id == "price-objection":
+        contexte = 9 if any(marker in normalized_reply for marker in ("free", "price", "cost", "paid", "beta")) else 4
+    elif scenario_id == "cold-negative":
+        contexte = 9 if any(marker in normalized_reply for marker in ("no worries", "appreciate", "leave it")) else 3
+    elif scenario_id == "not-qualified":
+        contexte = 9 if any(marker in normalized_reply for marker in ("too early", "steady flow", "make more sense")) else 5
+    elif scenario_id == "hot-prospect":
+        contexte = 9 if any(marker in normalized_reply for marker in ("quick call", "beta page", "next step", "real fit")) else 6
+    elif scenario_id == "ghost-after-reply":
+        contexte = 8 if any(marker in normalized_reply for marker in ("bump", "still", "leave it")) else 5
+    elif any(word for word in normalized_user.split() if len(word) > 4 and word in normalized_reply):
+        contexte = 8
+    if flags.get("manque_contexte"):
+        contexte -= 2
+
+    progression = 7
+    asks_useful_question = question_count == 1 and any(marker in normalized_reply for marker in qualification_markers)
+    offers_valid_next_step = any(marker in normalized_reply for marker in sales_markers) and any(marker in normalized_transcript for marker in warm_markers)
+    graceful_close = scenario_id in {"cold-negative", "not-qualified"} and question_count == 0
+    if asks_useful_question or offers_valid_next_step or graceful_close:
+        progression = 9
+    elif question_count > 1:
+        progression = 4
+    elif question_count == 0 and scenario_id not in {"cold-negative", "not-qualified", "ghost-after-reply"}:
+        progression = 5
+
+    timing = 8
+    is_cold_or_sensitive = scenario_id in {"skeptical-ai", "send-info", "interested-vague"}
+    if any(marker in normalized_reply for marker in sales_markers) and is_cold_or_sensitive and not any(marker in normalized_user for marker in warm_markers):
+        timing = 4
+    if scenario_id == "hot-prospect" and any(marker in normalized_reply for marker in ("quick call", "beta page")):
+        timing = 9
+    if flags.get("pitch_premature"):
+        timing -= 2
+
+    risque_ia = 9
+    if flags.get("trop_ia") or any(marker in normalized_reply for marker in ai_template_markers):
+        risque_ia -= 3
+    if flags.get("trop_long"):
+        risque_ia -= 2
+    if flags.get("repetitif"):
+        risque_ia -= 2
+    if reply_len > 320:
+        risque_ia -= 1
+
+    risque_business = min(contexte, timing) + 1
+    if scenario_id == "skeptical-ai" and not any(marker in normalized_reply for marker in ("ai", "automated", "honestly")):
+        risque_business -= 3
+    if scenario_id == "cold-negative" and question_count > 0:
+        risque_business -= 2
+    if scenario_id == "not-qualified" and any(marker in normalized_reply for marker in sales_markers):
+        risque_business -= 3
+    if flags.get("pitch_premature"):
+        risque_business -= 2
+
+    scores = {
+        "naturalite": clamp_quality_subscore(naturalite),
+        "contexte": clamp_quality_subscore(contexte),
+        "progression": clamp_quality_subscore(progression),
+        "timing": clamp_quality_subscore(timing),
+        "risque_ia": clamp_quality_subscore(risque_ia),
+        "risque_business": clamp_quality_subscore(risque_business),
+    }
+    overall_score = max(0, min(100, round(sum(scores.values()) / (len(scores) * 10) * 100)))
+    lowest_score = min(scores.values())
+    if overall_score < 55 or lowest_score <= 3 or scores["risque_business"] <= 4:
+        decision = "human_review"
+    elif overall_score < 75 or lowest_score <= 5:
+        decision = "retry"
+    else:
+        decision = "pass"
+
+    issues = []
+    if scores["contexte"] <= 6:
+        issues.append("contexte insuffisant")
+    if scores["progression"] <= 6:
+        issues.append("progression faible")
+    if scores["timing"] <= 6:
+        issues.append("timing commercial risqué")
+    if scores["risque_ia"] <= 6:
+        issues.append("vibe trop template")
+    if scores["risque_business"] <= 6:
+        issues.append("risque business élevé")
+    why = "Réponse courte, contextuelle et exploitable pour la suite." if not issues else "À corriger : " + ", ".join(issues[:3]) + "."
+
+    return {
+        "overall_score": overall_score,
+        "decision": decision,
+        "scores": scores,
+        "why": why,
+        "suggested_rewrite": quality_judge_suggested_rewrite(scenario, reply, scores),
+    }
+
+
 def build_simulation_transcript(scenario: dict, reply: str) -> list[dict]:
     return [*(scenario.get("history") or []), {"role": "assistant", "content": reply, "timestamp": now_iso(), "sent": False, "source": "conversation_simulator"}]
 
@@ -3326,6 +3507,7 @@ async def run_simulator_scenario(scenario: dict, user_id: str, use_ai: bool = Fa
     else:
         reply, source = deterministic_simulator_reply(scenario)
     scoring = score_simulated_reply(scenario, reply)
+    quality_judge = judge_simulated_reply_quality(scenario, reply, scoring.get("flags"))
     return {
         "scenario_id": scenario["id"],
         "title": scenario["title"],
@@ -3334,6 +3516,7 @@ async def run_simulator_scenario(scenario: dict, user_id: str, use_ai: bool = Fa
         "transcript": build_simulation_transcript(scenario, reply),
         "angellos_reply": reply,
         "response_source": source,
+        "quality_judge": quality_judge,
         **scoring,
     }
 
