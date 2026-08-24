@@ -3171,6 +3171,173 @@ class PlaygroundPayload(BaseModel):
     sales_page_url: Optional[str] = None
 
 
+class SimulatorRunPayload(BaseModel):
+    scenario_id: Optional[str] = Field(default=None, max_length=80)
+    use_ai: bool = False
+
+
+SIMULATOR_SCENARIOS = [
+    {
+        "id": "skeptical-ai",
+        "title": "Prospect sceptique",
+        "description": "Le prospect soupçonne une réponse automatique et demande si c’est de l’IA.",
+        "prospect_profile": "Operator who is curious but trust-sensitive.",
+        "history": [
+            {"role": "assistant", "content": "quick one, do you handle Instagram DMs yourself right now?", "timestamp": "2026-08-24T08:00:00Z", "sent": True},
+            {"role": "user", "content": "is this AI? lol", "timestamp": "2026-08-24T08:01:00Z"},
+        ],
+    },
+    {
+        "id": "interested-vague",
+        "title": "Intéressé mais vague",
+        "description": "Le prospect montre de l’intérêt sans donner beaucoup de contexte.",
+        "prospect_profile": "Warm but unclear Instagram operator.",
+        "history": [
+            {"role": "assistant", "content": "do you already get leads in your DMs?", "timestamp": "2026-08-24T08:00:00Z", "sent": True},
+            {"role": "user", "content": "yeah maybe interested", "timestamp": "2026-08-24T08:01:00Z"},
+        ],
+    },
+    {
+        "id": "price-objection",
+        "title": "Objection prix",
+        "description": "Le prospect demande le prix ou conteste le coût.",
+        "prospect_profile": "Budget-conscious lead asking before qualification.",
+        "history": [
+            {"role": "assistant", "content": "would this help with your DM flow?", "timestamp": "2026-08-24T08:00:00Z", "sent": True},
+            {"role": "user", "content": "how much does it cost?", "timestamp": "2026-08-24T08:01:00Z"},
+        ],
+    },
+    {
+        "id": "send-info",
+        "title": "Send me info",
+        "description": "Le prospect demande des infos ou un lien sans qualification.",
+        "prospect_profile": "Lead asking for details instead of engaging.",
+        "history": [
+            {"role": "assistant", "content": "quick one, are your DMs inbound or mostly outbound?", "timestamp": "2026-08-24T08:00:00Z", "sent": True},
+            {"role": "user", "content": "send me info", "timestamp": "2026-08-24T08:01:00Z"},
+        ],
+    },
+    {
+        "id": "ghost-after-reply",
+        "title": "Ghost après réponse",
+        "description": "Le prospect n’a pas répondu après une réponse Angellos.",
+        "prospect_profile": "Previously warm lead now silent.",
+        "history": [
+            {"role": "user", "content": "tell me more", "timestamp": "2026-08-20T08:00:00Z"},
+            {"role": "assistant", "content": "We built something that qualifies inbound DMs, follows up, and moves serious conversations toward a call. Still in beta. Want a quick look?", "timestamp": "2026-08-20T08:01:00Z", "sent": True},
+            {"role": "user", "content": "", "timestamp": "2026-08-24T08:01:00Z"},
+        ],
+    },
+    {
+        "id": "not-qualified",
+        "title": "Prospect non qualifié",
+        "description": "Le prospect n’a pas de volume DM ou n’est pas dans la cible.",
+        "prospect_profile": "Low-volume or bad-fit prospect.",
+        "history": [
+            {"role": "assistant", "content": "how many Instagram DM conversations do you get in a normal week?", "timestamp": "2026-08-24T08:00:00Z", "sent": True},
+            {"role": "user", "content": "none yet, just starting and no offer", "timestamp": "2026-08-24T08:01:00Z"},
+        ],
+    },
+    {
+        "id": "hot-prospect",
+        "title": "Prospect chaud",
+        "description": "Le prospect est prêt à avancer vers la beta ou un call.",
+        "prospect_profile": "High-intent lead with active DM volume.",
+        "history": [
+            {"role": "assistant", "content": "do you already have a consistent qualification process?", "timestamp": "2026-08-24T08:00:00Z", "sent": True},
+            {"role": "user", "content": "we get 40 DMs a week and I want to try this asap", "timestamp": "2026-08-24T08:01:00Z"},
+        ],
+    },
+    {
+        "id": "cold-negative",
+        "title": "Réponse froide / négative",
+        "description": "Le prospect refuse ou répond froidement.",
+        "prospect_profile": "Cold lead rejecting the outreach.",
+        "history": [
+            {"role": "assistant", "content": "would it be useful if someone handled the first part of those DM conversations?", "timestamp": "2026-08-24T08:00:00Z", "sent": True},
+            {"role": "user", "content": "no thanks bro", "timestamp": "2026-08-24T08:01:00Z"},
+        ],
+    },
+]
+
+
+def simulator_last_user_message(history: list[dict]) -> str:
+    return next(((item.get("content") or "") for item in reversed(history) if item.get("role") == "user"), "")
+
+
+def deterministic_simulator_reply(scenario: dict) -> tuple[str, str]:
+    message = simulator_last_user_message(scenario.get("history") or [])
+    canned = get_angellos_beta_canned_reply(message)
+    if canned:
+        return canned[0], "current_canned_logic"
+    normalized = normalize_inbound_text(message)
+    if scenario.get("id") == "skeptical-ai" or re.search(r"\b(ai|bot|automated)\b", normalized):
+        return "yeah fair question. honestly it is. if that’s a dealbreaker I get it, but happy to explain what this is about if you're curious", "current_ai_suspicion_guardrail"
+    if scenario.get("id") == "ghost-after-reply":
+        return "quick bump on this. still worth taking a look or should I leave it?", "internal_follow_up_logic"
+    if scenario.get("id") == "not-qualified":
+        return "fair. probably too early for this then. once you have a steady flow of DM conversations, it’ll make more sense", "internal_disqualification_logic"
+    if scenario.get("id") == "hot-prospect":
+        return ANGELLOS_INTERESTED_REPLY, "current_interest_logic"
+    return "got it. what does your current DM flow look like right now?", "internal_fallback_logic"
+
+
+def score_simulated_reply(scenario: dict, reply: str) -> dict:
+    normalized_reply = normalize_inbound_text(reply)
+    transcript_text = " ".join((msg.get("content") or "") for msg in scenario.get("history") or [])
+    normalized_transcript = normalize_inbound_text(transcript_text)
+    sentences = [part for part in re.split(r"[.!?]\s+|\n+", reply.strip()) if part.strip()]
+    question_count = reply.count("?")
+    flags = {
+        "trop_ia": any(marker in normalized_reply for marker in ("absolutely", "great question", "glad to hear", "i understand", "as an ai")),
+        "trop_long": len(reply) > 320 or len(sentences) > 4,
+        "repetitif": len(set(sentences)) < len(sentences) if sentences else False,
+        "pitch_premature": any(marker in normalized_reply for marker in ("booked call", "quick call", "send the beta page", "paid version")) and not any(marker in normalized_transcript for marker in ("interested", "try", "asap", "send", "price", "cost")),
+        "manque_contexte": question_count > 1 or (scenario.get("id") == "skeptical-ai" and "ai" not in normalized_reply and "caught" not in normalized_reply),
+    }
+    score = 100
+    penalties = {"trop_ia": 25, "trop_long": 20, "repetitif": 15, "pitch_premature": 20, "manque_contexte": 20}
+    for key, flagged in flags.items():
+        if flagged:
+            score -= penalties[key]
+    score = max(0, score)
+    recommendation = "pass" if score >= 80 else "retry" if score >= 60 else "human_review"
+    return {"quality_score": score, "flags": flags, "recommendation": recommendation}
+
+
+def build_simulation_transcript(scenario: dict, reply: str) -> list[dict]:
+    return [*(scenario.get("history") or []), {"role": "assistant", "content": reply, "timestamp": now_iso(), "sent": False, "source": "conversation_simulator"}]
+
+
+async def run_simulator_scenario(scenario: dict, user_id: str, use_ai: bool = False) -> dict:
+    reply = ""
+    source = ""
+    if use_ai:
+        if client is None:
+            raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+        active_prompt = await get_active_prompt(user_id)
+        system_prompt = build_generation_prompt(active_prompt)
+        try:
+            generation = generate_claude_generation(strip_message_metadata(scenario.get("history") or []), system_prompt, max_tokens=500)
+            reply = validate_agent_reply(sanitize_angellos_beta_reply(generation.text, simulator_last_user_message(scenario.get("history") or [])), system_prompt)
+            source = "anthropic_live_generation"
+        except ProviderGenerationError as e:
+            return {"scenario_id": scenario["id"], **provider_error_payload(e)}
+    else:
+        reply, source = deterministic_simulator_reply(scenario)
+    scoring = score_simulated_reply(scenario, reply)
+    return {
+        "scenario_id": scenario["id"],
+        "title": scenario["title"],
+        "description": scenario["description"],
+        "prospect_profile": scenario["prospect_profile"],
+        "transcript": build_simulation_transcript(scenario, reply),
+        "angellos_reply": reply,
+        "response_source": source,
+        **scoring,
+    }
+
+
 async def handle_inbound_message(
     *,
     channel: str,
@@ -3623,6 +3790,43 @@ async def auth_me(
         "user_id": user_id,
         "owner_user_id_configured": bool(config.owner_user_id),
         "matches_owner_user_id": (not config.owner_user_id) or hmac.compare_digest(user_id, config.owner_user_id),
+    }
+
+
+@app.get("/simulator/scenarios")
+async def get_simulator_scenarios(
+    user_id: str = Depends(require_jwt),
+):
+    return [
+        {
+            "id": scenario["id"],
+            "title": scenario["title"],
+            "description": scenario["description"],
+            "prospect_profile": scenario["prospect_profile"],
+        }
+        for scenario in SIMULATOR_SCENARIOS
+    ]
+
+
+@app.post("/simulator/run")
+async def run_conversation_simulator(
+    payload: SimulatorRunPayload = SimulatorRunPayload(),
+    user_id: str = Depends(require_jwt),
+):
+    scenarios = SIMULATOR_SCENARIOS
+    if payload.scenario_id:
+        scenarios = [scenario for scenario in SIMULATOR_SCENARIOS if scenario["id"] == payload.scenario_id]
+        if not scenarios:
+            raise HTTPException(status_code=404, detail="Simulator scenario not found")
+    results = [await run_simulator_scenario(scenario, user_id, payload.use_ai) for scenario in scenarios]
+    passed = sum(1 for result in results if result.get("recommendation") == "pass")
+    return {
+        "success": True,
+        "mode": "ai" if payload.use_ai else "deterministic_current_logic",
+        "scenario_count": len(results),
+        "pass_count": passed,
+        "review_count": len(results) - passed,
+        "results": results,
     }
 
 

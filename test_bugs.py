@@ -52,6 +52,10 @@ from main import (
     is_within_allowed_send_window,
     next_allowed_send_at,
     normalize_beta_account_settings,
+    SIMULATOR_SCENARIOS,
+    deterministic_simulator_reply,
+    run_simulator_scenario,
+    score_simulated_reply,
 )
 
 
@@ -749,6 +753,51 @@ class TestNounesBetaReadinessControls:
         assert len(_BulkClient.patches) == 1
         assert _BulkClient.patches[0]["kwargs"]["params"]["id"] == "eq.supervised-1"
         assert _BulkClient.patches[0]["kwargs"]["params"]["automation_mode"] == "eq.supervised"
+
+
+class TestAngellosConversationSimulator:
+    def test_includes_eight_required_scenarios(self):
+        scenario_ids = {scenario["id"] for scenario in SIMULATOR_SCENARIOS}
+        assert scenario_ids == {
+            "skeptical-ai",
+            "interested-vague",
+            "price-objection",
+            "send-info",
+            "ghost-after-reply",
+            "not-qualified",
+            "hot-prospect",
+            "cold-negative",
+        }
+
+    def test_deterministic_simulator_uses_current_canned_reply_for_price(self):
+        scenario = next(item for item in SIMULATOR_SCENARIOS if item["id"] == "price-objection")
+        reply, source = deterministic_simulator_reply(scenario)
+
+        assert source == "current_canned_logic"
+        assert "free for 30 days" in reply
+
+    def test_score_flags_long_robotic_pitch(self):
+        scenario = next(item for item in SIMULATOR_SCENARIOS if item["id"] == "not-qualified")
+        result = score_simulated_reply(
+            scenario,
+            "Absolutely! Great question! I understand your concern. Let's book a quick call so we can discuss the paid version and move forward immediately with your acquisition process.",
+        )
+
+        assert result["quality_score"] < 80
+        assert result["recommendation"] in {"retry", "human_review"}
+        assert result["flags"]["trop_ia"] is True
+        assert result["flags"]["pitch_premature"] is True
+
+    def test_run_simulator_scenario_returns_transcript_score_and_recommendation(self):
+        scenario = next(item for item in SIMULATOR_SCENARIOS if item["id"] == "cold-negative")
+        result = asyncio.run(run_simulator_scenario(scenario, "user-123", use_ai=False))
+
+        assert result["scenario_id"] == "cold-negative"
+        assert result["angellos_reply"] == "No worries, appreciate you getting back to me."
+        assert result["response_source"] == "current_canned_logic"
+        assert isinstance(result["quality_score"], int)
+        assert result["recommendation"] in {"pass", "retry", "human_review"}
+        assert result["transcript"][-1]["role"] == "assistant"
 
 
 if __name__ == "__main__":
