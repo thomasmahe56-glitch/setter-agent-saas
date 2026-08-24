@@ -1,5 +1,6 @@
 """Focused regression tests for BUG 1 (placeholder display names) and BUG 2 (supervised activation)."""
 import asyncio
+import json
 import types
 import pytest
 from datetime import datetime, timezone
@@ -24,6 +25,8 @@ from main import (
     ANGELLOS_BETA_REPLY_RULES,
     WebhookPayload,
     build_generation_prompt,
+    build_structured_refinement_result,
+    build_prompt_diff,
     build_training_center_prompt,
     default_automation_mode_for_prompt,
     durable_rule_from_refinement_instruction,
@@ -45,6 +48,8 @@ from main import (
     bulk_update_automation_mode,
     BulkAutomationModePayload,
     CostCapExceededError,
+    RefinePromptPayload,
+    refine_prompt,
     estimate_token_count,
     estimate_claude_cost_eur,
     enforce_ai_cost_cap,
@@ -650,6 +655,170 @@ class TestRefinePendingLearning:
         created_prompt = _PromptClient.posts[0]["kwargs"]["json"]
         assert created_prompt["source"].startswith("refine-learn:")
         assert result["rule"] in created_prompt["content"]
+
+
+class TestTrainingCenterRefinePromptRobustness:
+    production_instruction = (
+        "This reply needs improvement:\n"
+        "\"Le tarif dépend vraiment du contexte de ton cabinet on le confirme après un rapide audit de 20 minutes.\n\n"
+        "Tu es kiné ou ostéo ?\""
+    )
+
+    def _active_prompt(self):
+        return build_training_center_prompt(
+            "BASE PROMPT",
+            {"language": "fr", "offer_name": "Audit Growth", "price": "2500 EUR"},
+            {"persona_summary": "cabinet kiné"},
+            {"do_not_say": ["Pas de hype"]},
+        )
+
+    def test_structured_preview_does_not_persist_and_builds_diff(self, monkeypatch):
+        upserts = []
+
+        async def fake_get_user_singleton_row(table_url, user_id, select="*"):
+            if table_url.endswith("/agent_profiles"):
+                return {"profile": {"language": "fr", "offer_name": "Audit Growth", "price": "2500 EUR"}}
+            if table_url.endswith("/agent_avatars"):
+                return {"avatar": {"persona_summary": "cabinet kiné"}}
+            if table_url.endswith("/agent_sales_rules"):
+                return {"rules": {"do_not_say": ["Pas de hype"]}}
+            return None
+
+        async def fake_upsert_user_singleton_row(table_url, user_id, payload):
+            upserts.append((table_url, user_id, payload))
+            return payload
+
+        monkeypatch.setattr("main.get_user_singleton_row", fake_get_user_singleton_row)
+        monkeypatch.setattr("main.upsert_user_singleton_row", fake_upsert_user_singleton_row)
+
+        result = asyncio.run(build_structured_refinement_result(
+            "user-123",
+            self.production_instruction,
+            self._active_prompt(),
+            apply=False,
+        ))
+        diff = build_prompt_diff(self._active_prompt(), result["updated_prompt"])
+
+        assert result["structured_fallback"] is True
+        assert "tarif dépend" in result["updated_prompt"]
+        assert any(item["type"] == "add" for item in diff)
+        assert upserts == []
+
+    def test_truncated_claude_json_falls_back_without_exposing_jsondecodeerror(self, monkeypatch):
+        class _FakeMessages:
+            def create(self, **kwargs):
+                return types.SimpleNamespace(content=[types.SimpleNamespace(text='{"updated_prompt": "abc')])
+
+        class _FakeClient:
+            messages = _FakeMessages()
+
+        async def fake_get_active_prompt_version(user_id):
+            return {"id": "active-1", "content": self._active_prompt(), "is_active": True}
+
+        async def fake_get_user_singleton_row(table_url, user_id, select="*"):
+            if table_url.endswith("/agent_profiles"):
+                return {"profile": {"language": "fr", "offer_name": "Audit Growth", "price": "2500 EUR"}}
+            if table_url.endswith("/agent_avatars"):
+                return {"avatar": {"persona_summary": "cabinet kiné"}}
+            if table_url.endswith("/agent_sales_rules"):
+                return {"rules": {"do_not_say": ["Pas de hype"]}}
+            return None
+
+        monkeypatch.setattr("main.client", _FakeClient())
+        monkeypatch.setattr("main.get_active_prompt_version", fake_get_active_prompt_version)
+        monkeypatch.setattr("main.get_user_singleton_row", fake_get_user_singleton_row)
+
+        result = asyncio.run(refine_prompt(
+            RefinePromptPayload(instruction=self.production_instruction, apply=False),
+            user_id="user-123",
+        ))
+
+        assert isinstance(result, dict)
+        assert result["success"] is True
+        assert result["applied"] is False
+        assert result["diff"]
+        assert "JSONDecodeError" not in json.dumps(result)
+        assert "tarif dépend" in result["updated_prompt"]
+
+    def test_apply_true_persists_rule_and_prompt_version_after_fallback(self, monkeypatch):
+        upserts = []
+
+        class _FakeMessages:
+            def create(self, **kwargs):
+                return types.SimpleNamespace(content=[types.SimpleNamespace(text='{"updated_prompt": "abc')])
+
+        class _FakeClient:
+            messages = _FakeMessages()
+
+        class _PromptResponse:
+            def __init__(self, payload=None):
+                self._payload = payload or []
+                self.status_code = 200
+                self.text = json.dumps(self._payload)
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._payload
+
+        class _PromptClient:
+            patches = []
+            posts = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def patch(self, *args, **kwargs):
+                self.__class__.patches.append({"args": args, "kwargs": kwargs})
+                return _PromptResponse()
+
+            async def post(self, *args, **kwargs):
+                self.__class__.posts.append({"args": args, "kwargs": kwargs})
+                return _PromptResponse([{"id": "prompt-version-2"}])
+
+        async def fake_get_active_prompt_version(user_id):
+            return {"id": "active-1", "content": self._active_prompt(), "is_active": True}
+
+        async def fake_get_user_singleton_row(table_url, user_id, select="*"):
+            if table_url.endswith("/agent_profiles"):
+                return {"profile": {"language": "fr", "offer_name": "Audit Growth", "price": "2500 EUR"}}
+            if table_url.endswith("/agent_avatars"):
+                return {"avatar": {"persona_summary": "cabinet kiné"}}
+            if table_url.endswith("/agent_sales_rules"):
+                return {"rules": {"do_not_say": ["Pas de hype"]}}
+            return None
+
+        async def fake_upsert_user_singleton_row(table_url, user_id, payload):
+            upserts.append((table_url, user_id, payload))
+            return {"id": "rules-row", **payload}
+
+        _PromptClient.patches = []
+        _PromptClient.posts = []
+        monkeypatch.setattr("main.client", _FakeClient())
+        monkeypatch.setattr("main.get_active_prompt_version", fake_get_active_prompt_version)
+        monkeypatch.setattr("main.get_user_singleton_row", fake_get_user_singleton_row)
+        monkeypatch.setattr("main.upsert_user_singleton_row", fake_upsert_user_singleton_row)
+        monkeypatch.setattr("main.httpx.AsyncClient", _PromptClient)
+
+        result = asyncio.run(refine_prompt(
+            RefinePromptPayload(instruction=self.production_instruction, apply=True),
+            user_id="user-123",
+        ))
+
+        assert isinstance(result, dict)
+        assert result["success"] is True
+        assert result["applied"] is True
+        assert result["prompt_version_id"] == "prompt-version-2"
+        assert upserts[0][0].endswith("/agent_sales_rules")
+        saved_rules = upserts[0][2]["rules"]
+        assert any("tarif dépend" in item for item in saved_rules["do_not_say"])
+        created_prompt = _PromptClient.posts[0]["kwargs"]["json"]
+        assert created_prompt["previous_version_id"] == "active-1"
+        assert "JSONDecodeError" not in json.dumps(result)
 
 
 class TestNounesBetaReadinessControls:

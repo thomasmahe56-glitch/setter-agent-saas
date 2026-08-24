@@ -72,6 +72,7 @@ DEFAULT_BETA_ACCOUNT_SETTINGS = {
 
 GENERIC_AI_USER_MESSAGE = "Angellos couldn’t generate a reply right now. Please check your AI credits or try again."
 LOW_CREDITS_USER_MESSAGE = "Angellos couldn’t generate a reply because the Anthropic account has no available credits. Add credits in Anthropic billing, then try again."
+PROMPT_REFINEMENT_USER_MESSAGE = "Angellos couldn’t update this training instruction right now. Please try a shorter instruction or try again."
 PROMPT_REFINEMENT_SAVE_USER_MESSAGE = "Angellos couldn’t save this update. Please try again."
 PROMPT_REFINEMENT_SAVE_HINT = "If the issue continues, check the Training Center database configuration."
 
@@ -231,6 +232,20 @@ def prompt_refinement_save_error_response(error: Exception) -> JSONResponse:
             "message": PROMPT_REFINEMENT_SAVE_USER_MESSAGE,
             "user_message": PROMPT_REFINEMENT_SAVE_USER_MESSAGE,
             "hint": PROMPT_REFINEMENT_SAVE_HINT,
+        },
+    )
+
+
+def prompt_refinement_error_response(error: Exception) -> JSONResponse:
+    print(f"[refine-prompt:error] {type(error).__name__}: {str(error)[:1000]}", flush=True)
+    return JSONResponse(
+        status_code=502,
+        content={
+            "success": False,
+            "ok": False,
+            "error_type": "prompt_refinement_failed",
+            "message": PROMPT_REFINEMENT_USER_MESSAGE,
+            "user_message": PROMPT_REFINEMENT_USER_MESSAGE,
         },
     )
 
@@ -1459,6 +1474,8 @@ def build_training_center_prompt(base_prompt: str, profile: dict, avatar: dict, 
 
 
 PRICE_LEARNING_MARKERS = (
+    "tarif",
+    "tarifs",
     "ne donne jamais le prix",
     "ne pas donner le prix",
     "pas donner le prix",
@@ -1472,10 +1489,14 @@ PRICE_LEARNING_MARKERS = (
 )
 
 
+def is_price_refinement_instruction(instruction: str) -> bool:
+    lowered = (instruction or "").lower()
+    return any(marker in lowered for marker in PRICE_LEARNING_MARKERS)
+
+
 def durable_rule_from_refinement_instruction(instruction: str) -> Optional[str]:
     clean_instruction = re.sub(r"\s+", " ", instruction or "").strip()
-    lowered = clean_instruction.lower()
-    if any(marker in lowered for marker in PRICE_LEARNING_MARKERS):
+    if is_price_refinement_instruction(clean_instruction):
         return (
             "Ne jamais donner le prix directement en DM. Si le prospect demande le prix, "
             "répondre que le tarif dépend du contexte et qu'il sera confirmé pendant l'audit/appel, "
@@ -1509,10 +1530,11 @@ async def learn_refinement_rule(user_id: str, instruction: str) -> dict:
 
         rules["do_not_say"] = merge_rule_list(rules.get("do_not_say"), rule)
         rules["objection_responses"] = merge_rule_list(rules.get("objection_responses"), rule)
-        rules["qualification_questions"] = merge_rule_list(
-            rules.get("qualification_questions"),
-            "Avant de parler tarif, qualifier le type de besoin, la situation actuelle et l'urgence du prospect.",
-        )
+        if is_price_refinement_instruction(instruction):
+            rules["qualification_questions"] = merge_rule_list(
+                rules.get("qualification_questions"),
+                "Avant de parler tarif, qualifier le type de besoin, la situation actuelle et l'urgence du prospect.",
+            )
 
         await upsert_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id, {"rules": clean_json_value(rules)})
 
@@ -1554,6 +1576,59 @@ async def learn_refinement_rule(user_id: str, instruction: str) -> dict:
     except Exception as e:
         print(f"[refine-learn] failed user_id={user_id}: {e}", flush=True)
         return {"learned": False, "rule": rule, "error": str(e)[:300]}
+
+
+async def build_structured_refinement_result(
+    user_id: str,
+    instruction: str,
+    current_prompt: str,
+    apply: bool = False,
+) -> dict:
+    """Deterministic Training Center refinement path that does not parse a full prompt from LLM JSON."""
+    rule = durable_rule_from_refinement_instruction(instruction)
+    if not rule:
+        raise ValueError("Instruction did not produce a durable rule")
+
+    profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id)
+    avatar_row = await get_user_singleton_row(SUPABASE_AGENT_AVATARS_URL, user_id)
+    sales_rules_row = await get_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id)
+    profile = (profile_row or {}).get("profile") or training_center_profile(current_prompt)
+    avatar = (avatar_row or {}).get("avatar") or {}
+    if not isinstance(profile, dict):
+        profile = {}
+    if not isinstance(avatar, dict):
+        avatar = {}
+    existing_rules = (sales_rules_row or {}).get("rules") or {}
+    if not isinstance(existing_rules, dict):
+        existing_rules = {}
+
+    next_rules = dict(existing_rules)
+    next_rules["do_not_say"] = merge_rule_list(next_rules.get("do_not_say"), rule)
+    next_rules["objection_responses"] = merge_rule_list(next_rules.get("objection_responses"), rule)
+    if is_price_refinement_instruction(instruction):
+        next_rules["qualification_questions"] = merge_rule_list(
+            next_rules.get("qualification_questions"),
+            "Avant de parler tarif, qualifier le type de besoin, la situation actuelle et l'urgence du prospect.",
+        )
+    next_rules = clean_json_value(next_rules)
+    if not isinstance(next_rules, dict):
+        next_rules = {}
+
+    if apply:
+        await upsert_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id, {"rules": next_rules})
+
+    updated_prompt = build_training_center_prompt(current_prompt, profile, avatar, next_rules)
+    return {
+        "updated_prompt": updated_prompt,
+        "target_section": "Training Center sales rules",
+        "summary": "Stored the instruction as a durable Training Center rule and rebuilt the prompt from structured data.",
+        "changes": [
+            f"Added durable rule: {rule}",
+            "Rebuilt Angellos from Training Center profile, avatar, and sales rules.",
+        ],
+        "structured_rule": rule,
+        "structured_fallback": True,
+    }
 
 
 TRAINING_CENTER_MAIN_STEPS = [
@@ -5584,7 +5659,20 @@ async def refine_prompt(
         except ProviderGenerationError as e:
             return provider_error_response(e)
         except Exception as e:
-            return provider_error_response(classify_provider_error(e))
+            print(
+                "[refine-prompt:llm-invalid] "
+                f"error={type(e).__name__}: {str(e)[:500]} instruction_len={len(instruction)}",
+                flush=True,
+            )
+            try:
+                result = await build_structured_refinement_result(
+                    user_id,
+                    instruction,
+                    current_prompt,
+                    apply=payload.apply,
+                )
+            except Exception as fallback_error:
+                return prompt_refinement_error_response(fallback_error)
 
     updated_prompt = result["updated_prompt"]
     visual_diff = build_prompt_diff(current_prompt, updated_prompt)
