@@ -663,6 +663,7 @@ class TestTrainingCenterRefinePromptRobustness:
         "\"Le tarif dépend vraiment du contexte de ton cabinet on le confirme après un rapide audit de 20 minutes.\n\n"
         "Tu es kiné ou ostéo ?\""
     )
+    price_qualification_rule = "Avant de parler tarif, qualifier le type de besoin, la situation actuelle et l'urgence du prospect."
 
     def _active_prompt(self):
         return build_training_center_prompt(
@@ -704,9 +705,50 @@ class TestTrainingCenterRefinePromptRobustness:
         assert any(item["type"] == "add" for item in diff)
         assert upserts == []
 
+    def test_structured_preview_fr_handles_quotes_newlines_without_claude(self, monkeypatch):
+        class _ExplodingMessages:
+            def create(self, **kwargs):
+                raise AssertionError("Claude should not be called for Training Center structured refinement")
+
+        class _ExplodingClient:
+            messages = _ExplodingMessages()
+
+        async def fake_get_active_prompt_version(user_id):
+            return {"id": "active-1", "content": self._active_prompt(), "is_active": True}
+
+        async def fake_get_user_singleton_row(table_url, user_id, select="*"):
+            if table_url.endswith("/agent_profiles"):
+                return {"profile": {"language": "fr", "offer_name": "Audit Growth", "price": "2500 EUR"}}
+            if table_url.endswith("/agent_avatars"):
+                return {"avatar": {"persona_summary": "cabinet kiné"}}
+            if table_url.endswith("/agent_sales_rules"):
+                return {"rules": {"do_not_say": ["Pas de hype"]}}
+            return None
+
+        monkeypatch.setattr("main.client", _ExplodingClient())
+        monkeypatch.setattr("main.get_active_prompt_version", fake_get_active_prompt_version)
+        monkeypatch.setattr("main.get_user_singleton_row", fake_get_user_singleton_row)
+
+        result = asyncio.run(refine_prompt(
+            RefinePromptPayload(instruction=self.production_instruction, apply=False),
+            user_id="user-123",
+        ))
+
+        assert isinstance(result, dict)
+        assert result["success"] is True
+        assert result["applied"] is False
+        assert result["already_learned"] is False
+        assert result["target_section"] == "Règles commerciales du Training Center"
+        assert "règle durable" in result["summary"]
+        assert any("Règle ajoutée" in item for item in result["changes"])
+        assert any(item["type"] == "add" for item in result["diff"])
+
     def test_truncated_claude_json_falls_back_without_exposing_jsondecodeerror(self, monkeypatch):
+        calls = {"claude": 0}
+
         class _FakeMessages:
             def create(self, **kwargs):
+                calls["claude"] += 1
                 return types.SimpleNamespace(content=[types.SimpleNamespace(text='{"updated_prompt": "abc')])
 
         class _FakeClient:
@@ -739,6 +781,114 @@ class TestTrainingCenterRefinePromptRobustness:
         assert result["diff"]
         assert "JSONDecodeError" not in json.dumps(result)
         assert "tarif dépend" in result["updated_prompt"]
+        assert calls["claude"] == 0
+
+    def test_preview_already_present_rule_returns_already_learned_without_error(self, monkeypatch):
+        rule = durable_rule_from_refinement_instruction(self.production_instruction)
+        saved_rules = {
+            "do_not_say": [rule],
+            "objection_responses": [rule],
+            "qualification_questions": [self.price_qualification_rule],
+        }
+
+        async def fake_get_user_singleton_row(table_url, user_id, select="*"):
+            if table_url.endswith("/agent_profiles"):
+                return {"profile": {"language": "fr", "offer_name": "Audit Growth", "price": "2500 EUR"}}
+            if table_url.endswith("/agent_avatars"):
+                return {"avatar": {"persona_summary": "cabinet kiné"}}
+            if table_url.endswith("/agent_sales_rules"):
+                return {"rules": saved_rules}
+            return None
+
+        active_prompt = build_training_center_prompt(
+            "BASE PROMPT",
+            {"language": "fr", "offer_name": "Audit Growth", "price": "2500 EUR"},
+            {"persona_summary": "cabinet kiné"},
+            saved_rules,
+        )
+        monkeypatch.setattr("main.get_user_singleton_row", fake_get_user_singleton_row)
+
+        result = asyncio.run(build_structured_refinement_result(
+            "user-123",
+            self.production_instruction,
+            active_prompt,
+            apply=False,
+        ))
+        diff = build_prompt_diff(active_prompt, result["updated_prompt"])
+
+        assert result["already_learned"] is True
+        assert result["rules_changed"] is False
+        assert result["summary"] == "Cette règle est déjà enregistrée dans le Training Center."
+        assert diff == []
+
+    def test_apply_prompt_proposed_same_as_current_is_idempotent_no_prompt_version(self, monkeypatch):
+        rule = durable_rule_from_refinement_instruction(self.production_instruction)
+        saved_rules = {
+            "do_not_say": [rule],
+            "objection_responses": [rule],
+            "qualification_questions": [self.price_qualification_rule],
+        }
+        active_prompt = build_training_center_prompt(
+            "BASE PROMPT",
+            {"language": "fr", "offer_name": "Audit Growth", "price": "2500 EUR"},
+            {"persona_summary": "cabinet kiné"},
+            saved_rules,
+        )
+
+        class _PromptClient:
+            patches = []
+            posts = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def patch(self, *args, **kwargs):
+                self.__class__.patches.append({"args": args, "kwargs": kwargs})
+                raise AssertionError("No prompt version should be deactivated for an idempotent apply")
+
+            async def post(self, *args, **kwargs):
+                self.__class__.posts.append({"args": args, "kwargs": kwargs})
+                raise AssertionError("No prompt version should be inserted for an idempotent apply")
+
+        async def fake_get_active_prompt_version(user_id):
+            return {"id": "active-1", "content": active_prompt, "is_active": True}
+
+        async def fake_get_user_singleton_row(table_url, user_id, select="*"):
+            if table_url.endswith("/agent_profiles"):
+                return {"profile": {"language": "fr", "offer_name": "Audit Growth", "price": "2500 EUR"}}
+            if table_url.endswith("/agent_avatars"):
+                return {"avatar": {"persona_summary": "cabinet kiné"}}
+            if table_url.endswith("/agent_sales_rules"):
+                return {"rules": saved_rules}
+            return None
+
+        async def fake_upsert_user_singleton_row(table_url, user_id, payload):
+            raise AssertionError("Already learned rule should not be upserted again")
+
+        monkeypatch.setattr("main.get_active_prompt_version", fake_get_active_prompt_version)
+        monkeypatch.setattr("main.get_user_singleton_row", fake_get_user_singleton_row)
+        monkeypatch.setattr("main.upsert_user_singleton_row", fake_upsert_user_singleton_row)
+        monkeypatch.setattr("main.httpx.AsyncClient", _PromptClient)
+
+        result = asyncio.run(refine_prompt(
+            RefinePromptPayload(
+                instruction=self.production_instruction,
+                apply=True,
+                prompt_proposed=active_prompt,
+            ),
+            user_id="user-123",
+        ))
+
+        assert isinstance(result, dict)
+        assert result["success"] is True
+        assert result["applied"] is True
+        assert result["already_learned"] is True
+        assert result["prompt_version_id"] is None
+        assert _PromptClient.patches == []
+        assert _PromptClient.posts == []
 
     def test_apply_true_persists_rule_and_prompt_version_after_fallback(self, monkeypatch):
         upserts = []

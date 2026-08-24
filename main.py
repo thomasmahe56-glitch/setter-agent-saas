@@ -1517,6 +1517,51 @@ def merge_rule_list(existing: object, rule: str) -> list[str]:
     return values
 
 
+def normalized_rule_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [re.sub(r"\s+", " ", item).strip().lower() for item in value if isinstance(item, str) and item.strip()]
+
+
+def rules_contain_rule(rules: dict, rule: str) -> bool:
+    normalized_rule = re.sub(r"\s+", " ", rule or "").strip().lower()
+    if not normalized_rule:
+        return False
+    return normalized_rule in normalized_rule_list(rules.get("do_not_say")) or normalized_rule in normalized_rule_list(rules.get("objection_responses"))
+
+
+def structured_refinement_copy(language: str, rule: str, already_learned: bool = False) -> dict:
+    if normalize_tenant_language(language) == "fr":
+        if already_learned:
+            return {
+                "target_section": "Règles commerciales du Training Center",
+                "summary": "Cette règle est déjà enregistrée dans le Training Center.",
+                "changes": [f"Déjà enregistré : {rule}"],
+            }
+        return {
+            "target_section": "Règles commerciales du Training Center",
+            "summary": "La remarque a été transformée en règle durable pour Angellos.",
+            "changes": [
+                f"Règle ajoutée : {rule}",
+                "Angellos a été reconstruit depuis le profil, l’avatar et les règles du Training Center.",
+            ],
+        }
+    if already_learned:
+        return {
+            "target_section": "Training Center sales rules",
+            "summary": "This rule is already saved in the Training Center.",
+            "changes": [f"Already saved: {rule}"],
+        }
+    return {
+        "target_section": "Training Center sales rules",
+        "summary": "Stored the instruction as a durable Training Center rule.",
+        "changes": [
+            f"Added durable rule: {rule}",
+            "Rebuilt Angellos from Training Center profile, avatar, and sales rules.",
+        ],
+    }
+
+
 async def learn_refinement_rule(user_id: str, instruction: str) -> dict:
     rule = durable_rule_from_refinement_instruction(instruction)
     if not rule:
@@ -1602,6 +1647,14 @@ async def build_structured_refinement_result(
     if not isinstance(existing_rules, dict):
         existing_rules = {}
 
+    language = normalize_tenant_language(
+        profile.get("language")
+        or profile.get("preferred_language")
+        or profile.get("default_language")
+        or tenant_language_from_prompt(current_prompt)
+    )
+    already_learned = rules_contain_rule(existing_rules, rule)
+
     next_rules = dict(existing_rules)
     next_rules["do_not_say"] = merge_rule_list(next_rules.get("do_not_say"), rule)
     next_rules["objection_responses"] = merge_rule_list(next_rules.get("objection_responses"), rule)
@@ -1613,21 +1666,25 @@ async def build_structured_refinement_result(
     next_rules = clean_json_value(next_rules)
     if not isinstance(next_rules, dict):
         next_rules = {}
+    existing_rules_clean = clean_json_value(existing_rules)
+    if not isinstance(existing_rules_clean, dict):
+        existing_rules_clean = {}
+    rules_changed = next_rules != existing_rules_clean
 
-    if apply:
+    if apply and rules_changed:
         await upsert_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id, {"rules": next_rules})
 
     updated_prompt = build_training_center_prompt(current_prompt, profile, avatar, next_rules)
+    copy = structured_refinement_copy(language, rule, already_learned=already_learned)
     return {
         "updated_prompt": updated_prompt,
-        "target_section": "Training Center sales rules",
-        "summary": "Stored the instruction as a durable Training Center rule and rebuilt the prompt from structured data.",
-        "changes": [
-            f"Added durable rule: {rule}",
-            "Rebuilt Angellos from Training Center profile, avatar, and sales rules.",
-        ],
+        "target_section": copy["target_section"],
+        "summary": copy["summary"],
+        "changes": copy["changes"],
         "structured_rule": rule,
         "structured_fallback": True,
+        "already_learned": already_learned,
+        "rules_changed": rules_changed,
     }
 
 
@@ -5579,31 +5636,35 @@ async def refine_prompt(
     if payload.active_prompt and not payload.apply:
         current_prompt = payload.active_prompt.strip()
 
-    if payload.apply and payload.prompt_proposed:
-        try:
-            result = normalize_prompt_refinement_result(
-                {
-                    "updated_prompt": payload.prompt_proposed,
-                    "target_section": "User validation",
-                    "summary": "Previewed version validated from the Training Center.",
-                    "changes": [],
-                },
-                current_prompt,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=422, detail=f"Invalid prompt_proposed: {e}")
-    else:
+    try:
+        result = await build_structured_refinement_result(
+            user_id,
+            instruction,
+            current_prompt,
+            apply=payload.apply,
+        )
+    except Exception as structured_error:
         if client is None:
-            raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+            print(
+                "[refine-prompt:structured-invalid] "
+                f"error={type(structured_error).__name__}: {str(structured_error)[:500]} instruction_len={len(instruction)}",
+                flush=True,
+            )
+            return prompt_refinement_error_response(structured_error)
+        fallback_language = tenant_language_from_prompt(current_prompt)
+        fallback_language_label = tenant_language_label(fallback_language)
+        fallback_language_rule = (
+            "French. Return target_section, summary, changes, saved rules, and the updated prompt in natural French."
+            if fallback_language == "fr"
+            else "English. Return target_section, summary, changes, saved rules, and the updated prompt in natural English."
+        )
         system = (
             "You are a senior prompt engineering expert for an Instagram setter agent. "
             "You must modify an existing prompt surgically. "
             "Never rewrite the whole prompt for a minor instruction. "
             "Keep the structure, technical tags, and business data intact unless the modification targets that section. "
-            "Default language is English for Angellos English beta. "
-            "Return every generated rule, summary, change description, workflow update, target section, and saved instruction in English. "
-            "Do not write French unless the user's full business setup is explicitly written in French. "
-            "Never output French section labels such as 'TON RÔLE'; use English labels such as 'Your role'. "
+            f"The tenant default language is {fallback_language_label}. "
+            f"Use this language for every generated rule, summary, change description, workflow update, target section, saved instruction, and prompt update: {fallback_language_rule} "
             "Return only valid JSON, with no markdown."
         )
         user_message = (
@@ -5612,11 +5673,9 @@ async def refine_prompt(
             "Active prompt:\n"
             f"<active_prompt>\n{current_prompt}\n</active_prompt>\n\n"
             "Language rules:\n"
-            "- Angellos is currently in the English beta, so English is the default language.\n"
-            "- Keep the updated prompt, generated rules, target_section, summary, and changes in English.\n"
-            "- If the active prompt contains French headings or rules, translate the modified/saved version into natural English.\n"
-            "- Use labels like 'Your role', 'Qualification process', and 'Orientation flow'. Never use 'TON RÔLE' or other French labels.\n"
-            "- Only use French if the user's full business setup is explicitly written in French.\n\n"
+            f"- Tenant default language: {fallback_language_label}.\n"
+            f"- Keep the updated prompt, generated rules, target_section, summary, and changes in {fallback_language_label}.\n"
+            "- Use another language only for quoted prospect text or if the tenant data explicitly asks for it.\n\n"
             "Analyze which section is concerned: tone, rules, qualification questions, follow-ups, price, objections, links, or guardrails.\n"
             "Apply only the minimum necessary modification. Expected examples:\n"
             '- "He uses too many emojis" => add/reinforce a zero-emoji rule in the tone section.\n'
@@ -5640,7 +5699,7 @@ async def refine_prompt(
             )
             raw = response.content[0].text.strip()
             result = normalize_prompt_refinement_result(parse_llm_json(raw), current_prompt)
-            if looks_like_french_refinement_text(result):
+            if fallback_language != "fr" and looks_like_french_refinement_text(result):
                 retry_message = (
                     f"{user_message}\n\n"
                     "The previous draft used French. Regenerate the same surgical update fully in English. "
@@ -5664,15 +5723,7 @@ async def refine_prompt(
                 f"error={type(e).__name__}: {str(e)[:500]} instruction_len={len(instruction)}",
                 flush=True,
             )
-            try:
-                result = await build_structured_refinement_result(
-                    user_id,
-                    instruction,
-                    current_prompt,
-                    apply=payload.apply,
-                )
-            except Exception as fallback_error:
-                return prompt_refinement_error_response(fallback_error)
+            return prompt_refinement_error_response(e)
 
     updated_prompt = result["updated_prompt"]
     visual_diff = build_prompt_diff(current_prompt, updated_prompt)
@@ -5687,10 +5738,26 @@ async def refine_prompt(
         "changes": result["changes"],
         "instruction": instruction,
         "reset_test_conversation": False,
+        "already_learned": bool(result.get("already_learned")),
+        "rules_changed": bool(result.get("rules_changed", True)),
     }
 
     if not payload.apply:
         print(f"[refine-prompt:preview] instruction_len={len(instruction)} diff_lines={len(visual_diff)}")
+        return response_payload
+
+    if updated_prompt.strip() == current_prompt.strip():
+        response_payload.update({
+            "applied": True,
+            "prompt_version_id": None,
+            "previous_version_id": active_version.get("id"),
+            "refinement_applied_at": now_iso(),
+            "reset_test_conversation": False,
+        })
+        print(
+            "[refine-prompt:apply:no-op] "
+            f"already_learned={response_payload['already_learned']} instruction_len={len(instruction)}"
+        )
         return response_payload
 
     applied_at = now_iso()
