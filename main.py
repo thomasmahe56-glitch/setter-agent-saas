@@ -3335,11 +3335,22 @@ def quality_judge_suggested_rewrite(scenario: dict, reply: str, scores: dict[str
     }
     if min(scores.values()) >= 8:
         return reply
-    return rewrites.get(scenario_id) or "got it. what does your current DM flow look like right now?"
+    if scenario_id in rewrites:
+        return rewrites[scenario_id]
+    history = scenario.get("history") or []
+    last_user_message = simulator_last_user_message(history)
+    normalized_user = normalize_inbound_text(last_user_message)
+    if re.search(r"\b(ai|bot|automated)\b", normalized_user):
+        return "yeah fair question. what gave it away?"
+    if any(marker in normalized_user for marker in ("price", "cost", "how much")):
+        return "depends a bit on your DM volume. roughly how many patient enquiries do you get per week right now?"
+    if any(marker in normalized_user for marker in ("send info", "send details", "link")):
+        return "can do. quick context first, what kind of enquiries are you getting from Instagram right now?"
+    return "got it. what does your current DM flow look like right now?"
 
 
 def judge_simulated_reply_quality(scenario: dict, reply: str, flags: Optional[dict] = None) -> dict:
-    """Deterministic DM Quality Judge v1 for the internal simulator only."""
+    """Deterministic DM Quality Judge v1 for safe test conversations only."""
     flags = flags or {}
     normalized_reply = normalize_inbound_text(reply)
     history = scenario.get("history") or []
@@ -5143,7 +5154,16 @@ async def playground(
         "",
     )
     reply = sanitize_angellos_beta_reply(reply, last_prospect_message)
-    return {"response": reply}
+    judge_scenario = {
+        "id": "training-center-test-conversation",
+        "title": "Training Center test conversation",
+        "description": "Single Training Center playground turn.",
+        "prospect_profile": "Live Training Center test prospect.",
+        "history": clean_json_value(payload.messages),
+    }
+    scoring = score_simulated_reply(judge_scenario, reply)
+    quality_judge = judge_simulated_reply_quality(judge_scenario, reply, scoring.get("flags"))
+    return {"response": reply, "quality_judge": quality_judge}
 
 
 # ── Feedback Loop endpoints ────────────────────────────────────────────────────
