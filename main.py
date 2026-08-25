@@ -1671,9 +1671,6 @@ async def build_structured_refinement_result(
         existing_rules_clean = {}
     rules_changed = next_rules != existing_rules_clean
 
-    if apply and rules_changed:
-        await upsert_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id, {"rules": next_rules})
-
     updated_prompt = build_training_center_prompt(current_prompt, profile, avatar, next_rules)
     copy = structured_refinement_copy(language, rule, already_learned=already_learned)
     return {
@@ -1685,6 +1682,7 @@ async def build_structured_refinement_result(
         "structured_fallback": True,
         "already_learned": already_learned,
         "rules_changed": rules_changed,
+        "next_rules": next_rules,
     }
 
 
@@ -5725,7 +5723,8 @@ async def refine_prompt(
             )
             return prompt_refinement_error_response(e)
 
-    updated_prompt = result["updated_prompt"]
+    proposed_prompt = payload.prompt_proposed.strip() if payload.apply and payload.prompt_proposed else None
+    updated_prompt = proposed_prompt or result["updated_prompt"]
     visual_diff = build_prompt_diff(current_prompt, updated_prompt)
     response_payload = {
         "success": True,
@@ -5762,6 +5761,9 @@ async def refine_prompt(
 
     applied_at = now_iso()
     try:
+        if result.get("rules_changed") and isinstance(result.get("next_rules"), dict):
+            await upsert_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id, {"rules": result["next_rules"]})
+
         async with httpx.AsyncClient() as http:
             res = await http.patch(
                 SUPABASE_PROMPT_VERSIONS_URL,
