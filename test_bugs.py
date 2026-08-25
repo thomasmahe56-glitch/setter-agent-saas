@@ -27,6 +27,7 @@ from main import (
     build_generation_prompt,
     build_structured_refinement_result,
     build_prompt_diff,
+    build_prospecting_context_payload,
     build_training_center_prompt,
     default_automation_mode_for_prompt,
     durable_rule_from_refinement_instruction,
@@ -87,6 +88,49 @@ class _PatchCaptureAsyncClient:
     async def patch(self, *args, **kwargs):
         self.__class__.patches.append({"args": args, "kwargs": kwargs})
         return _PatchResponse()
+
+
+class TestProspectingContextPayload:
+    def test_builds_sanitized_context_from_training_center_rows(self):
+        payload = build_prospecting_context_payload(
+            "user-1",
+            {"profile": {
+                "business_name": "TrainToRehab",
+                "language": "fr",
+                "niche": "Kinés et coachs rehab",
+                "offer_name": "Programme Rehab Growth",
+                "offer_promise": "Transformer les DMs Instagram en appels qualifiés",
+                "offer_format": "8 semaines",
+                "tone_rules": ["Direct et humain"],
+                "forbidden_phrases": ["garanti"],
+                "next_step": "audit",
+            }},
+            {"avatar": {
+                "persona_summary": "Professionnels rehab qui vendent via Instagram",
+                "pain_points": ["perdent des demandes en DM"],
+                "buying_triggers": ["reçoit des demandes Instagram"],
+                "bad_fit": ["étudiant sans offre"],
+            }},
+            {"rules": {
+                "qualification_questions": ["Demander l'offre actuelle"],
+                "buying_signals": ["a déjà des prospects"],
+                "red_flags": ["pas de business"],
+                "do_not_say": ["IA"],
+                "call_offer_conditions": ["si besoin clair"],
+            }},
+        )
+        assert payload["is_complete"] is True
+        assert payload["source"] == "training_center"
+        assert payload["business_name"] == "TrainToRehab"
+        assert "Programme Rehab Growth" in payload["offer_summary"]
+        assert "Professionnels rehab" in payload["ideal_customer_profile"]
+        assert "IA" in payload["forbidden_phrases"]
+        assert "content" not in payload
+
+    def test_reports_missing_training_center_fields(self):
+        payload = build_prospecting_context_payload("user-1", {"profile": {}}, {"avatar": {}}, {"rules": {}})
+        assert payload["is_complete"] is False
+        assert "business_name" in payload["missing_fields"]
 
 
 # ===========================================================================

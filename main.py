@@ -1723,6 +1723,93 @@ def summarize_agent_sales_rules(sales_rules_row: Optional[dict]) -> list[str]:
     return summaries[:6]
 
 
+def _clean_string_list(value: object, limit: int = 12) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        return []
+    cleaned: list[str] = []
+    for item in values:
+        if not isinstance(item, str):
+            continue
+        text = re.sub(r"\s+", " ", item).strip()
+        if text:
+            cleaned.append(text[:500])
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def build_prospecting_context_payload(
+    user_id: str,
+    profile_row: Optional[dict],
+    avatar_row: Optional[dict],
+    sales_rules_row: Optional[dict],
+) -> dict:
+    profile = (profile_row or {}).get("profile") or {}
+    avatar = (avatar_row or {}).get("avatar") or {}
+    rules = (sales_rules_row or {}).get("rules") or {}
+    if not isinstance(profile, dict):
+        profile = {}
+    if not isinstance(avatar, dict):
+        avatar = {}
+    if not isinstance(rules, dict):
+        rules = {}
+
+    offer_parts = _clean_string_list([
+        str(profile.get("offer_name") or ""),
+        str(profile.get("offer_promise") or ""),
+        str(profile.get("offer_format") or ""),
+        str(profile.get("price") or ""),
+    ], limit=8)
+    ideal_customer_parts = _clean_string_list([
+        str(avatar.get("persona_summary") or ""),
+        str(avatar.get("current_situation") or ""),
+        str(avatar.get("desired_situation") or ""),
+    ], limit=8)
+    ideal_customer_parts.extend(_clean_string_list(avatar.get("pain_points"), limit=6))
+
+    positive_signals = _clean_string_list(avatar.get("buying_triggers"), limit=8)
+    positive_signals.extend(_clean_string_list(rules.get("buying_signals"), limit=8))
+    negative_signals = _clean_string_list(avatar.get("bad_fit"), limit=8)
+    negative_signals.extend(_clean_string_list(rules.get("red_flags"), limit=8))
+    negative_signals.extend(_clean_string_list(rules.get("stop_conditions"), limit=8))
+
+    forbidden_phrases = _clean_string_list(profile.get("forbidden_phrases"), limit=12)
+    forbidden_phrases.extend(_clean_string_list(rules.get("do_not_say"), limit=12))
+
+    next_step = "\n".join(_clean_string_list([
+        str(profile.get("next_step") or ""),
+        str(profile.get("calendly_url") or ""),
+        str(profile.get("sales_page_url") or ""),
+        *(_clean_string_list(rules.get("call_offer_conditions"), limit=6)),
+    ], limit=10)).strip()
+
+    context = {
+        "user_id": user_id,
+        "business_name": str(profile.get("business_name") or "").strip(),
+        "niche": str(profile.get("niche") or "").strip(),
+        "offer_summary": "\n".join(offer_parts).strip(),
+        "ideal_customer_profile": "\n".join(ideal_customer_parts).strip(),
+        "positive_signals": positive_signals[:12],
+        "negative_signals": negative_signals[:12],
+        "qualification_rules": _clean_string_list(rules.get("qualification_questions"), limit=12),
+        "tone": "\n".join(_clean_string_list([str(profile.get("voice_profile") or ""), *(_clean_string_list(profile.get("tone_rules"), limit=8))], limit=10)).strip(),
+        "language": normalize_tenant_language(profile.get("language") or "en"),
+        "forbidden_phrases": forbidden_phrases[:16],
+        "first_dm_style": "Short, natural, personalized, no product pitch, no AI/beta/tool mention, oriented toward a reply.",
+        "next_step": next_step,
+        "source": "training_center",
+    }
+    required = ["business_name", "niche", "offer_summary", "ideal_customer_profile"]
+    missing = [field for field in required if not str(context.get(field) or "").strip()]
+    context["is_complete"] = not missing
+    context["missing_fields"] = missing
+    return context
+
+
 def format_agent_profile_for_prompt(profile: dict) -> str:
     labels = {
         "avatar_client": "Client avatar",
@@ -6081,6 +6168,27 @@ async def get_training_center(
         },
     }
     return response_payload
+
+
+@app.get("/agent/prospecting-context")
+async def get_prospecting_context_from_training_center(
+    user_id: str = Query(..., min_length=1, max_length=80),
+    x_dashboard_secret: Optional[str] = Header(default=None),
+):
+    """Return sanitized Training Center context for the Prospecting backend.
+
+    This endpoint is backend-to-backend only: it requires DASHBOARD_SECRET and
+    returns derived business context, not raw prompt_versions content.
+    """
+    require_dashboard_secret(x_dashboard_secret)
+    try:
+        profile = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id)
+        avatar = await get_user_singleton_row(SUPABASE_AGENT_AVATARS_URL, user_id)
+        sales_rules = await get_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase error: {e}")
+
+    return build_prospecting_context_payload(user_id, profile, avatar, sales_rules)
 
 
 @app.post("/agent/profile/save")
