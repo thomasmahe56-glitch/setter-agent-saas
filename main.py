@@ -6,6 +6,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from config import load_config
 from prompts import build_system_prompt, build_analysis_prompt, build_follow_up_prompt, build_conversation_review_prompt
+from collections import Counter
 from dataclasses import dataclass
 import hmac
 import httpx
@@ -3207,6 +3208,307 @@ async def run_daily_conversation_review_job(user_id: str, review_date: Optional[
     }
 
 
+def aggregate_postmortem_reviews(reviews: list[dict]) -> dict:
+    failed_reviews = [review for review in reviews if review.get("failure_category") != "objective_reached"]
+    category_counts = Counter(clean_text(review.get("failure_category")) or "other" for review in failed_reviews)
+    top_failures = [
+        {"failure_category": category, "count": count}
+        for category, count in category_counts.most_common(8)
+    ]
+
+    def top_text_values(field: str, max_items: int = 12) -> list[dict]:
+        values = [clean_text(review.get(field)) for review in failed_reviews]
+        values = [value for value in values if value]
+        counts = Counter(values)
+        return [{"text": text, "count": count} for text, count in counts.most_common(max_items)]
+
+    return {
+        "top_failures": top_failures,
+        "prompt_rule_candidates": top_text_values("prompt_rule_candidate"),
+        "lessons_learned": top_text_values("lesson_learned"),
+        "score_averages": {
+            "human_likeness_score": average_review_score(reviews, "human_likeness_score"),
+            "sales_effectiveness_score": average_review_score(reviews, "sales_effectiveness_score"),
+            "engagement_score": average_review_score(reviews, "engagement_score"),
+        },
+    }
+
+
+def average_review_score(reviews: list[dict], key: str) -> Optional[float]:
+    scores = []
+    for review in reviews:
+        value = review.get(key)
+        if value is None:
+            continue
+        try:
+            scores.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    if not scores:
+        return None
+    return round(sum(scores) / len(scores), 2)
+
+
+def build_postmortem_synthesis_message(active_prompt: str, aggregate: dict, reviews: list[dict], days: int) -> str:
+    review_summaries = []
+    for review in reviews[:40]:
+        review_summaries.append({
+            "conversation_id": review.get("conversation_id"),
+            "username": review.get("username"),
+            "objective_reached": review.get("objective_reached"),
+            "failure_category": review.get("failure_category"),
+            "human_likeness_score": review.get("human_likeness_score"),
+            "sales_effectiveness_score": review.get("sales_effectiveness_score"),
+            "engagement_score": review.get("engagement_score"),
+            "moment_of_failure": review.get("moment_of_failure"),
+            "lesson_learned": review.get("lesson_learned"),
+            "prompt_rule_candidate": review.get("prompt_rule_candidate"),
+        })
+    return (
+        f"Run a weekly post-mortem on Angellos conversations from the last {days} days.\n\n"
+        "=== ACTIVE PROMPT ===\n"
+        f"{active_prompt[:30000]}\n\n"
+        "=== AGGREGATED REVIEW PATTERNS ===\n"
+        f"{json.dumps(aggregate, ensure_ascii=False, indent=2)}\n\n"
+        "=== REVIEW SUMMARIES ===\n"
+        f"{json.dumps(review_summaries, ensure_ascii=False, indent=2)}\n\n"
+        "Decide whether recurring failures justify a surgical prompt update. Focus especially on repetition, robotic tone, AI detection risk, stacked questions, premature pitch/call push, bad emotional read, and niche/offer/language mismatch.\n"
+        "If the evidence is weak or non-recurring, set prompt_proposed exactly equal to the active prompt.\n"
+        "If you change the prompt, preserve structure and business facts; add only durable behavioral rules supported by repeated failures.\n"
+        "Return ONLY valid JSON with this shape:\n"
+        "{\n"
+        '  "prompt_proposed": "<complete prompt, changed only if justified>",\n'
+        '  "diff": [{"line": "<line text>", "type": "add|remove|keep", "justification": "<why this line matters; blank for keep>"}],\n'
+        '  "summary": "<French human-readable summary of the recurring patterns and proposed rule>"\n'
+        "}\n"
+    )
+
+
+def normalize_postmortem_synthesis(raw_result: dict, active_prompt: str) -> dict:
+    proposed = clean_text(raw_result.get("prompt_proposed")) or active_prompt
+    if not proposed.strip():
+        proposed = active_prompt
+    raw_diff_value = raw_result.get("diff")
+    raw_diff = raw_diff_value if isinstance(raw_diff_value, list) else []
+    diff = []
+    for item in raw_diff[:200]:
+        if not isinstance(item, dict):
+            continue
+        line_type = clean_text(item.get("type"))
+        if line_type not in {"add", "remove", "keep"}:
+            line_type = "keep"
+        diff.append({
+            "line": clean_text(item.get("line")),
+            "type": line_type,
+            "justification": clean_text(item.get("justification")),
+        })
+    if not diff and proposed.strip() != active_prompt.strip():
+        diff = [
+            {**line, "justification": line.get("justification", "")}
+            for line in build_prompt_diff(active_prompt, proposed)
+        ]
+    return {
+        "prompt_proposed": proposed,
+        "diff": diff,
+        "summary": clean_text(raw_result.get("summary")) or "Post-mortem hebdomadaire: aucune règle récurrente suffisamment forte détectée.",
+    }
+
+
+async def synthesize_postmortem_prompt(active_prompt: str, aggregate: dict, reviews: list[dict], days: int) -> dict:
+    if client is None:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+    user_message = build_postmortem_synthesis_message(active_prompt, aggregate, reviews, days)
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=8192,
+        system=(
+            "You are a senior prompt engineer reviewing Angellos post-mortems. "
+            "You propose inactive prompt candidates only; never activate them. "
+            "Make minimal, evidence-backed prompt changes. Return strict JSON only."
+        ),
+        messages=[{"role": "user", "content": user_message}],
+    )
+    raw = getattr(response.content[0], "text", "").strip()
+    return normalize_postmortem_synthesis(parse_llm_json(raw), active_prompt)
+
+
+async def fetch_existing_postmortem_prompt_version(user_id: str, start: datetime) -> Optional[dict]:
+    async with httpx.AsyncClient() as http:
+        params = {
+            "source": "eq.postmortem",
+            "created_at": f"gte.{start.isoformat()}",
+            "order": "created_at.desc",
+            "limit": "1",
+            "select": "id,created_at,is_active,source,refinement_instruction,prompt_diff,previous_version_id",
+            **owner_scope(user_id),
+        }
+        try:
+            res = await http.get(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params=params,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        except httpx.HTTPStatusError as select_error:
+            if not is_supabase_schema_cache_error(select_error):
+                raise
+            print(
+                "[reviews:postmortem:schema-fallback] "
+                f"status={select_error.response.status_code} body={select_error.response.text[:1000]}"
+            )
+            fallback_params = dict(params)
+            fallback_params["select"] = "id,created_at,is_active,source"
+            res = await http.get(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params=fallback_params,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        rows = res.json()
+    return rows[0] if rows else None
+
+
+async def insert_postmortem_prompt_version(user_id: str, active_version: dict, synthesis: dict) -> dict:
+    active_prompt = active_version.get("content") or build_system_prompt(config)
+    prompt_changed = synthesis["prompt_proposed"].strip() != active_prompt.strip()
+    insert_payload = {
+        **row_owner_fields(user_id),
+        "content": synthesis["prompt_proposed"],
+        "is_active": False,
+        "source": "postmortem",
+        "insight_id": None,
+        "refinement_instruction": synthesis["summary"],
+        "previous_version_id": active_version.get("id"),
+        "prompt_diff": synthesis["diff"],
+    }
+    async with httpx.AsyncClient() as http:
+        try:
+            res = await http.post(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=representation"},
+                json=insert_payload,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        except httpx.HTTPStatusError as insert_error:
+            if not is_supabase_schema_cache_error(insert_error):
+                raise
+            print(
+                "[reviews:postmortem:insert:schema-fallback] "
+                f"status={insert_error.response.status_code} body={insert_error.response.text[:1000]}"
+            )
+            legacy_payload = {
+                **row_owner_fields(user_id),
+                "content": synthesis["prompt_proposed"],
+                "is_active": False,
+                "source": "postmortem",
+                "insight_id": None,
+            }
+            res = await http.post(
+                SUPABASE_PROMPT_VERSIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=representation"},
+                json=legacy_payload,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        created = res.json()
+    version = created[0] if isinstance(created, list) else created
+    return {**version, "prompt_changed": prompt_changed}
+
+
+async def run_weekly_conversation_postmortem_job(user_id: str, days: int = 7, limit: int = 200) -> dict:
+    if client is None:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+    bounded_days = min(max(days, 1), 30)
+    bounded_limit = min(max(limit, 1), 200)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=bounded_days)
+
+    existing = await fetch_existing_postmortem_prompt_version(user_id, start)
+    if existing:
+        return {
+            "success": True,
+            "duplicate_skipped": True,
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+            "selected": 0,
+            "reviewed": 0,
+            "top_failures": [],
+            "prompt_version_id": existing.get("id"),
+            "prompt_changed": False,
+            "is_active": existing.get("is_active"),
+            "source": existing.get("source"),
+            "summary": existing.get("refinement_instruction"),
+        }
+
+    conversations = await fetch_conversations_for_review(user_id, start, end, bounded_limit)
+    if not conversations:
+        return {
+            "success": True,
+            "duplicate_skipped": False,
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+            "selected": 0,
+            "reviewed": 0,
+            "top_failures": [],
+            "prompt_version_id": None,
+            "prompt_changed": False,
+            "summary": "Aucune conversation active trouvée dans la fenêtre.",
+        }
+
+    active_prompt_for_review = await get_active_prompt(user_id)
+    active_version = await get_active_prompt_version(user_id)
+    active_prompt_for_candidate = active_version.get("content") or build_system_prompt(config)
+    reviews = []
+    errors = []
+    for conversation in conversations:
+        try:
+            reviews.append(await review_single_conversation(conversation, active_prompt_for_review))
+        except Exception as e:
+            print(f"[reviews:postmortem] failed conversation_id={conversation.get('id')} error={e}")
+            errors.append({"conversation_id": conversation.get("id"), "error": str(e)[:300]})
+
+    if not reviews:
+        return {
+            "success": False,
+            "duplicate_skipped": False,
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+            "selected": len(conversations),
+            "reviewed": 0,
+            "errors": errors,
+            "top_failures": [],
+            "prompt_version_id": None,
+            "prompt_changed": False,
+            "summary": "Aucune review exploitable générée.",
+        }
+
+    aggregate = aggregate_postmortem_reviews(reviews)
+    synthesis = await synthesize_postmortem_prompt(active_prompt_for_candidate, aggregate, reviews, bounded_days)
+    new_version = await insert_postmortem_prompt_version(user_id, active_version, synthesis)
+
+    return {
+        "success": len(errors) == 0,
+        "duplicate_skipped": False,
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+        "selected": len(conversations),
+        "reviewed": len(reviews),
+        "errors": errors,
+        "top_failures": aggregate["top_failures"],
+        "prompt_rule_candidates": aggregate["prompt_rule_candidates"],
+        "prompt_version_id": new_version.get("id"),
+        "previous_version_id": active_version.get("id"),
+        "prompt_changed": bool(new_version.get("prompt_changed")),
+        "is_active": new_version.get("is_active"),
+        "source": new_version.get("source"),
+        "summary": synthesis["summary"],
+        "prompt_diff": synthesis["diff"],
+    }
+
+
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
 class WebhookPayload(BaseModel):
@@ -3235,6 +3537,12 @@ class DailyReviewPayload(BaseModel):
     review_date: Optional[str] = Field(default=None, max_length=10)
     limit: int = 200
     conversation_id: Optional[str] = Field(default=None, max_length=200)
+
+
+class PostmortemReviewPayload(BaseModel):
+    user_id: str = Field(max_length=200)
+    days: int = 7
+    limit: int = 200
 
 
 class ReviewLessonStatusPayload(BaseModel):
@@ -5515,6 +5823,30 @@ async def run_daily_reviews(
     print(
         f"[reviews:daily] user_id={user_id} date={result['review_date']} "
         f"selected={result['selected']} stored={result['stored']} errors={len(result.get('errors', []))}"
+    )
+    return result
+
+
+@app.post("/reviews/postmortem")
+async def run_postmortem_reviews(
+    payload: PostmortemReviewPayload,
+    x_dashboard_secret: Optional[str] = Header(default=None),
+):
+    """Weekly post-mortem trigger: creates an inactive prompt candidate only."""
+    require_dashboard_secret(x_dashboard_secret)
+    user_id = payload.user_id.strip()
+    if not user_id:
+        raise HTTPException(status_code=422, detail="user_id is required")
+    result = await run_weekly_conversation_postmortem_job(
+        user_id=user_id,
+        days=payload.days,
+        limit=payload.limit,
+    )
+    print(
+        f"[reviews:postmortem] user_id={user_id} days={min(max(payload.days, 1), 30)} "
+        f"selected={result['selected']} reviewed={result['reviewed']} "
+        f"prompt_version_id={result.get('prompt_version_id')} active={result.get('is_active')} "
+        f"duplicate_skipped={result.get('duplicate_skipped')}"
     )
     return result
 
