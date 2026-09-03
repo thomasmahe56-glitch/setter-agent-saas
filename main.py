@@ -1803,12 +1803,47 @@ def build_prospecting_context_payload(
         "first_dm_style": "Short, natural, personalized, no product pitch, no AI/beta/tool mention, oriented toward a reply.",
         "next_step": next_step,
         "source": "training_center",
+        "icp_constraints": build_icp_constraints(profile),
     }
     required = ["business_name", "niche", "offer_summary", "ideal_customer_profile"]
     missing = [field for field in required if not str(context.get(field) or "").strip()]
     context["is_complete"] = not missing
     context["missing_fields"] = missing
     return context
+
+
+def build_icp_constraints(profile: dict) -> dict:
+    """Return the tenant's structured ICP constraints as a direct copy.
+
+    No LLM inference here: these are typed business fields persisted in
+    `agent_profiles.profile`. The prospecting generator copies them verbatim.
+    """
+    require_active = profile.get("require_active")
+    if require_active is None:
+        require_active = True
+    else:
+        require_active = bool(require_active)
+
+    niche_exceptions: list[dict[str, str]] = []
+    raw_exceptions = profile.get("niche_exceptions")
+    if isinstance(raw_exceptions, list):
+        for item in raw_exceptions:
+            if not isinstance(item, dict):
+                continue
+            condition = str(item.get("condition") or "").strip()
+            override = str(item.get("override") or item.get("alternative_rule") or "").strip()
+            if condition:
+                niche_exceptions.append({"condition": condition, "override": override})
+
+    markets = [str(m).strip() for m in (profile.get("markets") or []) if str(m).strip()]
+
+    return {
+        "min_followers": _coerce_int(profile.get("min_followers")),
+        "markets": markets,
+        "exclude_corporate": bool(profile.get("exclude_corporate")),
+        "require_active": require_active,
+        "niche_exceptions": niche_exceptions,
+    }
 
 
 def format_agent_profile_for_prompt(profile: dict) -> str:
@@ -3588,6 +3623,14 @@ class AgentProfilePayload(BaseModel):
     forbidden_phrases: str = ""
 
 
+class NicheExceptionPayload(BaseModel):
+    """A single structured ICP exception (e.g. a niche where the follower floor
+    does not apply and engagement/views are judged instead)."""
+
+    condition: str = Field(default="", max_length=200)
+    override: str = Field(default="", max_length=200)
+
+
 class TrainingProfilePayload(BaseModel):
     language: str = Field(default="en", max_length=20)
     business_name: str = Field(default="", max_length=300)
@@ -3607,6 +3650,13 @@ class TrainingProfilePayload(BaseModel):
     next_step: str = Field(default="", max_length=5000)
     voice_profile: str = Field(default="", max_length=10000)
     knowledge_sources: list[str] = Field(default_factory=list)
+    # Structured ICP constraints (source of truth for discovery hard filters).
+    # These are business data, not free text: the generator copies them verbatim.
+    min_followers: Optional[int] = Field(default=None, ge=0)
+    markets: list[str] = Field(default_factory=list)
+    exclude_corporate: bool = False
+    require_active: bool = True
+    niche_exceptions: list[NicheExceptionPayload] = Field(default_factory=list)
 
 
 class AvatarGeneratePayload(BaseModel):

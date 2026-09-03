@@ -28,6 +28,7 @@ from main import (
     build_structured_refinement_result,
     build_prompt_diff,
     build_prospecting_context_payload,
+    build_icp_constraints,
     build_training_center_prompt,
     default_automation_mode_for_prompt,
     durable_rule_from_refinement_instruction,
@@ -131,6 +132,48 @@ class TestProspectingContextPayload:
         payload = build_prospecting_context_payload("user-1", {"profile": {}}, {"avatar": {}}, {"rules": {}})
         assert payload["is_complete"] is False
         assert "business_name" in payload["missing_fields"]
+
+    def test_exposes_structured_icp_constraints_direct_copy(self):
+        payload = build_prospecting_context_payload(
+            "user-1",
+            {"profile": {
+                "business_name": "TrainToRehab",
+                "niche": "Coachs",
+                "offer_name": "Programme",
+                "min_followers": 8000,
+                "markets": ["France", "Belgique"],
+                "exclude_corporate": True,
+                "require_active": False,
+                "niche_exceptions": [{"condition": "addiction", "override": "engagement_based"}],
+            }},
+            {"avatar": {}},
+            {"rules": {}},
+        )
+        constraints = payload["icp_constraints"]
+        assert constraints["min_followers"] == 8000
+        assert constraints["markets"] == ["France", "Belgique"]
+        assert constraints["exclude_corporate"] is True
+        assert constraints["require_active"] is False
+        assert constraints["niche_exceptions"] == [{"condition": "addiction", "override": "engagement_based"}]
+
+    def test_icp_constraints_defaults_when_absent(self):
+        payload = build_prospecting_context_payload("user-1", {"profile": {}}, {"avatar": {}}, {"rules": {}})
+        constraints = payload["icp_constraints"]
+        assert constraints["min_followers"] is None
+        assert constraints["markets"] == []
+        assert constraints["exclude_corporate"] is False
+        assert constraints["require_active"] is True
+        assert constraints["niche_exceptions"] == []
+
+    def test_build_icp_constraints_normalizes_alternative_rule_key(self):
+        constraints = build_icp_constraints({
+            "min_followers": "8000",
+            "markets": [" France ", "", "Suisse"],
+            "niche_exceptions": [{"condition": "addiction", "alternative_rule": "views/engagement"}],
+        })
+        assert constraints["min_followers"] == 8000
+        assert constraints["markets"] == ["France", "Suisse"]
+        assert constraints["niche_exceptions"] == [{"condition": "addiction", "override": "views/engagement"}]
 
 
 # ===========================================================================
