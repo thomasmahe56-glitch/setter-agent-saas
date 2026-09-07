@@ -96,6 +96,13 @@ class CostCapExceededError(Exception):
         self.user_message = AI_COST_BLOCK_USER_MESSAGE
 
 
+class AiSpendUnavailableError(Exception):
+    def __init__(self, user_id: str):
+        super().__init__(f"AI spend is unavailable for user {user_id}; failing closed")
+        self.user_id = user_id
+        self.user_message = AI_COST_BLOCK_USER_MESSAGE
+
+
 @dataclass
 class AiGenerationUsage:
     provider: str
@@ -359,8 +366,8 @@ def cors_allowed_origins() -> list[str]:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_allowed_origins(),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["authorization", "content-type", "x-dashboard-secret", "x-webhook-secret", "x-hub-signature-256", "x-angellos-route-scope"],
 )
 
 
@@ -575,7 +582,7 @@ async def get_ai_spend_breakdown(user_id: str) -> dict:
                     return {**empty, "spent_eur": fallback, "spent_eur_estimated_fallback": fallback, "cost_source_breakdown": {"profile_estimated_fallback": fallback}}
                 except Exception as profile_error:
                     print(f"[ai-cost:usage] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
-                    return empty
+                    return {**empty, "usage_available": False}
             breakdown = {**empty, "cost_source_breakdown": {}, "provider_breakdown": {}}
             for row in res.json():
                 source = row.get("cost_source") or ("provider_usage_priced" if row.get("cost_eur") is not None else "estimated_fallback")
@@ -603,11 +610,14 @@ async def get_ai_spend_breakdown(user_id: str) -> dict:
             return {**empty, "spent_eur": fallback, "spent_eur_estimated_fallback": fallback, "cost_source_breakdown": {"profile_estimated_fallback": fallback}}
         except Exception as profile_error:
             print(f"[ai-cost:usage] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
-            return empty
+            return {**empty, "usage_available": False}
 
 
 async def get_estimated_ai_spend_eur(user_id: str) -> float:
-    return float((await get_ai_spend_breakdown(user_id)).get("spent_eur") or 0.0)
+    spend = await get_ai_spend_breakdown(user_id)
+    if spend.get("usage_available") is False:
+        raise AiSpendUnavailableError(user_id)
+    return float(spend.get("spent_eur") or 0.0)
 
 
 async def enforce_ai_cost_cap(user_id: str) -> dict:
@@ -697,7 +707,15 @@ async def record_ai_usage_event(
     return row
 
 
-def cost_cap_error_payload(error: CostCapExceededError) -> dict:
+def cost_cap_error_payload(error: CostCapExceededError | AiSpendUnavailableError) -> dict:
+    if isinstance(error, AiSpendUnavailableError):
+        return {
+            "ok": False,
+            "error_type": "ai_spend_unavailable",
+            "message": error.user_message,
+            "user_message": error.user_message,
+            "fail_closed": True,
+        }
     return {
         "ok": False,
         "error_type": "ai_cost_cap_reached",
@@ -713,6 +731,12 @@ def require_dashboard_secret(x_dashboard_secret: Optional[str]) -> None:
         raise HTTPException(status_code=500, detail="DASHBOARD_SECRET is not configured")
     if not x_dashboard_secret or not hmac.compare_digest(x_dashboard_secret, DASHBOARD_SECRET):
         raise HTTPException(status_code=401, detail="Invalid dashboard secret")
+
+
+def require_route_scope(x_angellos_route_scope: Optional[str], expected: str) -> None:
+    actual = x_angellos_route_scope if isinstance(x_angellos_route_scope, str) else ""
+    if actual.strip().lower() != expected:
+        raise HTTPException(status_code=403, detail=f"{expected} route scope required")
 
 
 async def require_jwt(authorization: Optional[str] = Header(default=None)) -> str:
@@ -4202,31 +4226,6 @@ async def handle_inbound_message(
             "conversation_id": contact.get("id"),
         }
 
-    try:
-        await enforce_ai_cost_cap(user_id)
-    except CostCapExceededError as e:
-        patch_data["pending_message"] = None
-        patch_data["pending_message_at"] = None
-        async with httpx.AsyncClient() as http:
-            res = await http.patch(
-                SUPABASE_CONVERSATIONS_URL,
-                headers={**supabase_headers(), "Prefer": "return=minimal"},
-                params={"id": f"eq.{contact.get('id')}", "user_id": f"eq.{user_id}"},
-                json=patch_data,
-                timeout=10.0,
-            )
-            res.raise_for_status()
-        return {
-            "reply": "",
-            "sent": False,
-            "should_send": False,
-            "mode": automation_mode,
-            "skipped": True,
-            "reason": "ai_cost_cap_reached",
-            "error": cost_cap_error_payload(e),
-            "conversation_id": contact.get("id"),
-        }
-
     active_prompt = await get_active_prompt(contact.get("user_id"))
     system_prompt = build_generation_prompt(active_prompt)
     if client is None:
@@ -4261,6 +4260,30 @@ async def handle_inbound_message(
     if canned_reply:
         reply, should_stop_agent = canned_reply
     else:
+        try:
+            await enforce_ai_cost_cap(user_id)
+        except (CostCapExceededError, AiSpendUnavailableError) as e:
+            patch_data["pending_message"] = None
+            patch_data["pending_message_at"] = None
+            async with httpx.AsyncClient() as http:
+                res = await http.patch(
+                    SUPABASE_CONVERSATIONS_URL,
+                    headers={**supabase_headers(), "Prefer": "return=minimal"},
+                    params={"id": f"eq.{contact.get('id')}", "user_id": f"eq.{user_id}"},
+                    json=patch_data,
+                    timeout=10.0,
+                )
+                res.raise_for_status()
+            return {
+                "reply": "",
+                "sent": False,
+                "should_send": False,
+                "mode": automation_mode,
+                "skipped": True,
+                "reason": "ai_cost_guard_unavailable" if isinstance(e, AiSpendUnavailableError) else "ai_cost_cap_reached",
+                "error": cost_cap_error_payload(e),
+                "conversation_id": contact.get("id"),
+            }
         first_turn = not history
         prospect_label = "Prospect WhatsApp" if channel == "whatsapp" else "Prospect Instagram"
         user_content = (
@@ -5215,8 +5238,10 @@ async def refine_pending(
 async def seed_conversation(
     body: dict,
     x_dashboard_secret: Optional[str] = Header(default=None),
+    x_angellos_route_scope: Optional[str] = Header(default=None),
 ) -> dict:
     require_dashboard_secret(x_dashboard_secret)
+    require_route_scope(x_angellos_route_scope, "interservice")
 
     username = (body.get("username") or "").strip().lower()
     first_dm = (body.get("first_dm") or "").strip()
@@ -5240,7 +5265,14 @@ async def seed_conversation(
         "status": "nouveau",
         "agent_active": True,
         "history": [
-            {"role": "assistant", "content": first_dm, "timestamp": now, "sent": True}
+            {
+                "role": "assistant",
+                "content": first_dm,
+                "timestamp": now,
+                "sent": False,
+                "delivery_status": "draft_generated",
+                "source": "prospecting_seed",
+            }
         ],
         "channel": "instagram",
         "external_contact_id": username,
@@ -5519,7 +5551,7 @@ async def send_auto_23h_follow_up(
 
     try:
         await enforce_ai_cost_cap(user_id)
-    except CostCapExceededError as e:
+    except (CostCapExceededError, AiSpendUnavailableError) as e:
         raise HTTPException(status_code=402, detail=cost_cap_error_payload(e))
     generation = await generate_follow_up_result(
         conversation,
@@ -5592,10 +5624,12 @@ async def send_auto_23h_follow_up(
 @app.post("/follow-ups/cron-auto-check")
 async def cron_auto_follow_up_check(
     x_dashboard_secret: Optional[str] = Header(default=None),
+    x_angellos_route_scope: Optional[str] = Header(default=None),
 ):
     """Cron endpoint: scan all conversations and send auto 23h follow-ups for due ones.
     Replaces the ManyChat trigger that doesn't fire reliably."""
     require_dashboard_secret(x_dashboard_secret)
+    require_route_scope(x_angellos_route_scope, "admin")
 
     results = {"checked": 0, "auto_sent": 0, "errors": 0, "details": []}
 
@@ -5713,6 +5747,10 @@ async def playground(
 
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+    try:
+        await enforce_ai_cost_cap(user_id)
+    except (CostCapExceededError, AiSpendUnavailableError) as e:
+        raise HTTPException(status_code=402, detail=cost_cap_error_payload(e))
     system_prompt = build_generation_prompt(await get_active_prompt(user_id))
     if payload.calendly_url or payload.sales_page_url:
         system_prompt = append_agent_options(
@@ -5721,9 +5759,18 @@ async def playground(
             sales_page_url=(payload.sales_page_url or "").strip(),
         )
     try:
-        reply = generate_claude_reply(payload.messages, system_prompt)
+        generation = generate_claude_generation(payload.messages, system_prompt)
+        reply = generation.text
     except ProviderGenerationError as e:
         return provider_error_response(e)
+    await record_ai_usage_event(
+        user_id,
+        "playground",
+        json.dumps(payload.messages, ensure_ascii=False),
+        reply,
+        usage=generation.usage,
+        request_kind="playground",
+    )
     last_prospect_message = next(
         ((msg.get("content") or "") for msg in reversed(payload.messages) if msg.get("role") == "user"),
         "",
@@ -6614,6 +6661,10 @@ async def generate_agent_avatar(
 ):
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+    try:
+        await enforce_ai_cost_cap(user_id)
+    except (CostCapExceededError, AiSpendUnavailableError) as e:
+        raise HTTPException(status_code=402, detail=cost_cap_error_payload(e))
 
     system = (
         "You are a CRM and sales enablement strategist for an Instagram setter. "
@@ -6643,12 +6694,21 @@ async def generate_agent_avatar(
         "confidence_score is an integer from 0 to 100 based on input precision."
     )
     try:
-        raw = generate_claude_reply([{"role": "user", "content": user_message}], system)
+        generation = generate_claude_generation([{"role": "user", "content": user_message}], system)
+        raw = generation.text
         avatar = clean_json_value(parse_llm_json(raw))
     except ProviderGenerationError as e:
         return provider_error_response(e)
     except Exception:
         return provider_error_response(classify_provider_error(Exception("Invalid AI response")))
+    await record_ai_usage_event(
+        user_id,
+        "agent_avatar_generate",
+        user_message,
+        raw,
+        usage=generation.usage,
+        request_kind="agent_avatar_generate",
+    )
 
     return {"avatar": avatar}
 
@@ -6711,6 +6771,10 @@ async def generate_agent_sales_rules(
 ):
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+    try:
+        await enforce_ai_cost_cap(user_id)
+    except (CostCapExceededError, AiSpendUnavailableError) as e:
+        raise HTTPException(status_code=402, detail=cost_cap_error_payload(e))
 
     try:
         profile_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id)
@@ -6750,12 +6814,21 @@ async def generate_agent_sales_rules(
         "Each list must contain short, concrete sentences."
     )
     try:
-        raw = generate_claude_reply([{"role": "user", "content": user_message}], system)
+        generation = generate_claude_generation([{"role": "user", "content": user_message}], system)
+        raw = generation.text
         rules = clean_json_value(parse_llm_json(raw))
     except ProviderGenerationError as e:
         return provider_error_response(e)
     except Exception:
         return provider_error_response(classify_provider_error(Exception("Invalid AI response")))
+    await record_ai_usage_event(
+        user_id,
+        "agent_sales_rules_generate",
+        user_message,
+        raw,
+        usage=generation.usage,
+        request_kind="agent_sales_rules_generate",
+    )
 
     return {"rules": rules}
 
@@ -6799,6 +6872,10 @@ async def extract_agent_knowledge(
 ):
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+    try:
+        await enforce_ai_cost_cap(user_id)
+    except (CostCapExceededError, AiSpendUnavailableError) as e:
+        raise HTTPException(status_code=402, detail=cost_cap_error_payload(e))
 
     uploaded_text = extract_text_from_uploaded_knowledge(payload.file_name, payload.file_base64)
     source_text = "\n\n".join(
@@ -6871,12 +6948,21 @@ async def extract_agent_knowledge(
         "Keep every list item short and editable. If a field is unknown, use an empty string or empty list."
     )
     try:
-        raw = generate_claude_reply([{"role": "user", "content": user_message}], system)
+        generation = generate_claude_generation([{"role": "user", "content": user_message}], system)
+        raw = generation.text
         extracted = clean_json_value(parse_llm_json(raw))
     except ProviderGenerationError as e:
         return provider_error_response(e)
     except Exception:
         return provider_error_response(classify_provider_error(Exception("Invalid AI response")))
+    await record_ai_usage_event(
+        user_id,
+        "agent_knowledge_extract",
+        user_message,
+        raw,
+        usage=generation.usage,
+        request_kind="agent_knowledge_extract",
+    )
 
     return {
         "profile_patch": extracted.get("profile_patch") or {},

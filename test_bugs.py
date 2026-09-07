@@ -50,6 +50,7 @@ from main import (
     bulk_update_automation_mode,
     BulkAutomationModePayload,
     CostCapExceededError,
+    AiSpendUnavailableError,
     RefinePromptPayload,
     refine_prompt,
     estimate_token_count,
@@ -1313,3 +1314,76 @@ class TestAngellosConversationSimulator:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_seed_conversation_requires_interservice_scope(monkeypatch):
+    import main
+
+    with pytest.raises(Exception) as exc:
+        asyncio.run(main.seed_conversation(
+            {"username": "alice", "first_dm": "hello", "user_id": "tenant-a"},
+            x_dashboard_secret="test-dashboard-secret",
+        ))
+
+    assert getattr(exc.value, "status_code", None) == 403
+
+
+def test_seed_conversation_stores_first_dm_as_draft(monkeypatch):
+    import main
+
+    posted = {}
+
+    class FakeResponse:
+        status_code = 201
+        text = "[]"
+        def json(self):
+            return [{"id": "conv-1"}]
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+        async def post(self, *args, **kwargs):
+            posted.update(kwargs.get("json") or {})
+            return FakeResponse()
+
+    async def fake_get_contact(*args, **kwargs):
+        return None
+
+    async def fake_get_active_prompt(user_id):
+        return "prompt"
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(main, "get_contact_by_external_id", fake_get_contact)
+    monkeypatch.setattr(main, "get_active_prompt", fake_get_active_prompt)
+
+    result = asyncio.run(main.seed_conversation(
+        {"username": "Alice", "first_dm": "Hello draft", "user_id": "tenant-a"},
+        x_dashboard_secret="test-dashboard-secret",
+        x_angellos_route_scope="interservice",
+    ))
+
+    assert result == {"status": "created", "conversation_id": "conv-1"}
+    history = posted["history"]
+    assert history[0]["sent"] is False
+    assert history[0]["delivery_status"] == "draft_generated"
+    assert posted["user_id"] == "tenant-a"
+
+
+def test_ai_cost_cap_fails_closed_when_usage_unavailable(monkeypatch):
+    import main
+
+    async def fake_settings(user_id):
+        return {"enabled": True, "cap_eur": 50}
+
+    async def fake_spend(user_id):
+        return {"spent_eur": 0.0, "usage_available": False}
+
+    monkeypatch.setattr(main, "get_beta_cost_settings", fake_settings)
+    monkeypatch.setattr(main, "get_ai_spend_breakdown", fake_spend)
+
+    with pytest.raises(AiSpendUnavailableError):
+        asyncio.run(enforce_ai_cost_cap("tenant-a"))
