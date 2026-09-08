@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Header, HTTPException, Depends, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from config import load_config
@@ -20,7 +20,7 @@ import re
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 load_dotenv()
 config = load_config()
@@ -1863,6 +1863,7 @@ def build_icp_constraints(profile: dict) -> dict:
 
     return {
         "min_followers": _coerce_int(profile.get("min_followers")),
+        "max_followers": _coerce_int(profile.get("max_followers")),
         "markets": markets,
         "exclude_corporate": bool(profile.get("exclude_corporate")),
         "require_active": require_active,
@@ -3677,6 +3678,7 @@ class TrainingProfilePayload(BaseModel):
     # Structured ICP constraints (source of truth for discovery hard filters).
     # These are business data, not free text: the generator copies them verbatim.
     min_followers: Optional[int] = Field(default=None, ge=0)
+    max_followers: Optional[int] = Field(default=None, ge=0)
     markets: list[str] = Field(default_factory=list)
     exclude_corporate: bool = False
     require_active: bool = True
@@ -3768,6 +3770,233 @@ class PlaygroundPayload(BaseModel):
     messages: list  # list of {role: str, content: str}
     calendly_url: Optional[str] = None
     sales_page_url: Optional[str] = None
+
+
+ANGELLOS_TRAINING_IMPORT_SCHEMA_VERSION = "angellos_training_import_v1"
+ANGELLOS_TRAINING_IMPORT_PROMPT = """You are helping fill an onboarding profile for an AI sales assistant (Angellos) that qualifies Instagram DMs for this business owner.
+
+Based ONLY on what you actually know about my business from our previous conversations, return an Angellos onboarding profile as strict JSON.
+
+CRITICAL — DO NOT INFER OR INVENT:
+- If you do not actually know a field, return null (never 0, never an empty guess, never a plausible default).
+- Never invent a booking URL (never invent a Calendly link). Unknown → null.
+- Never turn a general customer description into a hard filter. Report a hard filter only if I explicitly stated it.
+- No follower threshold mentioned → min_followers null and max_followers null (not 0, not 1000, not 8000).
+- No geographic restriction stated → geography null (meaning unknown). Use [] only if I explicitly said worldwide/anywhere.
+- Unknown whether companies/brands are eligible → companies_eligible null.
+- No pricing stated → price null.
+
+Return ONLY valid JSON, no prose, no markdown:
+{
+  "schema_version": "angellos_training_import_v1",
+  "business": {"business_name": null, "operator_name": null, "language": null, "niche": null},
+  "offer": {"offer_name": null, "promise": null, "format": null, "price": null, "next_step": null, "booking_url": null},
+  "icp": {"ideal_customer": null, "positive_signals": [], "negative_signals": [], "hard_filters": {"min_followers": null, "max_followers": null, "geography": null, "companies_eligible": null}},
+  "voice": {"tone": null, "forbidden": [], "qualification_questions": []}
+}
+Only fill what you genuinely know; everything else stays null or an empty known list."""
+
+
+class ImportBusinessSection(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    business_name: Optional[StrictStr] = None
+    operator_name: Optional[StrictStr] = None
+    language: Optional[StrictStr] = None
+    niche: Optional[StrictStr] = None
+
+
+class ImportOfferSection(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    offer_name: Optional[StrictStr] = None
+    promise: Optional[StrictStr] = None
+    format: Optional[StrictStr] = None
+    price: Optional[StrictStr] = None
+    next_step: Optional[StrictStr] = None
+    booking_url: Optional[StrictStr] = None
+
+
+class ImportHardFiltersSection(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    min_followers: Optional[StrictInt] = Field(default=None, ge=0)
+    max_followers: Optional[StrictInt] = Field(default=None, ge=0)
+    geography: Optional[list[StrictStr]] = None
+    companies_eligible: Optional[StrictBool] = None
+
+
+class ImportIcpSection(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    ideal_customer: Optional[StrictStr] = None
+    positive_signals: list[StrictStr] = Field(default_factory=list)
+    negative_signals: list[StrictStr] = Field(default_factory=list)
+    hard_filters: ImportHardFiltersSection = Field(default_factory=ImportHardFiltersSection)
+
+
+class ImportVoiceSection(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    tone: Optional[StrictStr] = None
+    forbidden: list[StrictStr] = Field(default_factory=list)
+    qualification_questions: list[StrictStr] = Field(default_factory=list)
+
+
+class TrainingImportV1(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    schema_version: Literal["angellos_training_import_v1"]
+    business: ImportBusinessSection
+    offer: ImportOfferSection
+    icp: ImportIcpSection
+    voice: ImportVoiceSection
+
+
+class AgentImportParsePayload(BaseModel):
+    json_text: str = Field(min_length=1, max_length=120000)
+
+
+class AgentImportApplyPayload(BaseModel):
+    import_: TrainingImportV1 = Field(alias="import")
+
+
+IMPORT_ALLOWED_TREE = {
+    "schema_version": None,
+    "business": {"business_name": None, "operator_name": None, "language": None, "niche": None},
+    "offer": {"offer_name": None, "promise": None, "format": None, "price": None, "next_step": None, "booking_url": None},
+    "icp": {
+        "ideal_customer": None,
+        "positive_signals": None,
+        "negative_signals": None,
+        "hard_filters": {"min_followers": None, "max_followers": None, "geography": None, "companies_eligible": None},
+    },
+    "voice": {"tone": None, "forbidden": None, "qualification_questions": None},
+}
+
+
+def _unknown_import_fields(raw: Any, allowed: Any, prefix: str = "") -> list[str]:
+    if not isinstance(raw, dict) or not isinstance(allowed, dict):
+        return []
+    unknown: list[str] = []
+    for key, value in raw.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if key not in allowed:
+            unknown.append(path)
+        elif isinstance(value, dict):
+            unknown.extend(_unknown_import_fields(value, allowed[key], path))
+    return unknown
+
+
+def _normalize_import_language(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"english", "anglais", "en", "eng"}:
+        return "en"
+    if normalized in {"french", "français", "francais", "fr", "fra"}:
+        return "fr"
+    return value.strip()
+
+
+def _clean_import_string(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    return value.strip()
+
+
+def _clean_import_list(values: list[str]) -> list[str]:
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def build_training_import_mapping(import_payload: TrainingImportV1) -> dict:
+    data = import_payload.model_dump()
+    business = data["business"]
+    offer = data["offer"]
+    icp = data["icp"]
+    hard_filters = icp["hard_filters"]
+    voice = data["voice"]
+
+    fields = [
+        ("business.business_name", "profile", "business_name", _clean_import_string(business.get("business_name"))),
+        ("business.operator_name", "profile", "coach_name", _clean_import_string(business.get("operator_name"))),
+        ("business.language", "profile", "language", _normalize_import_language(business.get("language"))),
+        ("business.niche", "profile", "niche", _clean_import_string(business.get("niche"))),
+        ("offer.offer_name", "profile", "offer_name", _clean_import_string(offer.get("offer_name"))),
+        ("offer.promise", "profile", "offer_promise", _clean_import_string(offer.get("promise"))),
+        ("offer.format", "profile", "offer_format", _clean_import_string(offer.get("format"))),
+        ("offer.price", "profile", "price", _clean_import_string(offer.get("price"))),
+        ("offer.next_step", "profile", "next_step", _clean_import_string(offer.get("next_step"))),
+        ("offer.booking_url", "profile", "calendly_url", _clean_import_string(offer.get("booking_url"))),
+        ("icp.ideal_customer", "avatar", "persona_summary", _clean_import_string(icp.get("ideal_customer"))),
+        ("icp.positive_signals", "avatar", "buying_triggers", _clean_import_list(icp.get("positive_signals") or [])),
+        ("icp.negative_signals", "avatar", "bad_fit", _clean_import_list(icp.get("negative_signals") or [])),
+        ("icp.hard_filters.min_followers", "profile", "min_followers", hard_filters.get("min_followers")),
+        ("icp.hard_filters.max_followers", "profile", "max_followers", hard_filters.get("max_followers")),
+        ("icp.hard_filters.geography", "profile", "markets", _clean_import_list(hard_filters.get("geography")) if hard_filters.get("geography") is not None else None),
+        ("icp.hard_filters.companies_eligible", "profile", "exclude_corporate", (not hard_filters.get("companies_eligible")) if hard_filters.get("companies_eligible") is not None else None),
+        ("voice.tone", "profile", "tone_rules", [_clean_import_string(voice.get("tone"))] if _clean_import_string(voice.get("tone")) is not None else None),
+        ("voice.forbidden", "profile", "forbidden_phrases", _clean_import_list(voice.get("forbidden") or [])),
+        ("voice.qualification_questions", "rules", "qualification_questions", _clean_import_list(voice.get("qualification_questions") or [])),
+    ]
+
+    profile_patch: dict[str, Any] = {}
+    avatar_patch: dict[str, Any] = {}
+    rules_patch: dict[str, Any] = {}
+    mapped_preview: list[dict[str, Any]] = []
+    to_verify: list[dict[str, str]] = []
+
+    for source_key, target_table, target_field, value in fields:
+        status = "null" if value is None else "found"
+        mapped_preview.append({
+            "source_key": source_key,
+            "target_table": target_table,
+            "target_field": target_field,
+            "value": value,
+            "status": status,
+        })
+        if value is None:
+            to_verify.append({"source_key": source_key, "target_table": target_table, "target_field": target_field})
+            continue
+        if target_table == "profile":
+            profile_patch[target_field] = value
+        elif target_table == "avatar":
+            avatar_patch[target_field] = value
+        else:
+            rules_patch[target_field] = value
+
+    tone = _clean_import_string(voice.get("tone"))
+    if tone and len(tone) > 500:
+        profile_patch["voice_profile"] = tone
+
+    return {
+        "profile": profile_patch,
+        "avatar": avatar_patch,
+        "rules": rules_patch,
+        "mapped_preview": mapped_preview,
+        "to_verify": to_verify,
+    }
+
+
+def parse_training_import_json(json_text: str) -> tuple[TrainingImportV1, dict, list[str]]:
+    try:
+        raw = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=422, detail={"valid": False, "errors": [f"Invalid JSON: {e.msg}"]}) from e
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=422, detail={"valid": False, "errors": ["Import payload must be a JSON object."]})
+    unknown_fields = _unknown_import_fields(raw, IMPORT_ALLOWED_TREE)
+    try:
+        parsed = TrainingImportV1.model_validate(raw)
+    except Exception as e:
+        errors = []
+        error_items = getattr(e, "errors", lambda: [])()
+        if isinstance(error_items, list):
+            for err in error_items:
+                loc = ".".join(str(part) for part in err.get("loc", []))
+                errors.append(f"{loc}: {err.get('msg', 'invalid value')}")
+        raise HTTPException(status_code=422, detail={"valid": False, "errors": errors or ["Invalid import payload."]}) from e
+    return parsed, raw, unknown_fields
 
 
 class SimulatorRunPayload(BaseModel):
@@ -6597,6 +6826,79 @@ async def get_training_center(
         },
     }
     return response_payload
+
+
+@app.get("/agent/import/prompt")
+async def get_agent_import_prompt(user_id: str = Depends(require_jwt)):
+    return {
+        "schema_version": ANGELLOS_TRAINING_IMPORT_SCHEMA_VERSION,
+        "prompt": ANGELLOS_TRAINING_IMPORT_PROMPT,
+    }
+
+
+@app.post("/agent/import/parse")
+async def parse_agent_import(
+    payload: AgentImportParsePayload,
+    user_id: str = Depends(require_jwt),
+):
+    parsed, _raw, unknown_fields = parse_training_import_json(payload.json_text)
+    mapping = build_training_import_mapping(parsed)
+    return {
+        "valid": True,
+        "errors": [],
+        "parsed": parsed.model_dump(),
+        "mapped_preview": mapping["mapped_preview"],
+        "unknown_fields": unknown_fields,
+        "to_verify": mapping["to_verify"],
+    }
+
+
+@app.post("/agent/import/apply")
+async def apply_agent_import(
+    payload: AgentImportApplyPayload,
+    user_id: str = Depends(require_jwt),
+):
+    mapping = build_training_import_mapping(payload.import_)
+    profile_patch = mapping["profile"]
+    avatar_patch = mapping["avatar"]
+    rules_patch = mapping["rules"]
+    written = {"profile": [], "avatar": [], "rules": []}
+    rows: dict[str, Optional[dict]] = {"profile": None, "avatar": None, "rules": None}
+    try:
+        if profile_patch:
+            current_row = await get_user_singleton_row(SUPABASE_AGENT_PROFILES_URL, user_id)
+            current_profile = dict((current_row or {}).get("profile") or {})
+            current_profile.update(profile_patch)
+            rows["profile"] = await upsert_user_singleton_row(
+                SUPABASE_AGENT_PROFILES_URL,
+                user_id,
+                {"profile": current_profile},
+            )
+            written["profile"] = list(profile_patch.keys())
+        if avatar_patch:
+            current_row = await get_user_singleton_row(SUPABASE_AGENT_AVATARS_URL, user_id)
+            current_avatar = dict((current_row or {}).get("avatar") or {})
+            current_avatar.update(avatar_patch)
+            rows["avatar"] = await upsert_user_singleton_row(
+                SUPABASE_AGENT_AVATARS_URL,
+                user_id,
+                {"avatar": current_avatar},
+            )
+            written["avatar"] = list(avatar_patch.keys())
+        if rules_patch:
+            current_row = await get_user_singleton_row(SUPABASE_AGENT_SALES_RULES_URL, user_id)
+            current_rules = dict((current_row or {}).get("rules") or {})
+            current_rules.update(rules_patch)
+            rows["rules"] = await upsert_user_singleton_row(
+                SUPABASE_AGENT_SALES_RULES_URL,
+                user_id,
+                {"rules": current_rules},
+            )
+            written["rules"] = list(rules_patch.keys())
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Supabase upsert error: {e}")
+
+    return {"success": True, "written": written, "rows": rows}
 
 
 @app.get("/agent/prospecting-context")

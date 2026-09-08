@@ -29,6 +29,7 @@ from main import (
     build_prompt_diff,
     build_prospecting_context_payload,
     build_icp_constraints,
+    build_training_import_mapping,
     build_training_center_prompt,
     default_automation_mode_for_prompt,
     durable_rule_from_refinement_instruction,
@@ -49,9 +50,14 @@ from main import (
     webhook,
     bulk_update_automation_mode,
     BulkAutomationModePayload,
+    ANGELLOS_TRAINING_IMPORT_PROMPT,
+    ANGELLOS_TRAINING_IMPORT_SCHEMA_VERSION,
     CostCapExceededError,
     AiSpendUnavailableError,
     RefinePromptPayload,
+    TrainingImportV1,
+    AgentImportApplyPayload,
+    apply_agent_import,
     refine_prompt,
     estimate_token_count,
     estimate_claude_cost_eur,
@@ -152,6 +158,7 @@ class TestProspectingContextPayload:
         )
         constraints = payload["icp_constraints"]
         assert constraints["min_followers"] == 8000
+        assert constraints["max_followers"] is None
         assert constraints["markets"] == ["France", "Belgique"]
         assert constraints["exclude_corporate"] is True
         assert constraints["require_active"] is False
@@ -161,6 +168,7 @@ class TestProspectingContextPayload:
         payload = build_prospecting_context_payload("user-1", {"profile": {}}, {"avatar": {}}, {"rules": {}})
         constraints = payload["icp_constraints"]
         assert constraints["min_followers"] is None
+        assert constraints["max_followers"] is None
         assert constraints["markets"] == []
         assert constraints["exclude_corporate"] is False
         assert constraints["require_active"] is True
@@ -169,12 +177,127 @@ class TestProspectingContextPayload:
     def test_build_icp_constraints_normalizes_alternative_rule_key(self):
         constraints = build_icp_constraints({
             "min_followers": "8000",
+            "max_followers": "50000",
             "markets": [" France ", "", "Suisse"],
             "niche_exceptions": [{"condition": "addiction", "alternative_rule": "views/engagement"}],
         })
         assert constraints["min_followers"] == 8000
+        assert constraints["max_followers"] == 50000
         assert constraints["markets"] == ["France", "Suisse"]
         assert constraints["niche_exceptions"] == [{"condition": "addiction", "override": "views/engagement"}]
+
+    def test_imported_english_worldwide_no_followers_corporate_ok_constraints(self):
+        import_payload = TrainingImportV1.model_validate({
+            "schema_version": "angellos_training_import_v1",
+            "business": {"business_name": "Studio Lead", "operator_name": "Alex", "language": "English", "niche": "coaches"},
+            "offer": {"offer_name": "DM OS", "promise": "more qualified calls", "format": "coaching", "price": None, "next_step": "application", "booking_url": None},
+            "icp": {
+                "ideal_customer": "coaches selling through Instagram",
+                "positive_signals": [],
+                "negative_signals": [],
+                "hard_filters": {"min_followers": None, "max_followers": None, "geography": [], "companies_eligible": True},
+            },
+            "voice": {"tone": "short and natural", "forbidden": [], "qualification_questions": []},
+        })
+        mapping = build_training_import_mapping(import_payload)
+        constraints = build_icp_constraints(mapping["profile"])
+        assert constraints == {
+            "min_followers": None,
+            "max_followers": None,
+            "markets": [],
+            "exclude_corporate": False,
+            "require_active": True,
+            "niche_exceptions": [],
+        }
+        assert mapping["profile"]["language"] == "en"
+
+
+class TestTrainingImportV1:
+    def test_prompt_is_generic_and_zero_invention(self):
+        assert ANGELLOS_TRAINING_IMPORT_SCHEMA_VERSION == "angellos_training_import_v1"
+        assert "Import from ChatGPT" not in ANGELLOS_TRAINING_IMPORT_PROMPT
+        assert "Nounes" not in ANGELLOS_TRAINING_IMPORT_PROMPT
+        assert "Jake" not in ANGELLOS_TRAINING_IMPORT_PROMPT
+        assert "min_followers null and max_followers null" in ANGELLOS_TRAINING_IMPORT_PROMPT
+        assert "Return ONLY valid JSON" in ANGELLOS_TRAINING_IMPORT_PROMPT
+
+    def test_mapping_preserves_nulls_and_ignores_unknown_by_model(self):
+        import_payload = TrainingImportV1.model_validate({
+            "schema_version": "angellos_training_import_v1",
+            "business": {"business_name": "Biz", "operator_name": None, "language": "French", "niche": None, "ignored": "x"},
+            "offer": {"offer_name": None, "promise": "Outcome", "format": None, "price": None, "next_step": None, "booking_url": None},
+            "icp": {
+                "ideal_customer": None,
+                "positive_signals": ["asks about price"],
+                "negative_signals": [],
+                "hard_filters": {"min_followers": None, "max_followers": 50000, "geography": None, "companies_eligible": False},
+            },
+            "voice": {"tone": "warm", "forbidden": ["guaranteed"], "qualification_questions": ["What do you sell?"]},
+        })
+        mapping = build_training_import_mapping(import_payload)
+        assert mapping["profile"] == {
+            "business_name": "Biz",
+            "language": "fr",
+            "offer_promise": "Outcome",
+            "max_followers": 50000,
+            "exclude_corporate": True,
+            "tone_rules": ["warm"],
+            "forbidden_phrases": ["guaranteed"],
+        }
+        assert "min_followers" not in mapping["profile"]
+        assert "markets" not in mapping["profile"]
+        assert mapping["avatar"] == {"buying_triggers": ["asks about price"], "bad_fit": []}
+        assert mapping["rules"] == {"qualification_questions": ["What do you sell?"]}
+        assert any(item["source_key"] == "business.operator_name" and item["status"] == "null" for item in mapping["mapped_preview"])
+
+    def test_rejects_silent_type_coercion(self):
+        with pytest.raises(Exception):
+            TrainingImportV1.model_validate({
+                "schema_version": "angellos_training_import_v1",
+                "business": {"business_name": "Biz", "operator_name": None, "language": "English", "niche": None},
+                "offer": {"offer_name": None, "promise": None, "format": None, "price": None, "next_step": None, "booking_url": None},
+                "icp": {"ideal_customer": None, "positive_signals": [], "negative_signals": [], "hard_filters": {"min_followers": "8000", "max_followers": None, "geography": None, "companies_eligible": None}},
+                "voice": {"tone": None, "forbidden": [], "qualification_questions": []},
+            })
+
+    def test_apply_field_merge_is_user_scoped_and_preserves_existing(self, monkeypatch):
+        calls = []
+
+        async def fake_get(table_url, user_id, select="*"):
+            assert user_id == "tenant-a"
+            if table_url.endswith("agent_profiles"):
+                return {"profile": {"business_name": "Old", "min_followers": 8000, "markets": ["France"]}}
+            if table_url.endswith("agent_avatars"):
+                return {"avatar": {"persona_summary": "Old persona", "pain_points": ["keep"]}}
+            if table_url.endswith("agent_sales_rules"):
+                return {"rules": {"qualification_questions": ["Old q"], "red_flags": ["keep"]}}
+            return None
+
+        async def fake_upsert(table_url, user_id, payload):
+            assert user_id == "tenant-a"
+            calls.append({"table_url": table_url, "user_id": user_id, "payload": payload})
+            return {"user_id": user_id, **payload}
+
+        monkeypatch.setattr("main.get_user_singleton_row", fake_get)
+        monkeypatch.setattr("main.upsert_user_singleton_row", fake_upsert)
+        payload = AgentImportApplyPayload.model_validate({"import": {
+            "schema_version": "angellos_training_import_v1",
+            "business": {"business_name": "New", "operator_name": None, "language": "English", "niche": None},
+            "offer": {"offer_name": None, "promise": None, "format": None, "price": None, "next_step": None, "booking_url": None},
+            "icp": {"ideal_customer": None, "positive_signals": [], "negative_signals": [], "hard_filters": {"min_followers": None, "max_followers": None, "geography": [], "companies_eligible": True}},
+            "voice": {"tone": None, "forbidden": [], "qualification_questions": []},
+        }})
+
+        result = asyncio.run(apply_agent_import(payload, user_id="tenant-a"))
+
+        assert result["written"]["profile"] == ["business_name", "language", "markets", "exclude_corporate", "forbidden_phrases"]
+        profile_payload = next(call["payload"]["profile"] for call in calls if "profile" in call["payload"])
+        assert profile_payload["business_name"] == "New"
+        assert profile_payload["min_followers"] == 8000
+        assert profile_payload["markets"] == []
+        assert profile_payload["exclude_corporate"] is False
+        rules_payload = next(call["payload"]["rules"] for call in calls if "rules" in call["payload"])
+        assert rules_payload["red_flags"] == ["keep"]
 
 
 # ===========================================================================
