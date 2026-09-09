@@ -4088,6 +4088,64 @@ SIMULATOR_SCENARIOS = [
     },
 ]
 
+FRENCH_SIMULATOR_HISTORY = {
+    "skeptical-ai": [
+        ("assistant", "Petite question : tu gères toi-même tes messages Instagram aujourd’hui ?"),
+        ("user", "C’est une IA qui me répond ?"),
+    ],
+    "interested-vague": [
+        ("assistant", "Tu reçois déjà des demandes dans tes messages Instagram ?"),
+        ("user", "Oui, ça peut m’intéresser."),
+    ],
+    "price-objection": [
+        ("assistant", "Est-ce que cela t’aiderait à mieux gérer tes messages ?"),
+        ("user", "Ça coûte combien ?"),
+    ],
+    "send-info": [
+        ("assistant", "Tes conversations viennent surtout de demandes entrantes ou de prospection ?"),
+        ("user", "Envoie-moi les informations."),
+    ],
+    "ghost-after-reply": [
+        ("user", "Dis-m’en plus."),
+        ("assistant", "Angellos aide à qualifier les demandes Instagram et à faire avancer les bons prospects vers un appel. Tu veux un aperçu ?"),
+        ("user", ""),
+    ],
+    "not-qualified": [
+        ("assistant", "Combien de conversations Instagram reçois-tu pendant une semaine normale ?"),
+        ("user", "Aucune pour le moment, je débute et je n’ai pas encore d’offre."),
+    ],
+    "hot-prospect": [
+        ("assistant", "Tu as déjà un processus régulier pour qualifier tes prospects ?"),
+        ("user", "On reçoit 40 messages par semaine et je veux tester rapidement."),
+    ],
+    "cold-negative": [
+        ("assistant", "Est-ce que déléguer la première partie de ces conversations pourrait t’aider ?"),
+        ("user", "Non merci."),
+    ],
+}
+
+
+def localized_simulator_scenario(scenario: dict, language: str) -> dict:
+    if normalize_tenant_language(language) != "fr":
+        return scenario
+    localized = FRENCH_SIMULATOR_HISTORY.get(str(scenario.get("id") or ""))
+    if not localized:
+        return scenario
+    base_timestamp = "2026-08-24T08:00:00Z"
+    return {
+        **scenario,
+        "prospect_profile": "Prospect francophone correspondant au cas de test.",
+        "history": [
+            {
+                "role": role,
+                "content": content,
+                "timestamp": base_timestamp,
+                **({"sent": True} if role == "assistant" else {}),
+            }
+            for role, content in localized
+        ],
+    }
+
 
 def simulator_last_user_message(history: list[dict]) -> str:
     return next(((item.get("content") or "") for item in reversed(history) if item.get("role") == "user"), "")
@@ -4151,6 +4209,21 @@ def clamp_quality_subscore(value: int) -> int:
 
 def quality_judge_suggested_rewrite(scenario: dict, reply: str, scores: dict[str, int]) -> str:
     scenario_id = str(scenario.get("id") or "")
+    history = scenario.get("history") or []
+    last_user_message = simulator_last_user_message(history)
+    french = bool(re.search(r"[àâçéèêëîïôùûüÿœ]|\b(bonjour|merci|combien|intéress|message|appel|prospect)\b", f"{last_user_message} {reply}".lower()))
+    french_rewrites = {
+        "skeptical-ai": "Oui, Angellos m’aide à répondre, mais le but n’est pas de te spammer. Qu’est-ce qui t’a mis la puce à l’oreille ?",
+        "interested-vague": "Super. À quoi ressemble ton flux de messages Instagram aujourd’hui ?",
+        "price-objection": "Le tarif dépend de ta situation. Environ combien de conversations Instagram gères-tu chaque semaine ?",
+        "send-info": "Bien sûr. Avant cela, tes messages viennent surtout de demandes entrantes ou de prospection ?",
+        "ghost-after-reply": "Petite relance : est-ce toujours pertinent pour toi ou préfères-tu qu’on en reste là ?",
+        "not-qualified": "C’est probablement encore un peu tôt. Cela deviendra pertinent quand tu auras un flux régulier de conversations.",
+        "hot-prospect": "Cela semble pertinent. La prochaine étape est un court appel pour comprendre ton flux de messages. Je t’envoie le lien ?",
+        "cold-negative": "Pas de souci, merci pour ta réponse.",
+    }
+    if french and scenario_id in french_rewrites:
+        return french_rewrites[scenario_id]
     rewrites = {
         "skeptical-ai": "yeah fair question. it is automated, but not here to spam you. was just curious if DMs are a bottleneck for you right now?",
         "interested-vague": "nice. what does your current DM flow look like right now?",
@@ -4165,9 +4238,13 @@ def quality_judge_suggested_rewrite(scenario: dict, reply: str, scores: dict[str
         return reply
     if scenario_id in rewrites:
         return rewrites[scenario_id]
-    history = scenario.get("history") or []
-    last_user_message = simulator_last_user_message(history)
     normalized_user = normalize_inbound_text(last_user_message)
+    if french:
+        if re.search(r"\b(ia|robot|automatis)", normalized_user):
+            return "C’est une question légitime. Qu’est-ce qui t’a donné cette impression ?"
+        if any(marker in normalized_user for marker in ("prix", "coût", "coute", "combien")):
+            return "Le tarif dépend de ta situation. Environ combien de conversations Instagram gères-tu chaque semaine ?"
+        return reply
     if re.search(r"\b(ai|bot|automated)\b", normalized_user):
         return "yeah fair question. what gave it away?"
     if any(marker in normalized_user for marker in ("price", "cost", "how much")):
@@ -4213,6 +4290,13 @@ def judge_simulated_reply_quality(scenario: dict, reply: str, flags: Optional[di
         "process",
         "normal week",
         "bottleneck",
+        "messages",
+        "demandes",
+        "semaine",
+        "processus",
+        "besoin",
+        "activité",
+        "activite",
     )
 
     naturalite = 9
@@ -4230,17 +4314,17 @@ def judge_simulated_reply_quality(scenario: dict, reply: str, flags: Optional[di
     contexte = 7
     scenario_id = str(scenario.get("id") or "")
     if scenario_id == "skeptical-ai":
-        contexte = 9 if any(marker in normalized_reply for marker in ("ai", "automated", "fair question", "honestly")) else 3
+        contexte = 9 if any(marker in normalized_reply for marker in ("ai", "automated", "fair question", "honestly", "ia", "automatis", "légitime", "legitime")) else 3
     elif scenario_id == "price-objection":
-        contexte = 9 if any(marker in normalized_reply for marker in ("free", "price", "cost", "paid", "beta")) else 4
+        contexte = 9 if any(marker in normalized_reply for marker in ("free", "price", "cost", "paid", "beta", "prix", "tarif", "coût", "cout")) else 4
     elif scenario_id == "cold-negative":
-        contexte = 9 if any(marker in normalized_reply for marker in ("no worries", "appreciate", "leave it")) else 3
+        contexte = 9 if any(marker in normalized_reply for marker in ("no worries", "appreciate", "leave it", "pas de souci", "merci")) else 3
     elif scenario_id == "not-qualified":
-        contexte = 9 if any(marker in normalized_reply for marker in ("too early", "steady flow", "make more sense")) else 5
+        contexte = 9 if any(marker in normalized_reply for marker in ("too early", "steady flow", "make more sense", "trop tôt", "trop tot", "flux régulier", "flux regulier")) else 5
     elif scenario_id == "hot-prospect":
-        contexte = 9 if any(marker in normalized_reply for marker in ("quick call", "beta page", "next step", "real fit")) else 6
+        contexte = 9 if any(marker in normalized_reply for marker in ("quick call", "beta page", "next step", "real fit", "appel", "prochaine étape", "prochaine etape", "pertinent")) else 6
     elif scenario_id == "ghost-after-reply":
-        contexte = 8 if any(marker in normalized_reply for marker in ("bump", "still", "leave it")) else 5
+        contexte = 8 if any(marker in normalized_reply for marker in ("bump", "still", "leave it", "relance", "toujours", "en reste là", "en reste la")) else 5
     elif any(word for word in normalized_user.split() if len(word) > 4 and word in normalized_reply):
         contexte = 8
     if flags.get("manque_contexte"):
@@ -4329,13 +4413,19 @@ def build_simulation_transcript(scenario: dict, reply: str) -> list[dict]:
     return [*(scenario.get("history") or []), {"role": "assistant", "content": reply, "timestamp": now_iso(), "sent": False, "source": "conversation_simulator"}]
 
 
-async def run_simulator_scenario(scenario: dict, user_id: str, use_ai: bool = False) -> dict:
+async def run_simulator_scenario(
+    scenario: dict,
+    user_id: str,
+    use_ai: bool = False,
+    active_prompt: Optional[str] = None,
+) -> dict:
     reply = ""
     source = ""
     if use_ai:
         if client is None:
             raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
-        active_prompt = await get_active_prompt(user_id)
+        active_prompt = active_prompt or await get_active_prompt(user_id)
+        scenario = localized_simulator_scenario(scenario, tenant_language_from_prompt(active_prompt))
         system_prompt = build_generation_prompt(active_prompt)
         try:
             generation = generate_claude_generation(strip_message_metadata(scenario.get("history") or []), system_prompt, max_tokens=500)
@@ -4357,6 +4447,8 @@ async def run_simulator_scenario(scenario: dict, user_id: str, use_ai: bool = Fa
         "response_source": source,
         "quality_judge": quality_judge,
         **scoring,
+        "quality_score": quality_judge["overall_score"],
+        "recommendation": quality_judge["decision"],
     }
 
 
@@ -4839,7 +4931,11 @@ async def run_conversation_simulator(
         scenarios = [scenario for scenario in SIMULATOR_SCENARIOS if scenario["id"] == payload.scenario_id]
         if not scenarios:
             raise HTTPException(status_code=404, detail="Simulator scenario not found")
-    results = [await run_simulator_scenario(scenario, user_id, payload.use_ai) for scenario in scenarios]
+    active_prompt = await get_active_prompt(user_id) if payload.use_ai else None
+    results = [
+        await run_simulator_scenario(scenario, user_id, payload.use_ai, active_prompt)
+        for scenario in scenarios
+    ]
     passed = sum(1 for result in results if result.get("recommendation") == "pass")
     return {
         "success": True,

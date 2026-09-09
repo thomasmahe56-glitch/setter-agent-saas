@@ -68,6 +68,7 @@ from main import (
     normalize_beta_account_settings,
     SIMULATOR_SCENARIOS,
     deterministic_simulator_reply,
+    localized_simulator_scenario,
     run_simulator_scenario,
     score_simulated_reply,
     judge_simulated_reply_quality,
@@ -1406,7 +1407,29 @@ class TestAngellosConversationSimulator:
         assert isinstance(result["quality_score"], int)
         assert result["recommendation"] in {"pass", "retry", "human_review"}
         assert set(result["quality_judge"]["scores"].keys()) == set(QUALITY_JUDGE_SCORE_KEYS)
+        assert result["quality_score"] == result["quality_judge"]["overall_score"]
+        assert result["recommendation"] == result["quality_judge"]["decision"]
         assert result["transcript"][-1]["role"] == "assistant"
+
+    def test_localizes_simulator_history_for_french_tenant(self):
+        scenario = next(item for item in SIMULATOR_SCENARIOS if item["id"] == "skeptical-ai")
+        localized = localized_simulator_scenario(scenario, "français")
+
+        assert localized is not scenario
+        assert "IA" in localized["history"][-1]["content"]
+        assert localized["history"][-1]["role"] == "user"
+        assert localized_simulator_scenario(scenario, "english") is scenario
+
+    def test_quality_judge_rewrite_stays_french_for_french_scenario(self):
+        scenario = localized_simulator_scenario(
+            next(item for item in SIMULATOR_SCENARIOS if item["id"] == "skeptical-ai"),
+            "français",
+        )
+        scoring = score_simulated_reply(scenario, "Oui, c’est une IA.")
+        judge = judge_simulated_reply_quality(scenario, "Oui, c’est une IA.", scoring["flags"])
+
+        assert "Angellos" in judge["suggested_rewrite"]
+        assert "spam" in judge["suggested_rewrite"]
 
     def test_quality_judge_structure_is_returned_for_all_eight_scenarios(self):
         results = [
