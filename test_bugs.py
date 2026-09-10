@@ -536,7 +536,7 @@ class TestManyChatWebhookAutoSend:
         monkeypatch.setattr("main.handle_inbound_message", fake_handle_inbound_message)
 
         response = asyncio.run(webhook(
-            WebhookPayload(username="real_handle", message="Hello", subscriber_id="123456789"),
+            WebhookPayload(username="real_handle", message="Hello", subscriber_id="123456789", event_id="evt-auto-send"),
             x_webhook_secret="test-secret",
         ))
 
@@ -566,7 +566,7 @@ class TestManyChatWebhookAutoSend:
         monkeypatch.setattr("main.handle_inbound_message", fake_handle_inbound_message)
 
         response = asyncio.run(webhook(
-            WebhookPayload(username="real_handle", message="Hello", subscriber_id="123456789"),
+            WebhookPayload(username="real_handle", message="Hello", subscriber_id="123456789", event_id="evt-send-fallback"),
             x_webhook_secret="test-secret",
         ))
 
