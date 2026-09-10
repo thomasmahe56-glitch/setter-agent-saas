@@ -133,6 +133,7 @@ openssl rand -hex 32   # for DASHBOARD_SECRET
 | ANTHROPIC_API_KEY | Anthropic API key | ✅ |
 | WEBHOOK_SECRET | Secret for /webhook | ✅ |
 | OWNER_USER_ID | Founder Supabase Auth UUID | Recommended |
+| ALLOWED_USER_IDS | Comma-separated additional Supabase user UUIDs authorized for the private beta | Recommended |
 | DASHBOARD_SECRET | Legacy secret | Optional |
 | MANYCHAT_TOKEN | ManyChat API token | ✅ |
 | WHATSAPP_ACCESS_TOKEN | WhatsApp Cloud API token | If WhatsApp |
@@ -147,6 +148,8 @@ openssl rand -hex 32   # for DASHBOARD_SECRET
 | URL_CALL | Calendly URL (fallback) | ✅ |
 | CONTACT_EMAIL | Email for partnerships | ✅ |
 | NICHE_CONTEXT | Injected business context (fallback) | Recommended |
+
+`OWNER_USER_ID` et `ALLOWED_USER_IDS` forment l'allowlist beta appliquée côté serveur. En production, au moins l'un des deux doit être configuré ; une session Supabase valide qui n'appartient pas à cette liste reçoit HTTP 403.
 
 ---
 
