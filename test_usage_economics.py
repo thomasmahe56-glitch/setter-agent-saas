@@ -6,11 +6,13 @@ import pytest
 import main
 from usage_economics import (
     aggregate_costs,
+    build_cost_activities,
     build_credit_debit,
     credit_summary,
     month_period,
     safe_unit_cost,
     select_credit_rule,
+    summarize_cost_activities,
 )
 
 
@@ -142,3 +144,67 @@ def test_usage_reader_paginates_past_supabase_row_cap(monkeypatch):
     assert available is True
     assert len(rows) == 1001
     assert offsets == [0, 1000]
+
+
+def test_cost_activities_group_a_discovery_run_and_keep_messages_individual():
+    rows = [
+        {
+            "id": "source", "user_id": "tenant-a", "run_id": "run-1", "module": "prospecting",
+            "feature": "source_discovery", "event_type": "source_discovery", "provider": "tavily",
+            "quantity": 1, "cost_accuracy": "provider_reported", "cost_eur": "0.02",
+            "occurred_at": "2026-09-11T09:00:00Z",
+        },
+        {
+            "id": "profiles", "user_id": "tenant-a", "run_id": "run-1", "module": "prospecting",
+            "feature": "instagram_scrape", "event_type": "profiles_retrieved", "provider": "apify",
+            "quantity": 25, "cost_accuracy": "provider_reported", "cost_eur": "0.18",
+            "occurred_at": "2026-09-11T09:01:00Z",
+        },
+        {
+            "id": "reply-1", "user_id": "tenant-a", "module": "setter", "conversation_id": "conversation-1",
+            "feature": "reply", "event_type": "assistant_reply_generated", "provider": "anthropic",
+            "provider_event_id": "msg-1", "quantity": 1, "cost_accuracy": "provider_usage_priced", "cost_eur": "0.05",
+            "occurred_at": "2026-09-11T10:00:00Z",
+        },
+        {
+            "id": "reply-2", "user_id": "tenant-a", "module": "setter", "conversation_id": "conversation-1",
+            "feature": "reply", "event_type": "assistant_reply_generated", "provider": "anthropic",
+            "provider_event_id": "msg-2", "quantity": 1, "cost_accuracy": "unknown", "cost_eur": None,
+            "occurred_at": "2026-09-11T10:05:00Z",
+        },
+    ]
+    activities = build_cost_activities(rows)
+    assert len(activities) == 3
+    discovery = next(item for item in activities if item["activity_type"] == "discovery")
+    assert discovery["event_count"] == 2
+    assert discovery["total_cost_eur"] == pytest.approx(0.2)
+    assert discovery["cost_complete"] is True
+    replies = [item for item in activities if item["activity_type"] == "assistant_message"]
+    assert len(replies) == 2
+    assert sum(item["unknown_operations"] for item in replies) == 1
+
+    summaries = summarize_cost_activities(activities)
+    assert summaries["discovery"]["activity_count"] == 1
+    assert summaries["discovery"]["average_known_cost_eur"] == pytest.approx(0.2)
+    assert summaries["assistant_message"]["activity_count"] == 2
+    assert summaries["assistant_message"]["average_known_cost_eur"] == pytest.approx(0.025)
+    assert summaries["assistant_message"]["coverage_percent"] == pytest.approx(50)
+
+
+def test_admin_activity_history_is_server_side_and_filterable(monkeypatch):
+    async def fake_rows(*, start, end, user_id=None, limit=100000):
+        return ([{
+            "id": "row-1", "user_id": "tenant-a", "run_id": "run-1", "module": "prospecting",
+            "feature": "source_discovery", "event_type": "source_discovery", "provider": "tavily",
+            "quantity": 1, "cost_accuracy": "provider_reported", "cost_eur": "0.03",
+            "occurred_at": "2026-09-11T09:00:00Z",
+        }], True)
+
+    monkeypatch.setattr(main, "fetch_usage_rows", fake_rows)
+    result = asyncio.run(main.get_admin_economics_activities(
+        days=90, activity_type="discovery", limit=10, offset=0, _admin_user_id="tenant-admin",
+    ))
+    assert result["period"]["days"] == 90
+    assert result["total_activities"] == 1
+    assert result["activities"][0]["activity_type"] == "discovery"
+    assert result["summaries"]["discovery"]["average_known_cost_eur"] == pytest.approx(0.03)

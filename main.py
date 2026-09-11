@@ -24,7 +24,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 from uuid import uuid4
 from security_middleware import RateLimitMiddleware, RequestBodyLimitMiddleware, SecurityHeadersMiddleware
-from usage_economics import aggregate_costs, credit_summary, month_period, safe_unit_cost, usage_quantity
+from usage_economics import (
+    aggregate_costs,
+    build_cost_activities,
+    credit_summary,
+    month_period,
+    safe_unit_cost,
+    summarize_cost_activities,
+    usage_quantity,
+)
 
 load_dotenv()
 config = load_config()
@@ -5966,9 +5974,10 @@ async def fetch_usage_rows(
         "order": "occurred_at.asc",
         "limit": str(page_size),
         "select": (
-            "user_id,module,feature,event_type,provider,service,model,quantity,unit,"
+            "id,user_id,module,feature,event_type,provider,service,model,provider_event_id,quantity,unit,"
             "input_tokens,output_tokens,cache_creation_input_tokens,cache_read_input_tokens,"
-            "reasoning_tokens,cost_eur,cost_accuracy,cost_source,occurred_at"
+            "reasoning_tokens,cost_eur,cost_accuracy,cost_source,conversation_id,campaign_id,run_id,"
+            "idempotency_key,status,occurred_at"
         ),
     }
     if user_id:
@@ -6148,6 +6157,37 @@ async def get_admin_economics(_admin_user_id: str = Depends(require_admin)) -> d
             tenant: aggregate_costs(tenant_rows)["total_cost_eur"]
             for tenant, tenant_rows in by_tenant.items()
         },
+    }
+
+
+@app.get("/admin/economics/activities")
+async def get_admin_economics_activities(
+    days: int = Query(default=30, ge=1, le=3650),
+    activity_type: Optional[str] = Query(default=None, min_length=1, max_length=80),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=100000),
+    _admin_user_id: str = Depends(require_admin),
+) -> dict[str, Any]:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    rows, available = await fetch_usage_rows(start=start, end=end)
+    if not available:
+        raise HTTPException(status_code=503, detail="Usage ledger is unavailable")
+    all_activities = build_cost_activities(rows)
+    summaries = summarize_cost_activities(all_activities)
+    filtered = [
+        activity for activity in all_activities
+        if activity_type is None or activity.get("activity_type") == activity_type
+    ]
+    return {
+        "period": {"start": start.isoformat(), "end": end.isoformat(), "days": days},
+        "summaries": summaries,
+        "available_activity_types": list(summaries.keys()),
+        "total_activities": len(filtered),
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + limit < len(filtered),
+        "activities": filtered[offset:offset + limit],
     }
 
 

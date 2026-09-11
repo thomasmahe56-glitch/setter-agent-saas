@@ -141,6 +141,128 @@ def usage_quantity(rows: Iterable[dict[str, Any]], *, module: str | None = None,
     return int(total)
 
 
+ACTIVITY_LABELS = {
+    "discovery": "Discovery",
+    "assistant_message": "Message Angellos",
+    "follow_up": "Relance",
+    "dm_generation": "DM de prospection",
+    "prospect_analysis": "Analyse de prospect",
+    "training": "Action de training",
+}
+
+
+def _activity_kind(rows: list[dict[str, Any]]) -> tuple[str, str]:
+    event_types = {str(row.get("event_type") or "") for row in rows}
+    modules = {str(row.get("module") or "") for row in rows}
+    if "source_discovery" in event_types:
+        return "discovery", ACTIVITY_LABELS["discovery"]
+    if "assistant_reply_generated" in event_types:
+        return "assistant_message", ACTIVITY_LABELS["assistant_message"]
+    if "follow_up_generated" in event_types:
+        return "follow_up", ACTIVITY_LABELS["follow_up"]
+    if "dm_generated" in event_types:
+        return "dm_generation", ACTIVITY_LABELS["dm_generation"]
+    if "prospect_analyzed" in event_types or "prospect_qualified" in event_types:
+        return "prospect_analysis", ACTIVITY_LABELS["prospect_analysis"]
+    if "training" in modules:
+        return "training", ACTIVITY_LABELS["training"]
+    first = rows[0]
+    raw_kind = str(first.get("feature") or first.get("event_type") or first.get("module") or "other")
+    return raw_kind, raw_kind.replace("_", " ").strip().capitalize()
+
+
+def _activity_timestamp(row: dict[str, Any]) -> datetime:
+    try:
+        return datetime.fromisoformat(str(row.get("occurred_at") or "").replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def build_cost_activities(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Group immutable ledger rows into admin-facing business activities."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for position, row in enumerate(rows):
+        user_id = str(row.get("user_id") or "unknown")
+        run_id = row.get("run_id")
+        if run_id:
+            group_key = f"{user_id}:run:{run_id}"
+        else:
+            stable_id = (
+                row.get("provider_event_id")
+                or row.get("idempotency_key")
+                or row.get("id")
+                or f"row-{position}"
+            )
+            group_key = f"{user_id}:event:{stable_id}"
+        groups.setdefault(group_key, []).append(row)
+
+    activities: list[dict[str, Any]] = []
+    for group_key, group_rows in groups.items():
+        ordered = sorted(group_rows, key=_activity_timestamp)
+        kind, label = _activity_kind(ordered)
+        known_cost = sum((cost_value(row) or Decimal("0") for row in ordered), Decimal("0"))
+        unknown_operations = sum(1 for row in ordered if cost_value(row) is None)
+        quantities = sum((decimal_value(row.get("quantity")) or Decimal("0") for row in ordered), Decimal("0"))
+        tokens = {
+            "input": sum(int(row.get("input_tokens") or 0) for row in ordered),
+            "output": sum(int(row.get("output_tokens") or 0) for row in ordered),
+            "cache_creation": sum(int(row.get("cache_creation_input_tokens") or 0) for row in ordered),
+            "cache_read": sum(int(row.get("cache_read_input_tokens") or 0) for row in ordered),
+            "reasoning": sum(int(row.get("reasoning_tokens") or 0) for row in ordered),
+        }
+        first = ordered[0]
+        last = ordered[-1]
+        activities.append({
+            "id": group_key,
+            "activity_type": kind,
+            "label": label,
+            "module": str(first.get("module") or "unknown"),
+            "user_id": str(first.get("user_id") or "unknown"),
+            "run_id": first.get("run_id"),
+            "campaign_id": next((row.get("campaign_id") for row in ordered if row.get("campaign_id")), None),
+            "conversation_id": next((row.get("conversation_id") for row in ordered if row.get("conversation_id")), None),
+            "started_at": first.get("occurred_at"),
+            "ended_at": last.get("occurred_at"),
+            "total_cost_eur": _rounded(known_cost),
+            "cost_complete": unknown_operations == 0,
+            "unknown_operations": unknown_operations,
+            "known_operations": len(ordered) - unknown_operations,
+            "event_count": len(ordered),
+            "quantity": _rounded(quantities, 6),
+            "providers": sorted({str(row.get("provider")) for row in ordered if row.get("provider")}),
+            "models": sorted({str(row.get("model")) for row in ordered if row.get("model")}),
+            "features": sorted({str(row.get("feature")) for row in ordered if row.get("feature")}),
+            "event_types": sorted({str(row.get("event_type")) for row in ordered if row.get("event_type")}),
+            "tokens": tokens,
+        })
+    return sorted(activities, key=lambda item: _activity_timestamp({"occurred_at": item.get("started_at")}), reverse=True)
+
+
+def summarize_cost_activities(activities: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for activity in activities:
+        grouped.setdefault(str(activity.get("activity_type") or "other"), []).append(activity)
+
+    summaries: dict[str, dict[str, Any]] = {}
+    for activity_type, items in grouped.items():
+        costs = [decimal_value(item.get("total_cost_eur")) or Decimal("0") for item in items]
+        total = sum(costs, Decimal("0"))
+        complete_count = sum(1 for item in items if item.get("cost_complete"))
+        summaries[activity_type] = {
+            "activity_type": activity_type,
+            "label": str(items[0].get("label") or activity_type),
+            "activity_count": len(items),
+            "total_known_cost_eur": _rounded(total),
+            "average_known_cost_eur": _rounded(total / Decimal(len(items))) if items else None,
+            "minimum_known_cost_eur": _rounded(min(costs)) if costs else None,
+            "maximum_known_cost_eur": _rounded(max(costs)) if costs else None,
+            "complete_activities": complete_count,
+            "incomplete_activities": len(items) - complete_count,
+            "coverage_percent": round(complete_count / len(items) * 100, 2) if items else None,
+        }
+    return dict(sorted(summaries.items(), key=lambda item: (-item[1]["total_known_cost_eur"], item[0])))
+
+
 def credit_summary(
     transactions: Iterable[dict[str, Any]],
     credits_enabled: bool,
