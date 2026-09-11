@@ -86,10 +86,16 @@ def test_client_usage_summary_is_tenant_scoped_and_hides_internal_costs(monkeypa
 
     async def fake_rows(*, start, end, user_id=None, limit=10000):
         captured["user_id"] = user_id
-        return ([{
-            "user_id": "tenant-a", "module": "setter", "event_type": "assistant_reply_generated",
-            "quantity": 2, "cost_accuracy": "provider_usage_priced", "cost_eur": 99,
-        }], True)
+        return ([
+            {
+                "user_id": "tenant-a", "module": "setter", "event_type": "assistant_reply_generated",
+                "quantity": 2, "cost_accuracy": "provider_usage_priced", "cost_eur": 99,
+            },
+            {
+                "user_id": "tenant-a", "module": "prospecting", "event_type": "source_discovery",
+                "quantity": 3, "cost_accuracy": "unknown", "cost_eur": None,
+            },
+        ], True)
 
     async def fake_credits(user_id, start, end):
         return credit_summary([], False)
@@ -98,6 +104,8 @@ def test_client_usage_summary_is_tenant_scoped_and_hides_internal_costs(monkeypa
     monkeypatch.setattr(main, "get_credit_state", fake_credits)
     result = asyncio.run(main.get_usage_summary("tenant-a"))
     assert captured["user_id"] == "tenant-a"
+    assert result["usage"]["source_discoveries"] == 3
+    assert result["prospecting"]["source_discoveries"] == 3
     assert result["usage"]["assistant_replies"] == 2
     assert result["credits_remaining"] is None
     assert "total_cost_eur" not in result

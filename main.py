@@ -6078,6 +6078,7 @@ async def get_usage_summary(user_id: str = Depends(require_jwt)) -> dict[str, An
         "period": {"start": start.isoformat(), "end": end.isoformat()},
         "usage": {
             "total_operations": usage_quantity(rows),
+            "source_discoveries": usage_quantity(rows, module="prospecting", event_type="source_discovery"),
             "prospects_analyzed": usage_quantity(rows, module="prospecting", event_type="prospect_analyzed"),
             "prospects_qualified": usage_quantity(rows, module="prospecting", event_type="prospect_qualified"),
             "dms_generated": usage_quantity(rows, module="prospecting", event_type="dm_generated"),
@@ -6086,6 +6087,7 @@ async def get_usage_summary(user_id: str = Depends(require_jwt)) -> dict[str, An
             "training_actions": module_usage["training"],
         },
         "prospecting": {
+            "source_discoveries": usage_quantity(rows, module="prospecting", event_type="source_discovery"),
             "prospects_analyzed": usage_quantity(rows, module="prospecting", event_type="prospect_analyzed"),
             "prospects_qualified": usage_quantity(rows, module="prospecting", event_type="prospect_qualified"),
             "dms_generated": usage_quantity(rows, module="prospecting", event_type="dm_generated"),
