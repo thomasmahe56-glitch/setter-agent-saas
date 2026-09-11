@@ -22,7 +22,9 @@ import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
+from uuid import uuid4
 from security_middleware import RateLimitMiddleware, RequestBodyLimitMiddleware, SecurityHeadersMiddleware
+from usage_economics import aggregate_costs, credit_summary, month_period, safe_unit_cost, usage_quantity
 
 load_dotenv()
 config = load_config()
@@ -42,6 +44,10 @@ SUPABASE_AGENT_AVATARS_URL = f"{config.supabase_url}/agent_avatars"
 SUPABASE_AGENT_SALES_RULES_URL = f"{config.supabase_url}/agent_sales_rules"
 SUPABASE_BETA_AI_USAGE_URL = f"{config.supabase_url}/beta_ai_usage"
 SUPABASE_BETA_ACCOUNT_SETTINGS_URL = f"{config.supabase_url}/beta_account_settings"
+SUPABASE_USAGE_LEDGER_URL = f"{config.supabase_url}/usage_ledger"
+SUPABASE_CREDIT_RULES_URL = f"{config.supabase_url}/credit_rules"
+SUPABASE_CREDIT_TRANSACTIONS_URL = f"{config.supabase_url}/credit_transactions"
+SUPABASE_PROSPECTS_URL = f"{config.supabase_url}/prospects"
 MANYCHAT_API_KEY = config.manychat_token
 MANYCHAT_SEND_URL = "https://api.manychat.com/fb/sending/sendContent"
 WHATSAPP_ACCESS_TOKEN = config.whatsapp_access_token
@@ -55,11 +61,16 @@ MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "40"))
 MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("MAX_EXTRACTED_TEXT_CHARS", "120000"))
 MAX_DOCX_XML_BYTES = int(os.environ.get("MAX_DOCX_XML_BYTES", "5000000"))
 DEFAULT_BETA_COST_CAP_EUR = float(os.environ.get("DEFAULT_BETA_COST_CAP_EUR", "50"))
-CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN", "2.75"))
-CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN", "13.75"))
-CLAUDE_SONNET_4_6_CACHE_CREATION_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_CACHE_CREATION_INPUT_EUR_PER_MTOKEN", "0"))
-CLAUDE_SONNET_4_6_CACHE_READ_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_CACHE_READ_INPUT_EUR_PER_MTOKEN", "0"))
-AI_USAGE_PRICING_VERSION = "anthropic-usage-eur-env-2026-08-22"
+ANTHROPIC_USD_TO_EUR_RATE = float(os.environ.get("ANTHROPIC_USD_TO_EUR_RATE", "0.86088154"))
+CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN", "2.58264463"))
+CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN", "12.91322314"))
+CLAUDE_SONNET_4_6_CACHE_CREATION_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_CACHE_CREATION_INPUT_EUR_PER_MTOKEN", "3.22830579"))
+CLAUDE_SONNET_4_6_CACHE_READ_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_SONNET_4_6_CACHE_READ_INPUT_EUR_PER_MTOKEN", "0.25826446"))
+CLAUDE_OPUS_4_7_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_OPUS_4_7_INPUT_EUR_PER_MTOKEN", "4.30440771"))
+CLAUDE_OPUS_4_7_OUTPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_OPUS_4_7_OUTPUT_EUR_PER_MTOKEN", "21.52203857"))
+CLAUDE_OPUS_4_7_CACHE_CREATION_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_OPUS_4_7_CACHE_CREATION_INPUT_EUR_PER_MTOKEN", "5.38050964"))
+CLAUDE_OPUS_4_7_CACHE_READ_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_OPUS_4_7_CACHE_READ_INPUT_EUR_PER_MTOKEN", "0.43044077"))
+AI_USAGE_PRICING_VERSION = os.environ.get("AI_USAGE_PRICING_VERSION", "anthropic-usd-eur-2026-09-11-v1")
 AI_COST_BLOCK_USER_MESSAGE = "Angellos a atteint le plafond de coût IA configuré pour ce compte. Les nouvelles réponses automatiques sont arrêtées par sécurité."
 DEFAULT_BETA_ACCOUNT_SETTINGS = {
     "cap_eur": DEFAULT_BETA_COST_CAP_EUR,
@@ -460,11 +471,34 @@ def estimate_token_count(text: str) -> int:
     return max(1, (len(text or "") + 3) // 4)
 
 
-def estimate_claude_cost_eur(input_text: str, output_text: str) -> float:
+def anthropic_rates_eur(model: str) -> dict[str, float]:
+    if "opus-4-7" in (model or "").lower():
+        return {
+            "input": CLAUDE_OPUS_4_7_INPUT_EUR_PER_MTOKEN,
+            "output": CLAUDE_OPUS_4_7_OUTPUT_EUR_PER_MTOKEN,
+            "cache_creation": CLAUDE_OPUS_4_7_CACHE_CREATION_INPUT_EUR_PER_MTOKEN,
+            "cache_read": CLAUDE_OPUS_4_7_CACHE_READ_INPUT_EUR_PER_MTOKEN,
+        }
+    return {
+        "input": CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN,
+        "output": CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN,
+        "cache_creation": CLAUDE_SONNET_4_6_CACHE_CREATION_INPUT_EUR_PER_MTOKEN,
+        "cache_read": CLAUDE_SONNET_4_6_CACHE_READ_INPUT_EUR_PER_MTOKEN,
+    }
+
+
+def anthropic_rates_usd(model: str) -> dict[str, float]:
+    if "opus-4-7" in (model or "").lower():
+        return {"input": 5.0, "output": 25.0, "cache_creation": 6.25, "cache_read": 0.5}
+    return {"input": 3.0, "output": 15.0, "cache_creation": 3.75, "cache_read": 0.3}
+
+
+def estimate_claude_cost_eur(input_text: str, output_text: str, model: str = "claude-sonnet-4-6") -> float:
     input_tokens = estimate_token_count(input_text)
     output_tokens = estimate_token_count(output_text)
-    return (input_tokens / 1_000_000 * CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN) + (
-        output_tokens / 1_000_000 * CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN
+    rates = anthropic_rates_eur(model)
+    return (input_tokens / 1_000_000 * rates["input"]) + (
+        output_tokens / 1_000_000 * rates["output"]
     )
 
 
@@ -473,11 +507,22 @@ def calculate_anthropic_usage_cost_eur(usage: AiGenerationUsage) -> float:
     output_tokens = usage.output_tokens or 0
     cache_creation_tokens = usage.cache_creation_input_tokens or 0
     cache_read_tokens = usage.cache_read_input_tokens or 0
+    rates = anthropic_rates_eur(usage.model)
     return (
-        input_tokens / 1_000_000 * CLAUDE_SONNET_4_6_INPUT_EUR_PER_MTOKEN
-        + output_tokens / 1_000_000 * CLAUDE_SONNET_4_6_OUTPUT_EUR_PER_MTOKEN
-        + cache_creation_tokens / 1_000_000 * CLAUDE_SONNET_4_6_CACHE_CREATION_INPUT_EUR_PER_MTOKEN
-        + cache_read_tokens / 1_000_000 * CLAUDE_SONNET_4_6_CACHE_READ_INPUT_EUR_PER_MTOKEN
+        input_tokens / 1_000_000 * rates["input"]
+        + output_tokens / 1_000_000 * rates["output"]
+        + cache_creation_tokens / 1_000_000 * rates["cache_creation"]
+        + cache_read_tokens / 1_000_000 * rates["cache_read"]
+    )
+
+
+def calculate_anthropic_usage_cost_usd(usage: AiGenerationUsage) -> float:
+    rates = anthropic_rates_usd(usage.model)
+    return (
+        (usage.input_tokens or 0) / 1_000_000 * rates["input"]
+        + (usage.output_tokens or 0) / 1_000_000 * rates["output"]
+        + (usage.cache_creation_input_tokens or 0) / 1_000_000 * rates["cache_creation"]
+        + (usage.cache_read_input_tokens or 0) / 1_000_000 * rates["cache_read"]
     )
 
 
@@ -670,15 +715,34 @@ async def record_ai_usage_event(
     usage: Optional[AiGenerationUsage] = None,
     conversation_id: Optional[str] = None,
     request_kind: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    retry_group_id: Optional[str] = None,
 ) -> dict:
     input_tokens = estimate_token_count(input_text)
     output_tokens = estimate_token_count(output_text)
-    estimated_cost = estimate_claude_cost_eur(input_text, output_text)
+    effective_model = usage.model if usage else model
+    estimated_cost = estimate_claude_cost_eur(input_text, output_text, effective_model)
     usage_cost = calculate_anthropic_usage_cost_eur(usage) if usage else None
+    provider_cost_usd = calculate_anthropic_usage_cost_usd(usage) if usage else None
+    effective_exchange_rate = (
+        usage_cost / provider_cost_usd
+        if usage_cost is not None and provider_cost_usd
+        else ANTHROPIC_USD_TO_EUR_RATE
+    )
+    pricing_snapshot = {
+        "provider": "anthropic",
+        "model": effective_model,
+        "provider_currency": "USD",
+        "cost_currency": "EUR",
+        "rates_per_million_tokens": anthropic_rates_eur(effective_model),
+        "provider_rates_usd_per_million_tokens": anthropic_rates_usd(effective_model),
+        "exchange_rate_to_eur": effective_exchange_rate,
+        "source": "Anthropic list pricing converted with the versioned deployment EUR rates",
+    }
     row = {
         "user_id": user_id,
         "feature": feature,
-        "model": usage.model if usage else model,
+        "model": effective_model,
         "input_tokens_estimated": input_tokens,
         "output_tokens_estimated": output_tokens,
         "estimated_cost_eur": round(estimated_cost, 8),
@@ -693,22 +757,28 @@ async def record_ai_usage_event(
         "prompt_cache_miss_tokens": usage.cache_creation_input_tokens if usage else None,
         "reasoning_tokens": None,
         "usage_raw": usage.usage_raw if usage else None,
-        "provider_currency": "EUR" if usage else None,
-        "provider_cost": round(usage_cost, 8) if usage_cost is not None else None,
+        "provider_currency": "USD" if usage else None,
+        "provider_cost": round(provider_cost_usd, 8) if provider_cost_usd is not None else None,
         "cost_eur": round(usage_cost, 8) if usage_cost is not None else None,
-        "exchange_rate_to_eur": 1.0 if usage else None,
+        "exchange_rate_to_eur": effective_exchange_rate if usage else None,
         "pricing_version": AI_USAGE_PRICING_VERSION if usage else "estimated-char-div-4",
+        "pricing_snapshot": pricing_snapshot,
         "cost_source": "provider_usage_priced" if usage else "estimated_fallback",
         "conversation_id": conversation_id,
         "status": "recorded",
         "request_kind": request_kind or feature,
+        "idempotency_key": idempotency_key or (
+            f"anthropic:{usage.provider_response_id}" if usage and usage.provider_response_id else f"anthropic-local:{uuid4()}"
+        ),
+        "retry_group_id": retry_group_id,
     }
     row = {key: value for key, value in row.items() if value is not None}
     try:
         async with httpx.AsyncClient() as http:
             res = await http.post(
                 SUPABASE_BETA_AI_USAGE_URL,
-                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                headers={**supabase_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
+                params={"on_conflict": "user_id,idempotency_key"},
                 json=row,
                 timeout=5.0,
             )
@@ -738,6 +808,73 @@ async def record_ai_usage_event(
             print(f"[ai-cost:record] profile fallback unavailable error={type(profile_error).__name__}: {profile_error}", flush=True)
     await release_ai_cost_slot(user_id)
     return row
+
+
+async def record_usage_ledger_event(
+    *,
+    user_id: str,
+    module: str,
+    feature: str,
+    event_type: str,
+    provider: Optional[str],
+    service: Optional[str],
+    status: str,
+    idempotency_key: str,
+    provider_event_id: Optional[str] = None,
+    quantity: float = 1,
+    unit: str = "operation",
+    conversation_id: Optional[str] = None,
+    cost_accuracy: str = "unknown",
+    cost_source: str = "provider_cost_unavailable",
+    metadata: Optional[dict[str, Any]] = None,
+) -> None:
+    row = {
+        "user_id": user_id,
+        "module": module,
+        "feature": feature,
+        "event_type": event_type,
+        "provider": provider,
+        "service": service,
+        "provider_event_id": provider_event_id,
+        "quantity": quantity,
+        "unit": unit,
+        "cost_eur": None,
+        "cost_accuracy": cost_accuracy,
+        "cost_source": cost_source,
+        "conversation_id": conversation_id,
+        "request_kind": feature,
+        "status": status,
+        "idempotency_key": idempotency_key,
+        "metadata": metadata or {},
+    }
+    row = {key: value for key, value in row.items() if value is not None}
+    try:
+        async with httpx.AsyncClient() as http:
+            response = await http.post(
+                SUPABASE_USAGE_LEDGER_URL,
+                headers={**supabase_headers(), "Prefer": "resolution=ignore-duplicates,return=minimal"},
+                params={"on_conflict": "user_id,idempotency_key"},
+                json=row,
+                timeout=5.0,
+            )
+            if response.status_code >= 400:
+                print(
+                    f"[usage:record:error] provider={provider or 'unknown'} feature={feature} "
+                    f"status={response.status_code}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[usage_recorded] provider={provider or 'unknown'} feature={feature} "
+                    f"tenant={user_id} cost_source={cost_source} event_id={provider_event_id or idempotency_key}",
+                    flush=True,
+                )
+    except Exception as error:
+        print(
+            f"[usage:record:error] provider={provider or 'unknown'} feature={feature} "
+            f"error={type(error).__name__}",
+            flush=True,
+        )
 
 
 def cost_cap_error_payload(error: CostCapExceededError | AiSpendUnavailableError) -> dict:
@@ -808,6 +945,15 @@ async def require_jwt(authorization: Optional[str] = Header(default=None)) -> st
         raise HTTPException(status_code=503, detail="Beta access allowlist is not configured")
     if user_id not in allowed_user_ids:
         raise HTTPException(status_code=403, detail="This account is not authorized for the private beta")
+    return user_id
+
+
+async def require_admin(user_id: str = Depends(require_jwt)) -> str:
+    owner_user_id = (config.owner_user_id or "").strip()
+    if not owner_user_id:
+        raise HTTPException(status_code=503, detail="Admin authorization is not configured")
+    if not hmac.compare_digest(user_id, owner_user_id):
+        raise HTTPException(status_code=403, detail="Angellos admin access required")
     return user_id
 
 
@@ -2748,12 +2894,45 @@ async def send_channel_message(conversation: dict, text: str) -> dict:
         phone_e164 = conversation.get("phone_e164") or conversation.get("external_contact_id") or conversation.get("username")
         if not phone_e164:
             raise HTTPException(status_code=422, detail="Conversation has no WhatsApp phone number")
-        return await send_whatsapp_text(phone_e164, text)
+        result = await send_whatsapp_text(phone_e164, text)
+        provider = "meta_whatsapp"
+    else:
+        subscriber_id = conversation.get("external_contact_id") or conversation.get("username")
+        if not subscriber_id:
+            raise HTTPException(status_code=422, detail="Conversation has no ManyChat subscriber id")
+        result = await send_manychat_message(subscriber_id, text)
+        provider = "manychat"
 
-    subscriber_id = conversation.get("external_contact_id") or conversation.get("username")
-    if not subscriber_id:
-        raise HTTPException(status_code=422, detail="Conversation has no ManyChat subscriber id")
-    return await send_manychat_message(subscriber_id, text)
+    user_id = str(conversation.get("user_id") or "").strip()
+    if user_id and int(result.get("status_code") or 500) < 400:
+        provider_event_id = None
+        try:
+            body = json.loads(result.get("body") or "{}")
+            provider_event_id = first_text(
+                body.get("message_id") if isinstance(body, dict) else None,
+                ((body.get("messages") or [{}])[0].get("id") if isinstance(body, dict) else None),
+                body.get("request_id") if isinstance(body, dict) else None,
+            )
+        except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
+            provider_event_id = None
+        await record_usage_ledger_event(
+            user_id=user_id,
+            module="setter",
+            feature="outbound_channel_message",
+            event_type="channel_message_sent",
+            provider=provider,
+            service="messaging",
+            status="accepted",
+            idempotency_key=(f"{provider}:{provider_event_id}" if provider_event_id else f"{provider}:local:{uuid4()}"),
+            provider_event_id=provider_event_id,
+            quantity=1,
+            unit="message",
+            conversation_id=conversation.get("id"),
+            cost_accuracy="unknown",
+            cost_source="provider_cost_unavailable",
+            metadata={"channel": channel},
+        )
+    return result
 
 
 def is_manychat_pending_delivery_error(send_result: Optional[dict]) -> bool:
@@ -3236,16 +3415,26 @@ async def fetch_conversations_for_review(user_id: str, start: datetime, end: dat
     return eligible[:limit]
 
 
-async def review_single_conversation(conversation: dict, active_prompt: str) -> dict:
+async def review_single_conversation(user_id: str, conversation: dict, active_prompt: str) -> dict:
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
+    await enforce_ai_cost_cap(user_id)
+    user_message = conversation_review_user_message(conversation, active_prompt)
+    generation = generate_claude_generation(
+        [{"role": "user", "content": user_message}],
+        build_conversation_review_prompt(config),
         max_tokens=2048,
-        system=build_conversation_review_prompt(config),
-        messages=[{"role": "user", "content": conversation_review_user_message(conversation, active_prompt)}],
     )
-    raw = getattr(response.content[0], "text", "").strip()
+    raw = generation.text.strip()
+    await record_ai_usage_event(
+        user_id,
+        "conversation_review",
+        user_message,
+        raw,
+        usage=generation.usage,
+        conversation_id=conversation.get("id"),
+        request_kind="conversation_review",
+    )
     return normalize_conversation_review(parse_llm_json(raw), conversation)
 
 
@@ -3318,7 +3507,7 @@ async def run_daily_conversation_review_job(user_id: str, review_date: Optional[
     errors = []
     for conversation in conversations:
         try:
-            review = await review_single_conversation(conversation, active_prompt)
+            review = await review_single_conversation(user_id, conversation, active_prompt)
             stored = await store_conversation_review(user_id, selected_date, conversation, review)
             stored_reviews.append(review_public_payload(stored))
         except Exception as e:
@@ -3442,21 +3631,24 @@ def normalize_postmortem_synthesis(raw_result: dict, active_prompt: str) -> dict
     }
 
 
-async def synthesize_postmortem_prompt(active_prompt: str, aggregate: dict, reviews: list[dict], days: int) -> dict:
+async def synthesize_postmortem_prompt(user_id: str, active_prompt: str, aggregate: dict, reviews: list[dict], days: int) -> dict:
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
+    await enforce_ai_cost_cap(user_id)
     user_message = build_postmortem_synthesis_message(active_prompt, aggregate, reviews, days)
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=8192,
-        system=(
+    system = (
             "You are a senior prompt engineer reviewing Angellos post-mortems. "
             "You propose inactive prompt candidates only; never activate them. "
             "Make minimal, evidence-backed prompt changes. Return strict JSON only."
-        ),
-        messages=[{"role": "user", "content": user_message}],
     )
-    raw = getattr(response.content[0], "text", "").strip()
+    generation = generate_claude_generation(
+        [{"role": "user", "content": user_message}], system, max_tokens=8192
+    )
+    raw = generation.text.strip()
+    await record_ai_usage_event(
+        user_id, "conversation_postmortem", user_message, raw,
+        usage=generation.usage, request_kind="conversation_postmortem",
+    )
     return normalize_postmortem_synthesis(parse_llm_json(raw), active_prompt)
 
 
@@ -3593,7 +3785,7 @@ async def run_weekly_conversation_postmortem_job(user_id: str, days: int = 7, li
     errors = []
     for conversation in conversations:
         try:
-            reviews.append(await review_single_conversation(conversation, active_prompt_for_review))
+            reviews.append(await review_single_conversation(user_id, conversation, active_prompt_for_review))
         except Exception as e:
             print(f"[reviews:postmortem] failed conversation_id={conversation.get('id')} error={e}")
             errors.append({"conversation_id": conversation.get("id"), "error": str(e)[:300]})
@@ -3614,7 +3806,7 @@ async def run_weekly_conversation_postmortem_job(user_id: str, days: int = 7, li
         }
 
     aggregate = aggregate_postmortem_reviews(reviews)
-    synthesis = await synthesize_postmortem_prompt(active_prompt_for_candidate, aggregate, reviews, bounded_days)
+    synthesis = await synthesize_postmortem_prompt(user_id, active_prompt_for_candidate, aggregate, reviews, bounded_days)
     new_version = await insert_postmortem_prompt_version(user_id, active_version, synthesis)
 
     return {
@@ -4497,10 +4689,16 @@ async def run_simulator_scenario(
         scenario = localized_simulator_scenario(scenario, tenant_language_from_prompt(active_prompt))
         system_prompt = build_generation_prompt(active_prompt)
         try:
+            await enforce_ai_cost_cap(user_id)
             generation = generate_claude_generation(strip_message_metadata(scenario.get("history") or []), system_prompt, max_tokens=500)
             reply = validate_agent_reply(sanitize_angellos_beta_reply(generation.text, simulator_last_user_message(scenario.get("history") or [])), system_prompt)
             source = "anthropic_live_generation"
+            await record_ai_usage_event(
+                user_id, "conversation_simulator", json.dumps(strip_message_metadata(scenario.get("history") or []), ensure_ascii=False),
+                reply, usage=generation.usage, request_kind="conversation_simulator",
+            )
         except ProviderGenerationError as e:
+            await release_ai_cost_slot(user_id)
             return {"scenario_id": scenario["id"], **provider_error_payload(e)}
     else:
         reply, source = deterministic_simulator_reply(scenario)
@@ -5601,11 +5799,14 @@ async def refine_pending(
     )
 
     try:
-        refined = generate_claude_reply(
+        await enforce_ai_cost_cap(user_id)
+        generation = generate_claude_generation(
             [{"role": "user", "content": refine_prompt}],
             generation_prompt,
         )
+        refined = generation.text
     except ProviderGenerationError as e:
+        await release_ai_cost_slot(user_id)
         return provider_error_response(e)
 
     last_prospect_message = next(
@@ -5614,6 +5815,11 @@ async def refine_pending(
     )
     refined = sanitize_angellos_beta_reply(refined, last_prospect_message)
     refined = validate_agent_reply(refined, generation_prompt)
+    await record_ai_usage_event(
+        user_id, "refine_pending", refine_prompt, refined,
+        usage=generation.usage, conversation_id=conversation_id,
+        request_kind="refine_pending",
+    )
 
     updated_history = []
     patched = False
@@ -5745,6 +5951,202 @@ async def delete_conversation(
 @app.get("/beta/ai-cost")
 async def get_beta_ai_cost(user_id: str = Depends(require_jwt)):
     return await beta_ai_cost_status(user_id)
+
+
+async def fetch_usage_rows(
+    *,
+    start: datetime,
+    end: datetime,
+    user_id: Optional[str] = None,
+    limit: int = 100000,
+) -> tuple[list[dict[str, Any]], bool]:
+    page_size = min(1000, limit)
+    params = {
+        "and": f"(occurred_at.gte.{start.isoformat()},occurred_at.lt.{end.isoformat()})",
+        "order": "occurred_at.asc",
+        "limit": str(page_size),
+        "select": (
+            "user_id,module,feature,event_type,provider,service,model,quantity,unit,"
+            "input_tokens,output_tokens,cache_creation_input_tokens,cache_read_input_tokens,"
+            "reasoning_tokens,cost_eur,cost_accuracy,cost_source,occurred_at"
+        ),
+    }
+    if user_id:
+        params["user_id"] = f"eq.{user_id}"
+    try:
+        rows: list[dict[str, Any]] = []
+        async with httpx.AsyncClient() as http:
+            while len(rows) < limit:
+                page_params = {**params, "offset": str(len(rows))}
+                response = await http.get(
+                    SUPABASE_USAGE_LEDGER_URL,
+                    headers={**supabase_headers(), "Accept": "application/json"},
+                    params=page_params,
+                    timeout=12.0,
+                )
+                if response.status_code >= 400:
+                    print(f"[usage:read:error] status={response.status_code}", flush=True)
+                    return [], False
+                page = response.json()
+                rows.extend(page)
+                if len(page) < page_size:
+                    return rows, True
+        print(f"[usage:read:error] safety_limit={limit} reached", flush=True)
+        return [], False
+    except Exception as error:
+        print(f"[usage:read:error] error={type(error).__name__}", flush=True)
+        return [], False
+
+
+async def fetch_period_rows(table_url: str, start: datetime, end: datetime, user_id: Optional[str]) -> list[dict[str, Any]]:
+    page_size = 1000
+    safety_limit = 100000
+    params = {
+        "and": f"(created_at.gte.{start.isoformat()},created_at.lt.{end.isoformat()})",
+        "select": "status" if table_url == SUPABASE_CONVERSATIONS_URL else "qualification_score",
+        "limit": str(page_size),
+    }
+    if user_id:
+        params["user_id"] = f"eq.{user_id}"
+    try:
+        rows: list[dict[str, Any]] = []
+        async with httpx.AsyncClient() as http:
+            while len(rows) < safety_limit:
+                response = await http.get(
+                    table_url,
+                    headers={**supabase_headers(), "Accept": "application/json"},
+                    params={**params, "offset": str(len(rows))},
+                    timeout=12.0,
+                )
+                if response.status_code >= 400:
+                    return []
+                page = response.json()
+                rows.extend(page)
+                if len(page) < page_size:
+                    return rows
+        return []
+    except Exception:
+        return []
+
+
+async def get_credit_state(user_id: str, start: datetime, end: datetime) -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient() as http:
+            rules_response, transactions_response = await asyncio.gather(
+                http.get(
+                    SUPABASE_CREDIT_RULES_URL,
+                    headers={**supabase_headers(), "Accept": "application/json"},
+                    params={"enabled": "eq.true", "effective_from": f"lt.{end.isoformat()}", "select": "id", "limit": "1"},
+                    timeout=8.0,
+                ),
+                http.get(
+                    SUPABASE_CREDIT_TRANSACTIONS_URL,
+                    headers={**supabase_headers(), "Accept": "application/json"},
+                    params={"user_id": f"eq.{user_id}", "select": "transaction_type,credits,occurred_at", "limit": "10000"},
+                    timeout=8.0,
+                ),
+            )
+        enabled = rules_response.status_code < 400 and bool(rules_response.json())
+        transactions = transactions_response.json() if transactions_response.status_code < 400 else []
+        return credit_summary(transactions, enabled, start, end)
+    except Exception:
+        return credit_summary([], False)
+
+
+@app.get("/usage/summary")
+async def get_usage_summary(user_id: str = Depends(require_jwt)) -> dict[str, Any]:
+    start, end = month_period()
+    rows, available = await fetch_usage_rows(start=start, end=end, user_id=user_id)
+    credits = await get_credit_state(user_id, start, end)
+    if not available:
+        return {
+            "period": {"start": start.isoformat(), "end": end.isoformat()},
+            "usage": None,
+            "prospecting": None,
+            "conversations": None,
+            "training": None,
+            "usage_by_module": None,
+            "data_available": False,
+            **credits,
+        }
+
+    module_usage = {
+        module: usage_quantity(rows, module=module)
+        for module in ("prospecting", "setter", "training")
+    }
+    return {
+        "period": {"start": start.isoformat(), "end": end.isoformat()},
+        "usage": {
+            "total_operations": usage_quantity(rows),
+            "prospects_analyzed": usage_quantity(rows, module="prospecting", event_type="prospect_analyzed"),
+            "prospects_qualified": usage_quantity(rows, module="prospecting", event_type="prospect_qualified"),
+            "dms_generated": usage_quantity(rows, module="prospecting", event_type="dm_generated"),
+            "assistant_replies": usage_quantity(rows, module="setter", event_type="assistant_reply_generated"),
+            "follow_ups": usage_quantity(rows, module="setter", event_type="follow_up_generated"),
+            "training_actions": module_usage["training"],
+        },
+        "prospecting": {
+            "prospects_analyzed": usage_quantity(rows, module="prospecting", event_type="prospect_analyzed"),
+            "prospects_qualified": usage_quantity(rows, module="prospecting", event_type="prospect_qualified"),
+            "dms_generated": usage_quantity(rows, module="prospecting", event_type="dm_generated"),
+        },
+        "conversations": {
+            "assistant_replies": usage_quantity(rows, module="setter", event_type="assistant_reply_generated"),
+            "follow_ups": usage_quantity(rows, module="setter", event_type="follow_up_generated"),
+        },
+        "training": {"ai_actions": module_usage["training"]},
+        "usage_by_module": module_usage,
+        "data_available": True,
+        **credits,
+    }
+
+
+@app.get("/admin/economics")
+async def get_admin_economics(_admin_user_id: str = Depends(require_admin)) -> dict[str, Any]:
+    start, end = month_period()
+    rows, available = await fetch_usage_rows(start=start, end=end)
+    if not available:
+        raise HTTPException(status_code=503, detail="Usage ledger is unavailable")
+    conversations, prospects = await asyncio.gather(
+        fetch_period_rows(SUPABASE_CONVERSATIONS_URL, start, end, None),
+        fetch_period_rows(SUPABASE_PROSPECTS_URL, start, end, None),
+    )
+    costs = aggregate_costs(rows)
+    qualified = len([row for row in prospects if row.get("qualification_score") is not None])
+    calls_booked = len([row for row in conversations if row.get("status") in {"appel_booke", "signe"}])
+    conversations_count = len(conversations)
+    denominators = {
+        "prospects_retrieved": usage_quantity(rows, module="prospecting", event_type="profiles_retrieved"),
+        "prospects_analyzed": usage_quantity(rows, module="prospecting", event_type="prospect_analyzed"),
+        "prospects_qualified": qualified,
+        "dms_generated": usage_quantity(rows, module="prospecting", event_type="dm_generated"),
+        "conversations": conversations_count,
+        "calls_booked": calls_booked,
+    }
+    total = costs["total_cost_eur"]
+    prospecting_cost = float(costs["cost_by_module"].get("prospecting") or 0)
+    setter_cost = float(costs["cost_by_module"].get("setter") or 0)
+    unit_economics = {
+        "cost_per_prospect_retrieved_eur": safe_unit_cost(prospecting_cost, denominators["prospects_retrieved"]),
+        "cost_per_prospect_analyzed_eur": safe_unit_cost(prospecting_cost, denominators["prospects_analyzed"]),
+        "cost_per_prospect_qualified_eur": safe_unit_cost(prospecting_cost, denominators["prospects_qualified"]),
+        "cost_per_dm_generated_eur": safe_unit_cost(prospecting_cost, denominators["dms_generated"]),
+        "cost_per_conversation_eur": safe_unit_cost(setter_cost, denominators["conversations"]),
+        "cost_per_call_booked_eur": safe_unit_cost(total, denominators["calls_booked"]),
+    }
+    by_tenant: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_tenant.setdefault(str(row.get("user_id") or "unknown"), []).append(row)
+    return {
+        "period": {"start": start.isoformat(), "end": end.isoformat()},
+        **costs,
+        "denominators": denominators,
+        "unit_economics": unit_economics,
+        "cost_by_tenant": {
+            tenant: aggregate_costs(tenant_rows)["total_cost_eur"]
+            for tenant, tenant_rows in by_tenant.items()
+        },
+    }
 
 
 async def beta_ai_cost_status(user_id: str) -> dict:
@@ -6265,14 +6667,24 @@ async def run_feedback_loop(
         user_message += f"\n\n=== TEST CONVERSATION ===\n{payload.test_conversation}"
 
     try:
-        response = client.messages.create(
+        await enforce_ai_cost_cap(user_id)
+        generation = generate_claude_generation(
+            [{"role": "user", "content": user_message}],
+            build_analysis_prompt(config),
             model="claude-opus-4-7",
             max_tokens=4096,
-            system=build_analysis_prompt(config),
-            messages=[{"role": "user", "content": user_message}],
         )
-        raw = response.content[0].text.strip()
+        raw = generation.text.strip()
+        await record_ai_usage_event(
+            user_id, "feedback_loop", user_message, raw,
+            model="claude-opus-4-7", usage=generation.usage,
+            request_kind="feedback_loop",
+        )
+    except (CostCapExceededError, AiSpendUnavailableError) as error:
+        await release_ai_cost_slot(user_id)
+        raise HTTPException(status_code=402, detail=cost_cap_error_payload(error))
     except Exception as e:
+        await release_ai_cost_slot(user_id)
         return provider_error_response(classify_provider_error(e))
 
     # 4. Parse the JSON response
@@ -6438,6 +6850,11 @@ async def preview_prompt(
     if client is None:
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY is not configured")
 
+    try:
+        await enforce_ai_cost_cap(user_id)
+    except (CostCapExceededError, AiSpendUnavailableError) as error:
+        raise HTTPException(status_code=402, detail=cost_cap_error_payload(error))
+
     prompt_actif = await get_active_prompt(user_id)
 
     def fmt(items: list[str], label: str) -> str:
@@ -6467,19 +6884,22 @@ async def preview_prompt(
     )
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            system=(
+        system = (
                 "You are an expert in AI prompt optimization. "
                 "Default language is English for Angellos English beta. "
                 "Return generated prompt lines, diffs, summaries, and justifications in English. "
                 "Never use French labels like 'TON RÔLE'; use English labels like 'Your role'."
-            ),
-            messages=[{"role": "user", "content": user_message}],
         )
-        raw = response.content[0].text.strip()
+        generation = generate_claude_generation(
+            [{"role": "user", "content": user_message}], system, max_tokens=4096
+        )
+        raw = generation.text.strip()
+        await record_ai_usage_event(
+            user_id, "prompt_preview", user_message, raw,
+            usage=generation.usage, request_kind="prompt_preview",
+        )
     except Exception as e:
+        await release_ai_cost_slot(user_id)
         return provider_error_response(classify_provider_error(e))
 
     try:
@@ -6628,13 +7048,17 @@ async def refine_prompt(
         )
 
         try:
-            response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=8192,
-                system=system,
-                messages=[{"role": "user", "content": user_message}],
+            retry_group_id = str(uuid4())
+            await enforce_ai_cost_cap(user_id)
+            generation = generate_claude_generation(
+                [{"role": "user", "content": user_message}], system, max_tokens=8192
             )
-            raw = response.content[0].text.strip()
+            raw = generation.text.strip()
+            await record_ai_usage_event(
+                user_id, "prompt_refinement", user_message, raw,
+                usage=generation.usage, request_kind="prompt_refinement",
+                retry_group_id=retry_group_id,
+            )
             result = normalize_prompt_refinement_result(parse_llm_json(raw), current_prompt)
             if fallback_language != "fr" and looks_like_french_refinement_text(result):
                 retry_message = (
@@ -6642,19 +7066,25 @@ async def refine_prompt(
                     "The previous draft used French. Regenerate the same surgical update fully in English. "
                     "Translate any French rule labels into English. Return only the required JSON."
                 )
-                response = client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=8192,
-                    system=system,
-                    messages=[{"role": "user", "content": retry_message}],
+                await enforce_ai_cost_cap(user_id)
+                retry_generation = generate_claude_generation(
+                    [{"role": "user", "content": retry_message}], system, max_tokens=8192
                 )
-                raw = response.content[0].text.strip()
+                raw = retry_generation.text.strip()
+                await record_ai_usage_event(
+                    user_id, "prompt_refinement_retry", retry_message, raw,
+                    usage=retry_generation.usage,
+                    request_kind="prompt_refinement_retry",
+                    retry_group_id=retry_group_id,
+                )
                 result = normalize_prompt_refinement_result(parse_llm_json(raw), current_prompt)
                 if looks_like_french_refinement_text(result):
                     raise ValueError("Claude returned French text for an English beta prompt refinement")
         except ProviderGenerationError as e:
+            await release_ai_cost_slot(user_id)
             return provider_error_response(e)
         except Exception as e:
+            await release_ai_cost_slot(user_id)
             print(
                 "[refine-prompt:llm-invalid] "
                 f"error={type(e).__name__}: {str(e)[:500]} instruction_len={len(instruction)}",
