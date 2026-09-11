@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -72,17 +73,15 @@ def test_credit_engine_disabled_and_enabled_rule_is_versioned_idempotent():
     assert build_credit_debit(event, selected) == debit
 
 
-@pytest.mark.asyncio
-async def test_admin_authorization_is_server_side(monkeypatch):
+def test_admin_authorization_is_server_side(monkeypatch):
     monkeypatch.setattr(main.config, "owner_user_id", "tenant-admin")
-    assert await main.require_admin("tenant-admin") == "tenant-admin"
+    assert asyncio.run(main.require_admin("tenant-admin")) == "tenant-admin"
     with pytest.raises(main.HTTPException) as error:
-        await main.require_admin("tenant-b")
+        asyncio.run(main.require_admin("tenant-b"))
     assert error.value.status_code == 403
 
 
-@pytest.mark.asyncio
-async def test_client_usage_summary_is_tenant_scoped_and_hides_internal_costs(monkeypatch):
+def test_client_usage_summary_is_tenant_scoped_and_hides_internal_costs(monkeypatch):
     captured = {}
 
     async def fake_rows(*, start, end, user_id=None, limit=10000):
@@ -97,7 +96,7 @@ async def test_client_usage_summary_is_tenant_scoped_and_hides_internal_costs(mo
 
     monkeypatch.setattr(main, "fetch_usage_rows", fake_rows)
     monkeypatch.setattr(main, "get_credit_state", fake_credits)
-    result = await main.get_usage_summary("tenant-a")
+    result = asyncio.run(main.get_usage_summary("tenant-a"))
     assert captured["user_id"] == "tenant-a"
     assert result["usage"]["assistant_replies"] == 2
     assert result["credits_remaining"] is None
@@ -105,8 +104,7 @@ async def test_client_usage_summary_is_tenant_scoped_and_hides_internal_costs(mo
     assert "cost_by_provider" not in result
 
 
-@pytest.mark.asyncio
-async def test_usage_reader_paginates_past_supabase_row_cap(monkeypatch):
+def test_usage_reader_paginates_past_supabase_row_cap(monkeypatch):
     offsets = []
 
     class FakeResponse:
@@ -132,7 +130,7 @@ async def test_usage_reader_paginates_past_supabase_row_cap(monkeypatch):
 
     monkeypatch.setattr(main.httpx, "AsyncClient", FakeClient)
     start, end = month_period(datetime(2026, 9, 11, tzinfo=timezone.utc))
-    rows, available = await main.fetch_usage_rows(start=start, end=end)
+    rows, available = asyncio.run(main.fetch_usage_rows(start=start, end=end))
     assert available is True
     assert len(rows) == 1001
     assert offsets == [0, 1000]
