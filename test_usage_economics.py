@@ -179,6 +179,8 @@ def test_cost_activities_group_a_discovery_run_and_keep_messages_individual():
     assert discovery["event_count"] == 2
     assert discovery["total_cost_eur"] == pytest.approx(0.2)
     assert discovery["cost_complete"] is True
+    assert discovery["prospects_retrieved"] == 25
+    assert discovery["known_cost_per_prospect_eur"] == pytest.approx(0.008)
     replies = [item for item in activities if item["activity_type"] == "assistant_message"]
     assert len(replies) == 2
     assert sum(item["unknown_operations"] for item in replies) == 1
@@ -186,6 +188,7 @@ def test_cost_activities_group_a_discovery_run_and_keep_messages_individual():
     summaries = summarize_cost_activities(activities)
     assert summaries["discovery"]["activity_count"] == 1
     assert summaries["discovery"]["average_known_cost_eur"] == pytest.approx(0.2)
+    assert summaries["discovery"]["known_cost_per_prospect_eur"] == pytest.approx(0.008)
     assert summaries["assistant_message"]["activity_count"] == 2
     assert summaries["assistant_message"]["average_known_cost_eur"] == pytest.approx(0.025)
     assert summaries["assistant_message"]["coverage_percent"] == pytest.approx(50)

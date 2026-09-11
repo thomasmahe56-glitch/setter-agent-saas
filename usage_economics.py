@@ -203,6 +203,14 @@ def build_cost_activities(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]
         known_cost = sum((cost_value(row) or Decimal("0") for row in ordered), Decimal("0"))
         unknown_operations = sum(1 for row in ordered if cost_value(row) is None)
         quantities = sum((decimal_value(row.get("quantity")) or Decimal("0") for row in ordered), Decimal("0"))
+        prospects_retrieved = sum(
+            (
+                decimal_value(row.get("quantity")) or Decimal("0")
+                for row in ordered
+                if row.get("event_type") == "profiles_retrieved"
+            ),
+            Decimal("0"),
+        )
         tokens = {
             "input": sum(int(row.get("input_tokens") or 0) for row in ordered),
             "output": sum(int(row.get("output_tokens") or 0) for row in ordered),
@@ -229,6 +237,8 @@ def build_cost_activities(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]
             "known_operations": len(ordered) - unknown_operations,
             "event_count": len(ordered),
             "quantity": _rounded(quantities, 6),
+            "prospects_retrieved": int(prospects_retrieved),
+            "known_cost_per_prospect_eur": safe_unit_cost(known_cost, prospects_retrieved),
             "providers": sorted({str(row.get("provider")) for row in ordered if row.get("provider")}),
             "models": sorted({str(row.get("model")) for row in ordered if row.get("model")}),
             "features": sorted({str(row.get("feature")) for row in ordered if row.get("feature")}),
@@ -247,6 +257,7 @@ def summarize_cost_activities(activities: Iterable[dict[str, Any]]) -> dict[str,
     for activity_type, items in grouped.items():
         costs = [decimal_value(item.get("total_cost_eur")) or Decimal("0") for item in items]
         total = sum(costs, Decimal("0"))
+        prospects_retrieved = sum(int(item.get("prospects_retrieved") or 0) for item in items)
         complete_count = sum(1 for item in items if item.get("cost_complete"))
         summaries[activity_type] = {
             "activity_type": activity_type,
@@ -259,6 +270,8 @@ def summarize_cost_activities(activities: Iterable[dict[str, Any]]) -> dict[str,
             "complete_activities": complete_count,
             "incomplete_activities": len(items) - complete_count,
             "coverage_percent": round(complete_count / len(items) * 100, 2) if items else None,
+            "prospects_retrieved": prospects_retrieved,
+            "known_cost_per_prospect_eur": safe_unit_cost(total, prospects_retrieved),
         }
     return dict(sorted(summaries.items(), key=lambda item: (-item[1]["total_known_cost_eur"], item[0])))
 
