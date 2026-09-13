@@ -45,6 +45,7 @@ from main import (
     learn_refinement_rule,
     merge_rule_list,
     tenant_language_from_prompt,
+    validate_agent_reply,
     _cancel_pending_replies_for_mode_off,
     _generate_and_queue_auto_reply,
     _needs_activation_reply,
@@ -633,6 +634,43 @@ class TestModeSelectionReactivation:
         assert scheduled["delivery_status"] == "scheduled"
         assert scheduled["configured_delay_seconds"] == 60
         assert datetime.fromisoformat(result["queued_until"]) >= current + timedelta(seconds=59)
+
+
+class TestReplyUrlSafety:
+    def test_replaces_hallucinated_beta_url_with_configured_sales_page(self):
+        prompt = (
+            "BASE\n\n<!-- AGENT_OPTIONS_START -->\n"
+            "Sales page link: https://tally.so/r/official\n"
+            "<!-- AGENT_OPTIONS_END -->"
+        )
+
+        result = validate_agent_reply(
+            "You can start the beta here: https://invented.example/beta",
+            prompt,
+        )
+
+        assert result == "You can start the beta here: https://tally.so/r/official"
+
+    def test_replaces_hallucinated_booking_url_with_configured_call_link(self):
+        prompt = (
+            "BASE\n\n<!-- AGENT_OPTIONS_START -->\n"
+            "Calendly link: https://calendly.com/official/demo\n"
+            "Sales page link: https://tally.so/r/official\n"
+            "<!-- AGENT_OPTIONS_END -->"
+        )
+
+        result = validate_agent_reply(
+            "Book the demo here: https://invented.example/call",
+            prompt,
+        )
+
+        assert result == "Book the demo here: https://calendly.com/official/demo"
+
+    def test_still_blocks_hallucinated_url_without_configured_destination(self):
+        with pytest.raises(Exception) as exc_info:
+            validate_agent_reply("Open https://invented.example", "BASE")
+
+        assert getattr(exc_info.value, "status_code", None) == 502
 
 
 # ===========================================================================
