@@ -2,11 +2,24 @@ import os
 from dataclasses import dataclass
 
 
+DEFAULT_OPENAI_SETTER_MODEL = "gpt-5.6-luna"
+DEFAULT_ANTHROPIC_SETTER_MODEL = "claude-sonnet-4-6"
+
+
 @dataclass
 class Config:
     supabase_url: str
     supabase_key: str
     anthropic_api_key: str
+    openai_api_key: str
+    setter_primary_provider: str
+    setter_primary_model: str
+    setter_premium_provider: str
+    setter_premium_model: str
+    setter_openai_enabled: bool
+    setter_context_compression_enabled: bool
+    setter_persistent_idempotency_enabled: bool
+    setter_premium_escalation_enabled: bool
     webhook_secret: str
     dashboard_secret: str
     manychat_token: str
@@ -30,10 +43,22 @@ class Config:
 
 
 def load_config() -> Config:
+    def env_bool(name: str, default: bool) -> bool:
+        return os.environ.get(name, "true" if default else "false").strip().lower() in {"1", "true", "yes", "on"}
+
     return Config(
         supabase_url=os.environ.get("SUPABASE_URL", ""),
         supabase_key=os.environ.get("SUPABASE_KEY", ""),
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+        openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
+        setter_primary_provider=os.environ.get("SETTER_PRIMARY_PROVIDER", "anthropic").strip().lower(),
+        setter_primary_model=os.environ.get("SETTER_PRIMARY_MODEL", "").strip(),
+        setter_premium_provider=os.environ.get("SETTER_PREMIUM_PROVIDER", "anthropic").strip().lower(),
+        setter_premium_model=os.environ.get("SETTER_PREMIUM_MODEL", DEFAULT_ANTHROPIC_SETTER_MODEL).strip(),
+        setter_openai_enabled=env_bool("SETTER_OPENAI_ENABLED", False),
+        setter_context_compression_enabled=env_bool("SETTER_CONTEXT_COMPRESSION_ENABLED", False),
+        setter_persistent_idempotency_enabled=env_bool("SETTER_PERSISTENT_IDEMPOTENCY_ENABLED", False),
+        setter_premium_escalation_enabled=env_bool("SETTER_PREMIUM_ESCALATION_ENABLED", False),
         webhook_secret=os.environ.get("WEBHOOK_SECRET", ""),
         dashboard_secret=os.environ.get("DASHBOARD_SECRET", ""),
         manychat_token=os.environ.get("MANYCHAT_TOKEN", ""),

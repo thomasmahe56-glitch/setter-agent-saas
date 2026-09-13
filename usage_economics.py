@@ -4,6 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
+import math
 
 
 COST_ACCURACIES = {
@@ -54,7 +55,11 @@ def aggregate_costs(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     by_feature: defaultdict[str, Decimal] = defaultdict(Decimal)
     by_provider: defaultdict[str, Decimal] = defaultdict(Decimal)
     by_model: defaultdict[str, Decimal] = defaultdict(Decimal)
+    operations_by_provider: defaultdict[str, int] = defaultdict(int)
     tokens = {"input": 0, "output": 0, "cache_creation": 0, "cache_read": 0, "reasoning": 0}
+    input_token_samples: list[int] = []
+    conversation_length_samples: list[int] = []
+    latency_samples: list[int] = []
     api_runs = 0
     scraping_runs = 0
 
@@ -64,6 +69,7 @@ def aggregate_costs(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         if accuracy not in COST_ACCURACIES:
             accuracy = "unknown"
         value = cost_value(row)
+        operations_by_provider[str(row.get("provider") or "unknown")] += 1
         if value is None:
             unknown_operations += 1
         else:
@@ -80,6 +86,13 @@ def aggregate_costs(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         tokens["cache_creation"] += int(row.get("cache_creation_input_tokens") or 0)
         tokens["cache_read"] += int(row.get("cache_read_input_tokens") or 0)
         tokens["reasoning"] += int(row.get("reasoning_tokens") or 0)
+        if row.get("input_tokens") is not None:
+            input_token_samples.append(int(row.get("input_tokens") or 0))
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        if metadata.get("history_message_count") is not None:
+            conversation_length_samples.append(int(metadata["history_message_count"]))
+        if metadata.get("latency_ms") is not None:
+            latency_samples.append(int(float(metadata["latency_ms"])))
         if str(row.get("unit") or "") in {"run", "api_call", "generation"}:
             api_runs += 1
         if row.get("module") == "prospecting" and row.get("provider") == "apify":
@@ -99,6 +112,12 @@ def aggregate_costs(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
             return None
         return round(float(by_accuracy[accuracy] / total * 100), 2)
 
+    def percentile(values: list[int], percent: float) -> int | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        return ordered[max(0, math.ceil(len(ordered) * percent) - 1)]
+
     return {
         "total_cost_eur": _rounded(total),
         "tracked_cost_eur": _rounded(total),
@@ -114,7 +133,18 @@ def aggregate_costs(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "cost_by_feature": money_map(by_feature),
         "cost_by_provider": money_map(by_provider),
         "cost_by_model": money_map(by_model),
+        "operations_by_provider": dict(sorted(operations_by_provider.items())),
+        "operation_share_by_provider": {
+            provider: round(count / operation_count * 100, 2) if operation_count else 0.0
+            for provider, count in sorted(operations_by_provider.items())
+        },
         "tokens": tokens,
+        "input_tokens_p50": percentile(input_token_samples, 0.50),
+        "input_tokens_p95": percentile(input_token_samples, 0.95),
+        "conversation_length_p50": percentile(conversation_length_samples, 0.50),
+        "conversation_length_p95": percentile(conversation_length_samples, 0.95),
+        "latency_ms_p50": percentile(latency_samples, 0.50),
+        "latency_ms_p95": percentile(latency_samples, 0.95),
         "api_runs": api_runs,
         "scraping_runs": scraping_runs,
     }
