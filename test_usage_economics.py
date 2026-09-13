@@ -35,6 +35,30 @@ def test_cost_aggregation_keeps_unknown_separate_from_zero():
     assert safe_unit_cost(result["total_cost_eur"], 0) is None
 
 
+def test_cost_aggregation_exposes_provider_context_and_latency_rollout_metrics():
+    result = aggregate_costs([
+        {
+            "provider": "openai", "cost_accuracy": "provider_usage_priced", "cost_eur": 0.01,
+            "input_tokens": 100, "metadata": {"history_message_count": 8, "latency_ms": 300},
+        },
+        {
+            "provider": "openai", "cost_accuracy": "provider_usage_priced", "cost_eur": 0.02,
+            "input_tokens": 500, "metadata": {"history_message_count": 40, "latency_ms": 900},
+        },
+        {
+            "provider": "anthropic", "cost_accuracy": "provider_usage_priced", "cost_eur": 0.03,
+            "input_tokens": 900, "metadata": {"history_message_count": 80, "latency_ms": 1500},
+        },
+    ])
+    assert result["operation_share_by_provider"] == {"anthropic": pytest.approx(33.33), "openai": pytest.approx(66.67)}
+    assert result["input_tokens_p50"] == 500
+    assert result["input_tokens_p95"] == 900
+    assert result["conversation_length_p50"] == 40
+    assert result["conversation_length_p95"] == 80
+    assert result["latency_ms_p50"] == 900
+    assert result["latency_ms_p95"] == 1500
+
+
 def test_anthropic_provider_usage_pricing_and_legacy_parity():
     usage = main.AiGenerationUsage(
         provider="anthropic",
@@ -112,6 +136,32 @@ def test_client_usage_summary_is_tenant_scoped_and_hides_internal_costs(monkeypa
     assert result["credits_remaining"] is None
     assert "total_cost_eur" not in result
     assert "cost_by_provider" not in result
+
+
+def test_usage_ledger_unavailable_fails_closed_without_profile_cost_fallback(monkeypatch):
+    class FakeResponse:
+        status_code = 503
+        text = "ledger unavailable"
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    async def forbidden_profile_read(*_args, **_kwargs):
+        raise AssertionError("economic truth must not fall back to an agent profile")
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(main, "get_user_singleton_row", forbidden_profile_read)
+    result = asyncio.run(main.get_ai_spend_breakdown("tenant-a"))
+    assert result["usage_available"] is False
+    with pytest.raises(main.AiSpendUnavailableError):
+        asyncio.run(main.get_estimated_ai_spend_eur("tenant-a"))
 
 
 def test_usage_reader_paginates_past_supabase_row_cap(monkeypatch):

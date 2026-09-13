@@ -108,6 +108,8 @@ In Meta for Developers:
    - migrations/add_whatsapp_channel.sql
    - migrations/add_automation_mode.sql
    - migrations/add_training_center.sql
+   - migrations/add_conversation_memory.sql
+   - migrations/add_processed_inbound_events.sql
 4. Retrieve from Settings > API:
    - Project URL → SUPABASE_URL (append /rest/v1 at the end)
    - service_role key → SUPABASE_KEY
@@ -130,7 +132,15 @@ openssl rand -hex 32   # for DASHBOARD_SECRET
 |----------|-------------|----------|
 | SUPABASE_URL | Supabase URL + /rest/v1 | ✅ |
 | SUPABASE_KEY | Supabase service key | ✅ |
-| ANTHROPIC_API_KEY | Anthropic API key | ✅ |
+| OPENAI_API_KEY | OpenAI API key for the default Setter route | When OpenAI route enabled |
+| ANTHROPIC_API_KEY | Anthropic API key for premium/admin routes | When Anthropic premium route enabled |
+| SETTER_PRIMARY_PROVIDER | Default provider (`openai` recommended) | ✅ |
+| SETTER_PRIMARY_MODEL | Default model (`gpt-5.6-luna`) | ✅ |
+| SETTER_PREMIUM_PROVIDER | Explicit premium/admin provider | ✅ |
+| SETTER_PREMIUM_MODEL | Explicit premium/admin model | ✅ |
+| SETTER_OPENAI_ENABLED | Kill switch for the OpenAI primary route | ✅ |
+| SETTER_CONTEXT_COMPRESSION_ENABLED | Enable structured memory + recent-message context | Recommended |
+| SETTER_PERSISTENT_IDEMPOTENCY_ENABLED | Persist reliable inbound event IDs | Recommended |
 | WEBHOOK_SECRET | Secret for /webhook | ✅ |
 | OWNER_USER_ID | Founder Supabase Auth UUID | Recommended |
 | ALLOWED_USER_IDS | Comma-separated additional Supabase user UUIDs authorized for the private beta | Recommended |
@@ -217,7 +227,38 @@ prompt bloat.
 
 - Backend: FastAPI + Python 3.11, deployed on Railway
 - Database: Supabase (PostgreSQL + Auth + RLS)
-- AI: Anthropic Claude Sonnet (responses) + Claude Opus (analysis)
+- AI: provider-agnostic adapter; OpenAI GPT-5.6 Luna for routine Setter generations, Anthropic Claude for explicit premium/admin analysis
 - Instagram: ManyChat webhook
 - WhatsApp: Meta Cloud API
 - Dashboard: Next.js deployed on Vercel (setter-dashboard-saas)
+
+## AI Routing And Cost Controls
+
+Routine replies, follow-ups, supervised suggestions, memory refreshes, the
+simulator and playground use `SETTER_PRIMARY_PROVIDER` / `SETTER_PRIMARY_MODEL`.
+The recommended production route is OpenAI GPT-5.6 Luna with reasoning disabled
+for these short operational generations. Training analysis and the feedback loop
+remain explicit Anthropic routes; they never receive automatic traffic merely
+because a conversation is long.
+
+Full conversation history stays in PostgreSQL. When context compression is
+enabled, generation receives a structured memory plus the latest messages only.
+The memory records prospect context, needs, pain points, qualification,
+objections, information already given, commitments, stage and next step. It is
+refreshed incrementally after the configured thresholds.
+
+All generations and deterministic Setter replies are recorded directly in the
+existing `usage_ledger`. LLM rows include provider, model, provider response ID,
+input/output/cache/reasoning tokens when exposed, a versioned pricing snapshot,
+EUR cost, request kind and context-size metadata. No additional telemetry table
+is introduced.
+
+Deployment order:
+
+1. Apply both new SQL migrations.
+2. Deploy with the new dependencies and variables, initially leaving the three
+   Setter feature flags disabled if a staged rollout is desired.
+3. Set the OpenAI and Anthropic keys, then enable OpenAI, context compression and
+   persistent idempotency independently.
+4. Monitor provider share, token percentiles, failures and cost per conversation
+   in the existing cost endpoints before expanding traffic.
