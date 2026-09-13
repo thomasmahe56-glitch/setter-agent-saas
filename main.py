@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from config import DEFAULT_ANTHROPIC_SETTER_MODEL, DEFAULT_OPENAI_SETTER_MODEL, load_config
 from prompts import build_system_prompt, build_analysis_prompt, build_follow_up_prompt, build_conversation_review_prompt
 from collections import Counter
+from contextlib import asynccontextmanager, suppress
 import hmac
 import asyncio
 import httpx
@@ -119,6 +120,7 @@ CLAUDE_OPUS_4_7_CACHE_CREATION_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAU
 CLAUDE_OPUS_4_7_CACHE_READ_INPUT_EUR_PER_MTOKEN = float(os.environ.get("CLAUDE_OPUS_4_7_CACHE_READ_INPUT_EUR_PER_MTOKEN", "0.43044077"))
 AI_USAGE_PRICING_VERSION = os.environ.get("AI_USAGE_PRICING_VERSION", "multi-provider-usd-eur-2026-09-12-v1")
 AI_COST_BLOCK_USER_MESSAGE = "Angellos a atteint le plafond de coût IA configuré pour ce compte. Les nouvelles réponses automatiques sont arrêtées par sécurité."
+SCHEDULED_REPLY_POLL_SECONDS = max(1, int(os.environ.get("SCHEDULED_REPLY_POLL_SECONDS", "5")))
 DEFAULT_BETA_ACCOUNT_SETTINGS = {
     "cap_eur": DEFAULT_BETA_COST_CAP_EUR,
     "enabled": True,
@@ -372,10 +374,24 @@ def require_configured_provider(route: dict[str, str | None]) -> None:
         raise HTTPException(status_code=500, detail=f"{variable} is not configured for provider {provider}")
 
 expose_api_docs = os.environ.get("EXPOSE_API_DOCS", "false").strip().lower() == "true"
+
+
+@asynccontextmanager
+async def app_lifespan(_: FastAPI):
+    scheduled_reply_task = asyncio.create_task(scheduled_reply_worker())
+    try:
+        yield
+    finally:
+        scheduled_reply_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await scheduled_reply_task
+
+
 app = FastAPI(
     docs_url="/docs" if expose_api_docs else None,
     redoc_url="/redoc" if expose_api_docs else None,
     openapi_url="/openapi.json" if expose_api_docs else None,
+    lifespan=app_lifespan,
 )
 
 def cors_allowed_origins() -> list[str]:
@@ -2171,6 +2187,20 @@ def next_allowed_send_at(now: datetime, settings: dict) -> datetime:
     return candidate
 
 
+def auto_reply_delay_seconds(settings: dict, randbelow=secrets.randbelow) -> int:
+    """Return the configured minimum plus an inclusive random extra delay."""
+    minimum = max(0, int(settings.get("min_auto_delay_seconds") or 0))
+    random_max = max(0, int(settings.get("random_auto_delay_seconds") or 0))
+    return minimum + (randbelow(random_max + 1) if random_max else 0)
+
+
+def auto_reply_delivery_time(now: datetime, settings: dict, randbelow=secrets.randbelow) -> tuple[datetime, int]:
+    """Calculate the earliest permitted send time, including the account window."""
+    delay_seconds = auto_reply_delay_seconds(settings, randbelow=randbelow)
+    delayed_time = now.astimezone(timezone.utc) + timedelta(seconds=delay_seconds)
+    return next_allowed_send_at(delayed_time, settings), delay_seconds
+
+
 def configured_follow_up_stage(hours_since_user: float, settings: dict) -> Optional[dict]:
     config = settings.get("follow_up_config") or DEFAULT_BETA_ACCOUNT_SETTINGS["follow_up_config"]
     stages = [item for item in config if isinstance(item, dict) and item.get("stage")]
@@ -3167,6 +3197,155 @@ async def send_channel_message(conversation: dict, text: str) -> dict:
             metadata={"channel": channel},
         )
     return result
+
+
+def find_scheduled_auto_reply(history: list, *, now: Optional[datetime] = None) -> Optional[dict]:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    for message in history:
+        if (
+            message.get("role") != "assistant"
+            or message.get("source") != "inbound_auto_queued"
+            or message.get("sent")
+            or message.get("ignored")
+            or message.get("delivery_status") != "scheduled"
+        ):
+            continue
+        queued_until = parse_iso(message.get("queued_until"))
+        if queued_until and queued_until <= current and message.get("content"):
+            return message
+    return None
+
+
+def pending_scheduled_auto_reply(history: list) -> Optional[dict]:
+    pending = [
+        message for message in history
+        if message.get("role") == "assistant"
+        and message.get("source") == "inbound_auto_queued"
+        and not message.get("sent")
+        and not message.get("ignored")
+        and message.get("delivery_status") in {"scheduled", "pending_delivery", "send_failed"}
+        and message.get("content")
+    ]
+    return pending[-1] if pending else None
+
+
+def supersede_scheduled_auto_replies(history: list) -> list:
+    """Cancel obsolete unsent replies when a newer inbound message arrives."""
+    updated_history = []
+    for original in history:
+        message = dict(original)
+        if (
+            message.get("role") == "assistant"
+            and message.get("source") == "inbound_auto_queued"
+            and not message.get("sent")
+            and not message.get("ignored")
+            and message.get("delivery_status") == "scheduled"
+        ):
+            message["ignored"] = True
+            message["delivery_status"] = "superseded"
+            message["superseded_at"] = now_iso()
+        updated_history.append(message)
+    return updated_history
+
+
+_scheduled_reply_inflight: set[str] = set()
+
+
+async def deliver_due_scheduled_reply(conversation_id: str, user_id: str) -> bool:
+    """Deliver one due reply after re-reading the latest conversation state."""
+    if conversation_id in _scheduled_reply_inflight:
+        return False
+    _scheduled_reply_inflight.add(conversation_id)
+    try:
+        conversation = await get_conversation_by_id(conversation_id, user_id)
+        if not conversation:
+            return False
+        if (
+            conversation.get("automation_mode") != "auto"
+            or not conversation.get("agent_active", True)
+            or conversation.get("human_takeover")
+            or conversation.get("contact_status") == "opted_out"
+        ):
+            return False
+        history = [dict(message) for message in (conversation.get("history") or [])]
+        scheduled = find_scheduled_auto_reply(history)
+        if not scheduled:
+            return False
+        delivery_id = scheduled.get("delivery_id")
+        send_result = await send_channel_message(conversation, scheduled.get("content") or "")
+        sent = int(send_result.get("status_code") or 500) < 400
+        is_pending_delivery = is_manychat_pending_delivery_error(send_result)
+        for message in history:
+            if message.get("delivery_id") != delivery_id:
+                continue
+            message["send_status_code"] = send_result.get("status_code")
+            message["delivery_attempted_at"] = now_iso()
+            message["sent"] = sent
+            message["pending_delivery"] = is_pending_delivery
+            message["delivery_failed"] = not sent
+            message["delivery_status"] = "sent" if sent else ("pending_delivery" if is_pending_delivery else "send_failed")
+            if not sent:
+                message["send_error_body"] = (send_result.get("body") or "")[:500]
+            break
+
+        remaining = pending_scheduled_auto_reply(history)
+        async with httpx.AsyncClient() as http:
+            response = await http.patch(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
+                json={
+                    "history": history,
+                    "status": "pending_delivery" if remaining else "en_cours",
+                    "pending_message": remaining.get("content") if remaining else None,
+                    "pending_message_at": remaining.get("queued_until") if remaining else None,
+                },
+                timeout=10.0,
+            )
+        response.raise_for_status()
+        print(
+            f"[scheduled-reply] conversation_id={conversation_id} sent={sent} "
+            f"status={send_result.get('status_code')}",
+            flush=True,
+        )
+        return sent
+    finally:
+        _scheduled_reply_inflight.discard(conversation_id)
+
+
+async def process_due_scheduled_replies() -> int:
+    async with httpx.AsyncClient() as http:
+        response = await http.get(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Accept": "application/json"},
+            params={
+                "automation_mode": "eq.auto",
+                "pending_message": "not.is.null",
+                "select": "id,user_id",
+                "limit": "500",
+            },
+            timeout=10.0,
+        )
+    response.raise_for_status()
+    delivered = 0
+    for row in response.json():
+        conversation_id = str(row.get("id") or "")
+        user_id = str(row.get("user_id") or "")
+        if conversation_id and user_id and await deliver_due_scheduled_reply(conversation_id, user_id):
+            delivered += 1
+    return delivered
+
+
+async def scheduled_reply_worker() -> None:
+    """Poll persisted scheduled replies so webhook requests can return immediately."""
+    while True:
+        try:
+            await process_due_scheduled_replies()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[scheduled-reply] worker_error={type(exc).__name__}", flush=True)
+        await asyncio.sleep(SCHEDULED_REPLY_POLL_SECONDS)
 
 
 def is_manychat_pending_delivery_error(send_result: Optional[dict]) -> bool:
@@ -5012,6 +5191,7 @@ async def handle_inbound_message(
     if pending_flush.get("attempted"):
         history = pending_flush.get("history") or history
         contact = {**contact, "history": history}
+    history = supersede_scheduled_auto_replies(history)
 
     user_message = {
         "role": "user",
@@ -5277,13 +5457,19 @@ async def handle_inbound_message(
 
     should_send = automation_mode == "auto"
     auto_blocked_by_window = False
+    auto_reply_scheduled = False
+    auto_delay_seconds = 0
     queued_until = None
     if should_send:
         send_settings = await get_beta_cost_settings(user_id)
         current_time = datetime.now(timezone.utc)
-        if not is_within_allowed_send_window(current_time, send_settings):
-            auto_blocked_by_window = True
-            queued_until = next_allowed_send_at(current_time, send_settings).isoformat()
+        delivery_time, auto_delay_seconds = auto_reply_delivery_time(current_time, send_settings)
+        auto_blocked_by_window = not is_within_allowed_send_window(
+            current_time + timedelta(seconds=auto_delay_seconds), send_settings,
+        )
+        if delivery_time > current_time:
+            auto_reply_scheduled = True
+            queued_until = delivery_time.isoformat()
             should_send = False
     delegated_to_webhook_sender = should_send and not auto_send_transport
     sent = False
@@ -5294,11 +5480,15 @@ async def handle_inbound_message(
         "channel": channel,
         "sent": delegated_to_webhook_sender,
         "ignored": False,
-        "source": "inbound_auto_queued" if auto_blocked_by_window else ("inbound_auto" if should_send else "inbound_supervised"),
+        "source": "inbound_auto_queued" if auto_reply_scheduled else ("inbound_auto" if should_send else "inbound_supervised"),
     }
-    if auto_blocked_by_window:
+    if auto_reply_scheduled:
+        assistant_entry["delivery_id"] = str(uuid4())
+        assistant_entry["delivery_status"] = "scheduled"
+        assistant_entry["pending_delivery"] = False
         assistant_entry["queued_until"] = queued_until
-        assistant_entry["send_blocked_reason"] = "outside_allowed_send_window"
+        assistant_entry["send_blocked_reason"] = "outside_allowed_send_window" if auto_blocked_by_window else "configured_reply_delay"
+        assistant_entry["configured_delay_seconds"] = auto_delay_seconds
     if delegated_to_webhook_sender:
         assistant_entry["send_transport"] = "manychat_webhook_response"
         assistant_entry["send_status_code"] = 202
@@ -5309,16 +5499,16 @@ async def handle_inbound_message(
         "history": new_history,
         "status": "en_cours",
     })
-    if automation_mode == "supervised" or auto_blocked_by_window:
+    if automation_mode == "supervised" or auto_reply_scheduled:
         patch_data["pending_message"] = reply
-        patch_data["pending_message_at"] = now_iso()
+        patch_data["pending_message_at"] = queued_until if auto_reply_scheduled else now_iso()
         if auto_blocked_by_window:
             patch_data["status"] = "pending_delivery"
     elif automation_mode == "auto":
         patch_data["pending_message"] = None
         patch_data["pending_message_at"] = None
 
-    if automation_mode == "auto" and auto_send_transport:
+    if should_send and auto_send_transport:
         async with httpx.AsyncClient() as http:
             res = await http.patch(
                 SUPABASE_CONVERSATIONS_URL,
@@ -5376,7 +5566,11 @@ async def handle_inbound_message(
         "should_send": should_send,
         "mode": automation_mode,
         "skipped": False,
-        "reason": "outside_allowed_send_window" if auto_blocked_by_window else None,
+        "reason": (
+            "outside_allowed_send_window" if auto_blocked_by_window
+            else "configured_reply_delay" if auto_reply_scheduled
+            else None
+        ),
         "queued_until": queued_until,
         "send_result": send_result,
         "conversation_id": contact.get("id"),
