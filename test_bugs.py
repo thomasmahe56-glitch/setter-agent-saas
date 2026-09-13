@@ -45,11 +45,16 @@ from main import (
     learn_refinement_rule,
     merge_rule_list,
     tenant_language_from_prompt,
+    _cancel_pending_replies_for_mode_off,
+    _generate_and_queue_auto_reply,
+    _needs_activation_reply,
     _needs_supervised_pending,
     _last_prospect_message,
     webhook,
     bulk_update_automation_mode,
     BulkAutomationModePayload,
+    AutomationModePayload,
+    update_automation_mode,
     ANGELLOS_TRAINING_IMPORT_PROMPT,
     ANGELLOS_TRAINING_IMPORT_SCHEMA_VERSION,
     CostCapExceededError,
@@ -463,6 +468,7 @@ class TestNeedsSupervisedPending:
         conv = _make_conversation(history=[_user_msg("Hey")])
         assert _needs_supervised_pending(conv) is True
 
+
     def test_auto_mode_does_not_need_pending(self):
         conv = _make_conversation(automation_mode="auto", history=[_user_msg("Hey")])
         assert _needs_supervised_pending(conv) is False
@@ -511,6 +517,122 @@ class TestNeedsSupervisedPending:
         ]
         conv = _make_conversation(history=history)
         assert _needs_supervised_pending(conv) is True
+
+
+class TestModeSelectionReactivation:
+    def test_mode_off_cancels_unsent_work_and_makes_last_user_eligible_again(self):
+        history = [
+            _user_msg("Still waiting"),
+            {
+                **_assistant_msg("Old draft", sent=False),
+                "source": "activation_supervised",
+            },
+        ]
+
+        cancelled = _cancel_pending_replies_for_mode_off(history)
+
+        assert cancelled[-1]["ignored"] is True
+        assert cancelled[-1]["delivery_status"] == "cancelled_mode_off"
+        assert _needs_activation_reply({"history": cancelled, "pending_message": None}) is True
+
+    def test_selecting_supervised_reactivates_and_generates_manual_draft(self, monkeypatch):
+        _PatchCaptureAsyncClient.patches = []
+        conversation = _make_conversation(agent_active=False, automation_mode="disabled", history=[_user_msg("Hello")])
+
+        async def fake_get_conversation(conversation_id, user_id):
+            return conversation
+
+        generate = AsyncMock(return_value="Suggested answer")
+        monkeypatch.setattr("main.get_conversation_by_id", fake_get_conversation)
+        monkeypatch.setattr("main._generate_and_save_supervised_pending", generate)
+        monkeypatch.setattr("main.httpx.AsyncClient", _PatchCaptureAsyncClient)
+
+        result = asyncio.run(update_automation_mode(
+            "conv-1", AutomationModePayload(automation_mode="supervised"), user_id="user-1",
+        ))
+
+        first_patch = _PatchCaptureAsyncClient.patches[0]["kwargs"]["json"]
+        assert first_patch == {"automation_mode": "supervised", "agent_active": True}
+        assert result["outcome"] == "manual_draft"
+        assert result["pending_message"] == "Suggested answer"
+        activated = generate.await_args.args[0]
+        assert activated["agent_active"] is True
+        assert activated["automation_mode"] == "supervised"
+
+    def test_selecting_auto_reactivates_and_queues_unanswered_message(self, monkeypatch):
+        _PatchCaptureAsyncClient.patches = []
+        conversation = _make_conversation(
+            agent_active=False,
+            automation_mode="disabled",
+            history=[_user_msg("Can you help?")],
+            last_inbound_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        async def fake_get_conversation(conversation_id, user_id):
+            return conversation
+
+        queue = AsyncMock(return_value={
+            "outcome": "auto_scheduled",
+            "pending_message": "Yes",
+            "queued_until": "2026-09-13T20:05:00+00:00",
+        })
+        monkeypatch.setattr("main.get_conversation_by_id", fake_get_conversation)
+        monkeypatch.setattr("main._generate_and_queue_auto_reply", queue)
+        monkeypatch.setattr("main.httpx.AsyncClient", _PatchCaptureAsyncClient)
+
+        result = asyncio.run(update_automation_mode(
+            "conv-1", AutomationModePayload(automation_mode="auto"), user_id="user-1",
+        ))
+
+        first_patch = _PatchCaptureAsyncClient.patches[0]["kwargs"]["json"]
+        assert first_patch == {"automation_mode": "auto", "agent_active": True}
+        assert result["outcome"] == "auto_scheduled"
+        queue.assert_awaited_once()
+
+    def test_auto_reactivation_uses_delay_worker_and_persists_generated_reply(self, monkeypatch):
+        _PatchCaptureAsyncClient.patches = []
+        current = datetime.now(timezone.utc)
+        conversation = _make_conversation(
+            automation_mode="auto",
+            agent_active=True,
+            channel="instagram",
+            history=[_user_msg("Latest question")],
+            last_inbound_at=current.isoformat(),
+        )
+
+        async def fake_generate(*args, **kwargs):
+            return {
+                "reply": "Generated answer",
+                "should_human_mode": False,
+                "history": conversation["history"],
+                "last_user_message": conversation["history"][-1],
+            }
+
+        async def fake_settings(user_id):
+            return {
+                "allowed_send_start": "00:00",
+                "allowed_send_end": "00:00",
+                "min_auto_delay_seconds": 60,
+                "random_auto_delay_seconds": 0,
+            }
+
+        monkeypatch.setattr("main._generate_activation_reply", fake_generate)
+        monkeypatch.setattr("main.get_beta_cost_settings", fake_settings)
+        monkeypatch.setattr("main.httpx.AsyncClient", _PatchCaptureAsyncClient)
+
+        result = asyncio.run(_generate_and_queue_auto_reply(conversation, "conv-1", "user-1"))
+        patch_body = _PatchCaptureAsyncClient.patches[-1]["kwargs"]["json"]
+        scheduled = patch_body["history"][-1]
+
+        assert result["outcome"] == "auto_scheduled"
+        assert patch_body["agent_active"] is True
+        assert patch_body["automation_mode"] == "auto"
+        assert patch_body["pending_message"] == "Generated answer"
+        assert scheduled["source"] == "inbound_auto_queued"
+        assert scheduled["activation_trigger"] == "mode_selected"
+        assert scheduled["delivery_status"] == "scheduled"
+        assert scheduled["configured_delay_seconds"] == 60
+        assert datetime.fromisoformat(result["queued_until"]) >= current + timedelta(seconds=59)
 
 
 # ===========================================================================
