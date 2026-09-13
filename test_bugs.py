@@ -715,11 +715,13 @@ class TestManyChatWebhookAutoSend:
 
         queued_at = datetime.fromisoformat(result["queued_until"])
         patch_body = _PatchCaptureAsyncClient.patches[-1]["kwargs"]["json"]
+        received_at = datetime.fromisoformat(patch_body["history"][-2]["timestamp"])
         assistant = patch_body["history"][-1]
         assert result["should_send"] is False
         assert result["sent"] is False
         assert result["reason"] == "configured_reply_delay"
         assert queued_at >= before + timedelta(seconds=59)
+        assert queued_at - received_at == timedelta(seconds=60)
         assert patch_body["pending_message"] == "No worries, appreciate you getting back to me."
         assert patch_body["pending_message_at"] == result["queued_until"]
         assert assistant["source"] == "inbound_auto_queued"

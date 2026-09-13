@@ -5153,7 +5153,8 @@ async def handle_inbound_message(
     transport_metadata: Optional[dict] = None,
     auto_send_transport: bool = True,
 ) -> dict:
-    received_at = now_iso()
+    received_at_dt = datetime.now(timezone.utc)
+    received_at = received_at_dt.isoformat()
     inbound_provider = (transport_metadata or {}).get("provider") or (
         "meta_whatsapp_cloud_api" if channel == "whatsapp" else MANYCHAT_PROVIDER
     )
@@ -5463,9 +5464,9 @@ async def handle_inbound_message(
     if should_send:
         send_settings = await get_beta_cost_settings(user_id)
         current_time = datetime.now(timezone.utc)
-        delivery_time, auto_delay_seconds = auto_reply_delivery_time(current_time, send_settings)
+        delivery_time, auto_delay_seconds = auto_reply_delivery_time(received_at_dt, send_settings)
         auto_blocked_by_window = not is_within_allowed_send_window(
-            current_time + timedelta(seconds=auto_delay_seconds), send_settings,
+            received_at_dt + timedelta(seconds=auto_delay_seconds), send_settings,
         )
         if delivery_time > current_time:
             auto_reply_scheduled = True
