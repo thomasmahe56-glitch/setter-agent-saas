@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Header, HTTPException, Depends, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 from anthropic import Anthropic
 try:
@@ -21,11 +21,13 @@ import io
 import json
 import os
 import re
+import secrets
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 from uuid import uuid4
+from urllib.parse import urlencode
 from security_middleware import RateLimitMiddleware, RequestBodyLimitMiddleware, SecurityHeadersMiddleware
 from usage_economics import (
     aggregate_costs,
@@ -49,6 +51,18 @@ from conversation_context import (
     memory_update_messages,
     normalize_conversation_memory,
     should_refresh_memory,
+)
+from messaging_providers import (
+    MANYCHAT_PROVIDER,
+    META_PROVIDER,
+    REQUIRED_META_SCOPES,
+    ManyChatProvider,
+    MetaInstagramProvider,
+    can_send_meta_message,
+    decrypt_secret,
+    encrypt_secret,
+    is_explicit_opt_out,
+    parse_meta_instagram_webhook,
 )
 
 load_dotenv()
@@ -74,13 +88,18 @@ SUPABASE_CREDIT_RULES_URL = f"{config.supabase_url}/credit_rules"
 SUPABASE_CREDIT_TRANSACTIONS_URL = f"{config.supabase_url}/credit_transactions"
 SUPABASE_PROSPECTS_URL = f"{config.supabase_url}/prospects"
 SUPABASE_PROCESSED_INBOUND_EVENTS_URL = f"{config.supabase_url}/processed_inbound_events"
+SUPABASE_MESSAGING_CONNECTIONS_URL = f"{config.supabase_url}/messaging_connections"
+SUPABASE_MESSAGING_OAUTH_STATES_URL = f"{config.supabase_url}/messaging_oauth_states"
 MANYCHAT_API_KEY = config.manychat_token
 MANYCHAT_SEND_URL = "https://api.manychat.com/fb/sending/sendContent"
+MANYCHAT_PROVIDER_CLIENT = ManyChatProvider(MANYCHAT_API_KEY, send_url=MANYCHAT_SEND_URL)
 WHATSAPP_ACCESS_TOKEN = config.whatsapp_access_token
 WHATSAPP_PHONE_NUMBER_ID = config.whatsapp_phone_number_id
 WHATSAPP_VERIFY_TOKEN = config.whatsapp_verify_token
 META_APP_SECRET = config.meta_app_secret
 GRAPH_API_VERSION = config.graph_api_version or "v23.0"
+META_GRAPH_API_VERSION = config.meta_graph_api_version or "v26.0"
+META_INSTAGRAM_PROVIDER = MetaInstagramProvider(META_GRAPH_API_VERSION)
 WHATSAPP_SEND_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
 SETTER_RECENT_MESSAGES = int(os.environ.get("SETTER_RECENT_MESSAGES", "10"))
 SETTER_MEMORY_THRESHOLD_MESSAGES = int(os.environ.get("SETTER_MEMORY_THRESHOLD_MESSAGES", "24"))
@@ -2415,6 +2434,8 @@ def has_follow_up_stage(history: list, stage: str) -> bool:
 async def build_follow_up_item(conversation: dict, schedule: Optional[dict] = None) -> Optional[dict]:
     if not conversation.get("agent_active"):
         return None
+    if conversation.get("human_takeover") or conversation.get("contact_status") == "opted_out":
+        return None
     if conversation.get("automation_mode") == "disabled":
         return None
     if conversation.get("status") in {"appel_booke", "signe"}:
@@ -2564,6 +2585,7 @@ async def get_contact_by_external_id(
     external_contact_id: str,
     channel: str = "instagram",
     user_id: Optional[str] = None,
+    messaging_provider: Optional[str] = None,
 ) -> Optional[dict]:
     if not user_id:
         return None
@@ -2573,6 +2595,8 @@ async def get_contact_by_external_id(
         "limit": 1,
     }
     params["user_id"] = f"eq.{user_id}"
+    if messaging_provider:
+        params["messaging_provider"] = f"eq.{messaging_provider}"
     async with httpx.AsyncClient() as http:
         res = await http.get(
             SUPABASE_CONVERSATIONS_URL,
@@ -2581,7 +2605,7 @@ async def get_contact_by_external_id(
         )
         res.raise_for_status()
         rows = res.json()
-        if not rows and channel == "instagram":
+        if not rows and channel == "instagram" and (not messaging_provider or messaging_provider == MANYCHAT_PROVIDER):
             res = await http.get(
                 SUPABASE_CONVERSATIONS_URL,
                 headers={**supabase_headers(), "Accept": "application/json"},
@@ -2622,6 +2646,10 @@ async def create_contact(
         "phone_e164": phone_e164,
         "last_inbound_at": received_at,
         "transport_metadata": transport_metadata or {},
+        "messaging_provider": (transport_metadata or {}).get("provider") or (
+            "meta_whatsapp_cloud_api" if channel == "whatsapp" else MANYCHAT_PROVIDER
+        ),
+        "messaging_connection_id": (transport_metadata or {}).get("messaging_connection_id"),
         "user_id": user_id,
         "automation_mode": default_automation_mode,
     }
@@ -2858,25 +2886,9 @@ def generate_ai_generation(
 
 
 async def send_manychat_message(subscriber_id: str, text: str) -> dict:
-    async with httpx.AsyncClient() as http:
-        res = await http.post(
-            MANYCHAT_SEND_URL,
-            headers={
-                "Authorization": f"Bearer {MANYCHAT_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "subscriber_id": subscriber_id,
-                "data": {
-                    "version": "v2",
-                    "content": {
-                        "messages": [{"type": "text", "text": text}],
-                    },
-                },
-            },
-        )
-    print(f"[manychat] status={res.status_code} body_len={len(res.text)}")
-    return {"status_code": res.status_code, "body": res.text}
+    result = await MANYCHAT_PROVIDER_CLIENT.send_message(recipient_id=subscriber_id, text=text)
+    print(f"[manychat] status={result['status_code']} body_len={len(result.get('body') or '')}")
+    return result
 
 
 async def fetch_manychat_ig_username(subscriber_id: str) -> Optional[str]:
@@ -2945,6 +2957,135 @@ async def send_whatsapp_text(phone_e164: str, text: str) -> dict:
     return {"status_code": res.status_code, "body": res.text}
 
 
+async def get_messaging_connection(
+    *,
+    connection_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    external_account_id: Optional[str] = None,
+) -> Optional[dict]:
+    params: dict[str, str] = {"limit": "1", "select": "*"}
+    if connection_id:
+        params["id"] = f"eq.{connection_id}"
+    if user_id:
+        params["user_id"] = f"eq.{user_id}"
+    if provider:
+        params["provider"] = f"eq.{provider}"
+    if external_account_id:
+        params["external_account_id"] = f"eq.{external_account_id}"
+    async with httpx.AsyncClient() as http:
+        response = await http.get(
+            SUPABASE_MESSAGING_CONNECTIONS_URL,
+            headers={**supabase_headers(), "Accept": "application/json"},
+            params=params,
+            timeout=10.0,
+        )
+    response.raise_for_status()
+    rows = response.json()
+    return rows[0] if rows else None
+
+
+async def patch_messaging_connection(connection_id: str, patch: dict) -> None:
+    async with httpx.AsyncClient() as http:
+        response = await http.patch(
+            SUPABASE_MESSAGING_CONNECTIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=minimal"},
+            params={"id": f"eq.{connection_id}"},
+            json={**patch, "updated_at": now_iso()},
+            timeout=10.0,
+        )
+    response.raise_for_status()
+
+
+async def get_active_messaging_provider(user_id: str) -> str:
+    async with httpx.AsyncClient() as http:
+        response = await http.get(
+            SUPABASE_BETA_ACCOUNT_SETTINGS_URL,
+            headers={**supabase_headers(), "Accept": "application/json"},
+            params={"user_id": f"eq.{user_id}", "select": "active_messaging_provider", "limit": "1"},
+            timeout=5.0,
+        )
+    if response.status_code >= 400:
+        return MANYCHAT_PROVIDER
+    rows = response.json()
+    return (rows[0].get("active_messaging_provider") if rows else None) or MANYCHAT_PROVIDER
+
+
+async def get_valid_access_token(connection: dict) -> str:
+    """Return a decrypted server-side token or transition the connection state."""
+    if connection.get("status") != "connected":
+        raise HTTPException(status_code=409, detail="Instagram connection needs reauthorization")
+    encrypted = connection.get("access_token_encrypted")
+    if not encrypted or not config.messaging_token_encryption_key:
+        await patch_messaging_connection(connection["id"], {"status": "error"})
+        raise HTTPException(status_code=503, detail="Instagram token storage is not configured")
+    try:
+        token = decrypt_secret(encrypted, config.messaging_token_encryption_key)
+    except Exception:
+        await patch_messaging_connection(connection["id"], {"status": "error"})
+        raise HTTPException(status_code=503, detail="Instagram token could not be decrypted")
+    expires_at = parse_iso(connection.get("token_expires_at"))
+    now = datetime.now(timezone.utc)
+    if expires_at and expires_at <= now:
+        await patch_messaging_connection(connection["id"], {"status": "expired"})
+        raise HTTPException(status_code=409, detail="Instagram connection needs reauthorization")
+    if expires_at and expires_at <= now + timedelta(days=7):
+        async with httpx.AsyncClient() as http:
+            response = await http.get(
+                "https://graph.instagram.com/refresh_access_token",
+                params={"grant_type": "ig_refresh_token", "access_token": token},
+                timeout=15.0,
+            )
+        if response.status_code >= 400:
+            await patch_messaging_connection(connection["id"], {"status": "needs_reauthorization"})
+            raise HTTPException(status_code=409, detail="Instagram connection needs reauthorization")
+        refreshed = response.json()
+        token = refreshed.get("access_token") or token
+        refresh_expires_at = now + timedelta(seconds=int(refreshed.get("expires_in") or 0))
+        await patch_messaging_connection(connection["id"], {
+            "access_token_encrypted": encrypt_secret(token, config.messaging_token_encryption_key),
+            "token_expires_at": refresh_expires_at.isoformat() if refreshed.get("expires_in") else connection.get("token_expires_at"),
+            "status": "connected",
+        })
+    return token
+
+
+async def send_meta_instagram_message(conversation: dict, text: str) -> dict:
+    if not config.meta_instagram_enabled or not config.meta_instagram_send_enabled:
+        return {"status_code": 503, "body": '{"error":"meta_instagram_send_disabled"}'}
+    connection_id = conversation.get("messaging_connection_id")
+    if not connection_id:
+        return {"status_code": 409, "body": '{"error":"missing_messaging_connection"}'}
+    connection = await get_messaging_connection(connection_id=connection_id, user_id=conversation.get("user_id"))
+    if not connection:
+        return {"status_code": 404, "body": '{"error":"messaging_connection_not_found"}'}
+    eligible, reason = can_send_meta_message(
+        connection=connection,
+        conversation=conversation,
+        reply_window_hours=config.meta_instagram_reply_window_hours,
+    )
+    if not eligible:
+        return {"status_code": 409, "body": json.dumps({"error": "recipient_not_eligible", "reason": reason})}
+    token = await get_valid_access_token(connection)
+    result = await META_INSTAGRAM_PROVIDER.send_message(
+        account_id=connection["external_account_id"],
+        recipient_id=conversation.get("external_contact_id") or conversation.get("username"),
+        text=text,
+        access_token=token,
+    )
+    emit_messaging_metric(
+        "meta.message.sent" if int(result.get("status_code") or 500) < 400 else "meta.message.failed",
+        tenant_id=conversation.get("user_id"), connection_id=connection["id"],
+        conversation_id=conversation.get("id"), provider=META_PROVIDER,
+        status=result.get("status_code"),
+    )
+    if result.get("status_code") in {400, 401, 403}:
+        body = str(result.get("body") or "").lower()
+        if "token" in body or "oauth" in body:
+            await patch_messaging_connection(connection["id"], {"status": "needs_reauthorization"})
+    return result
+
+
 async def send_channel_message(conversation: dict, text: str) -> dict:
     channel = conversation.get("channel") or "instagram"
     if channel == "whatsapp":
@@ -2954,11 +3095,16 @@ async def send_channel_message(conversation: dict, text: str) -> dict:
         result = await send_whatsapp_text(phone_e164, text)
         provider = "meta_whatsapp"
     else:
-        subscriber_id = conversation.get("external_contact_id") or conversation.get("username")
-        if not subscriber_id:
-            raise HTTPException(status_code=422, detail="Conversation has no ManyChat subscriber id")
-        result = await send_manychat_message(subscriber_id, text)
-        provider = "manychat"
+        provider = conversation.get("messaging_provider") or MANYCHAT_PROVIDER
+        if provider == META_PROVIDER:
+            result = await send_meta_instagram_message(conversation, text)
+        elif provider == MANYCHAT_PROVIDER:
+            subscriber_id = conversation.get("external_contact_id") or conversation.get("username")
+            if not subscriber_id:
+                raise HTTPException(status_code=422, detail="Conversation has no ManyChat subscriber id")
+            result = await send_manychat_message(subscriber_id, text)
+        else:
+            raise HTTPException(status_code=422, detail="Unsupported messaging provider")
 
     user_id = str(conversation.get("user_id") or "").strip()
     if user_id and int(result.get("status_code") or 500) < 400:
@@ -4798,7 +4944,12 @@ async def handle_inbound_message(
     auto_send_transport: bool = True,
 ) -> dict:
     received_at = now_iso()
-    contact = await get_contact_by_external_id(external_contact_id, channel, user_id)
+    inbound_provider = (transport_metadata or {}).get("provider") or (
+        "meta_whatsapp_cloud_api" if channel == "whatsapp" else MANYCHAT_PROVIDER
+    )
+    contact = await get_contact_by_external_id(
+        external_contact_id, channel, user_id, messaging_provider=inbound_provider,
+    )
     existing_display_name = (contact.get("display_name") or "") if contact else ""
     safe_display_name = normalize_display_name(display_name, existing_display_name, external_contact_id)
     if contact is None:
@@ -4826,7 +4977,7 @@ async def handle_inbound_message(
             "conversation_id": contact.get("id"),
         }
 
-    pending_flush = await flush_pending_deliveries(contact, user_id)
+    pending_flush = await flush_pending_deliveries({**contact, "last_inbound_at": received_at}, user_id)
     if pending_flush.get("attempted"):
         history = pending_flush.get("history") or history
         contact = {**contact, "history": history}
@@ -4856,6 +5007,45 @@ async def handle_inbound_message(
         patch_data["transport_metadata"] = transport_metadata
 
     automation_mode = contact.get("automation_mode") or "supervised"
+    if is_explicit_opt_out(message):
+        patch_data.update({
+            "automation_mode": "disabled",
+            "agent_active": False,
+            "contact_status": "opted_out",
+            "opted_out_at": received_at,
+            "pending_message": None,
+            "pending_message_at": None,
+        })
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{contact.get('id')}", "user_id": f"eq.{user_id}"},
+                json=patch_data,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        print(f"[inbound] OPT_OUT channel={channel} external_id={external_contact_id}")
+        return {
+            "reply": "", "sent": False, "should_send": False, "mode": "disabled",
+            "skipped": True, "reason": "recipient_opted_out", "conversation_id": contact.get("id"),
+        }
+    if contact.get("human_takeover"):
+        patch_data["pending_message"] = None
+        patch_data["pending_message_at"] = None
+        async with httpx.AsyncClient() as http:
+            res = await http.patch(
+                SUPABASE_CONVERSATIONS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                params={"id": f"eq.{contact.get('id')}", "user_id": f"eq.{user_id}"},
+                json=patch_data,
+                timeout=10.0,
+            )
+            res.raise_for_status()
+        return {
+            "reply": "", "sent": False, "should_send": False, "mode": automation_mode,
+            "skipped": True, "reason": "human_takeover", "conversation_id": contact.get("id"),
+        }
     if automation_mode == "disabled":
         patch_data["pending_message"] = None
         patch_data["pending_message_at"] = None
@@ -4891,7 +5081,7 @@ async def handle_inbound_message(
                 timeout=10.0,
             )
             res.raise_for_status()
-        if channel == "instagram":
+        if channel == "instagram" and (contact.get("messaging_provider") or MANYCHAT_PROVIDER) == MANYCHAT_PROVIDER:
             await clear_manychat_agent_response(external_contact_id)
         print(f"[inbound] INACTIVE_HISTORY_ONLY channel={channel} external_id={external_contact_id}")
         return {
@@ -4987,7 +5177,7 @@ async def handle_inbound_message(
                     timeout=10.0,
                 )
                 res.raise_for_status()
-            if channel == "instagram":
+            if channel == "instagram" and (contact.get("messaging_provider") or MANYCHAT_PROVIDER) == MANYCHAT_PROVIDER:
                 await clear_manychat_agent_response(external_contact_id)
             print(f"[inbound] PROVIDER_ERROR channel={channel} external_id={external_contact_id} type={e.error_type}")
             return {
@@ -5108,7 +5298,7 @@ async def handle_inbound_message(
             )
             res.raise_for_status()
 
-        send_result = await send_channel_message(contact, reply)
+        send_result = await send_channel_message({**contact, **patch_data}, reply)
         sent = send_result["status_code"] < 400
         is_pending_delivery = is_manychat_pending_delivery_error(send_result)
         sent_history = mark_last_auto_assistant_sent(new_history, sent, send_result)
@@ -5181,7 +5371,14 @@ async def is_webhook_replay(user_id: str, payload: WebhookPayload) -> bool:
         return False
 
 
-async def reserve_inbound_event(user_id: str, channel: str, event_id: Optional[str]) -> bool:
+async def reserve_inbound_event(
+    user_id: str,
+    channel: str,
+    event_id: Optional[str],
+    *,
+    provider: Optional[str] = None,
+    messaging_connection_id: Optional[str] = None,
+) -> bool:
     event_id = str(event_id or "").strip()
     if not config.setter_persistent_idempotency_enabled or not event_id:
         return True
@@ -5189,13 +5386,16 @@ async def reserve_inbound_event(user_id: str, channel: str, event_id: Optional[s
         "user_id": user_id,
         "channel": channel,
         "event_id": event_id,
+        "provider": provider or ("meta_whatsapp_cloud_api" if channel == "whatsapp" else MANYCHAT_PROVIDER),
+        "messaging_connection_id": messaging_connection_id,
         "status": "processing",
     }
+    conflict_columns = "user_id,provider,messaging_connection_id,event_id"
     async with httpx.AsyncClient() as http:
         response = await http.post(
             SUPABASE_PROCESSED_INBOUND_EVENTS_URL,
             headers={**supabase_headers(), "Prefer": "resolution=ignore-duplicates,return=representation"},
-            params={"on_conflict": "user_id,channel,event_id"},
+            params={"on_conflict": conflict_columns},
             json=row,
             timeout=5.0,
         )
@@ -5213,6 +5413,8 @@ async def finish_inbound_event(
     status: str,
     conversation_id: Optional[str] = None,
     last_error: Optional[str] = None,
+    provider: Optional[str] = None,
+    messaging_connection_id: Optional[str] = None,
 ) -> None:
     event_id = str(event_id or "").strip()
     if not config.setter_persistent_idempotency_enabled or not event_id:
@@ -5224,14 +5426,20 @@ async def finish_inbound_event(
         "last_error": (last_error or "")[:500] or None,
     }
     async with httpx.AsyncClient() as http:
+        params = {
+            "event_id": f"eq.{event_id}",
+        }
+        if messaging_connection_id:
+            params.update({
+                "provider": f"eq.{provider or META_PROVIDER}",
+                "messaging_connection_id": f"eq.{messaging_connection_id}",
+            })
+        else:
+            params.update({"user_id": f"eq.{user_id}", "channel": f"eq.{channel}"})
         response = await http.patch(
             SUPABASE_PROCESSED_INBOUND_EVENTS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={
-                "user_id": f"eq.{user_id}",
-                "channel": f"eq.{channel}",
-                "event_id": f"eq.{event_id}",
-            },
+            params=params,
             json=patch,
             timeout=5.0,
         )
@@ -5258,6 +5466,8 @@ async def webhook(
     x_webhook_secret: Optional[str] = Header(default=None),
 ):
     user_id = await require_secret(x_webhook_secret)
+    if config.meta_instagram_enabled and await get_active_messaging_provider(user_id) != MANYCHAT_PROVIDER:
+        return {**duplicate_webhook_response(), "reason": "provider_inactive"}
     if await is_webhook_replay(user_id, payload):
         return duplicate_webhook_response()
     if not await reserve_inbound_event(user_id, "instagram", payload.event_id):
@@ -5389,6 +5599,336 @@ async def whatsapp_webhook(
     return {"success": True, "processed": processed}
 
 
+def require_meta_feature(feature: str, enabled: bool) -> None:
+    if not config.meta_instagram_enabled or not enabled:
+        raise HTTPException(status_code=404, detail=f"Meta Instagram {feature} is disabled")
+
+
+def emit_messaging_metric(name: str, **dimensions: object) -> None:
+    safe = {
+        key: value for key, value in dimensions.items()
+        if key in {"tenant_id", "connection_id", "conversation_id", "provider", "status", "reason"}
+    }
+    print(json.dumps({"metric": name, **safe}, separators=(",", ":"), default=str), flush=True)
+
+
+def sanitized_connection(connection: Optional[dict]) -> dict:
+    if not connection:
+        return {"provider": META_PROVIDER, "status": "disconnected", "connected": False}
+    return {
+        "id": connection.get("id"),
+        "provider": connection.get("provider"),
+        "status": connection.get("status"),
+        "connected": connection.get("status") == "connected",
+        "username": connection.get("external_username"),
+        "connected_at": connection.get("connected_at"),
+        "updated_at": connection.get("updated_at"),
+        "last_webhook_at": connection.get("last_webhook_at"),
+    }
+
+
+@app.get("/integrations/instagram")
+async def instagram_connection_status(user_id: str = Depends(require_jwt)):
+    connection = await get_messaging_connection(user_id=user_id, provider=META_PROVIDER)
+    return sanitized_connection(connection)
+
+
+@app.post("/integrations/instagram/oauth/start")
+async def start_instagram_oauth(user_id: str = Depends(require_jwt)):
+    require_meta_feature("OAuth", config.meta_instagram_oauth_enabled)
+    if not config.meta_app_id or not config.meta_instagram_redirect_uri or not config.messaging_token_encryption_key:
+        raise HTTPException(status_code=503, detail="Meta Instagram OAuth is not configured")
+    state = secrets.token_urlsafe(48)
+    state_hash = hashlib.sha256(state.encode()).hexdigest()
+    async with httpx.AsyncClient() as http:
+        response = await http.post(
+            SUPABASE_MESSAGING_OAUTH_STATES_URL,
+            headers={**supabase_headers(), "Prefer": "return=minimal"},
+            json={
+                "state_hash": state_hash,
+                "user_id": user_id,
+                "provider": META_PROVIDER,
+                "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+            },
+            timeout=10.0,
+        )
+    response.raise_for_status()
+    authorization_url = "https://www.instagram.com/oauth/authorize?" + urlencode({
+        "enable_fb_login": "0",
+        "force_authentication": "1",
+        "client_id": config.meta_app_id,
+        "redirect_uri": config.meta_instagram_redirect_uri,
+        "response_type": "code",
+        "scope": ",".join(sorted(REQUIRED_META_SCOPES)),
+        "state": state,
+    })
+    return {"authorization_url": authorization_url}
+
+
+async def consume_instagram_oauth_state(state: str) -> dict:
+    state_hash = hashlib.sha256((state or "").encode()).hexdigest()
+    async with httpx.AsyncClient() as http:
+        response = await http.patch(
+            SUPABASE_MESSAGING_OAUTH_STATES_URL,
+            headers={**supabase_headers(), "Prefer": "return=representation"},
+            params={
+                "state_hash": f"eq.{state_hash}",
+                "provider": f"eq.{META_PROVIDER}",
+                "consumed_at": "is.null",
+                "expires_at": f"gt.{now_iso()}",
+            },
+            json={"consumed_at": now_iso()},
+            timeout=10.0,
+        )
+    response.raise_for_status()
+    rows = response.json()
+    if not rows:
+        raise HTTPException(status_code=400, detail="Invalid, expired, or already used OAuth state")
+    return rows[0]
+
+
+async def exchange_instagram_oauth_code(code: str) -> dict:
+    async with httpx.AsyncClient() as http:
+        short_response = await http.post(
+            "https://api.instagram.com/oauth/access_token",
+            data={
+                "client_id": config.meta_app_id,
+                "client_secret": config.meta_app_secret,
+                "grant_type": "authorization_code",
+                "redirect_uri": config.meta_instagram_redirect_uri,
+                "code": code,
+            },
+            timeout=15.0,
+        )
+        if short_response.status_code >= 400:
+            raise HTTPException(status_code=400, detail="Meta rejected the authorization code")
+        short = short_response.json()
+        short_token = short.get("access_token")
+        if not short_token:
+            raise HTTPException(status_code=400, detail="Meta did not return an access token")
+        long_response = await http.get(
+            "https://graph.instagram.com/access_token",
+            params={
+                "grant_type": "ig_exchange_token",
+                "client_secret": config.meta_app_secret,
+                "access_token": short_token,
+            },
+            timeout=15.0,
+        )
+        if long_response.status_code >= 400:
+            raise HTTPException(status_code=400, detail="Meta long-lived token exchange failed")
+        token_data = long_response.json()
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Meta long-lived token is missing")
+        profile_response = await http.get(
+            f"https://graph.instagram.com/{META_GRAPH_API_VERSION}/me",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"fields": "user_id,username,account_type"},
+            timeout=15.0,
+        )
+        if profile_response.status_code >= 400:
+            raise HTTPException(status_code=400, detail="Instagram Professional account lookup failed")
+        profile = profile_response.json()
+        external_account_id = str(profile.get("user_id") or profile.get("id") or short.get("user_id") or "")
+        if not external_account_id:
+            raise HTTPException(status_code=400, detail="Meta account ID is missing")
+        # Instagram Login issues Instagram User access tokens on graph.instagram.com.
+        # Facebook's debug_token endpoint does not reliably accept this token type.
+        # A read-only conversations probe verifies the messaging permission without
+        # exposing the token or performing any user-visible action.
+        messages_permission_response = await http.get(
+            f"https://graph.instagram.com/{META_GRAPH_API_VERSION}/{external_account_id}/conversations",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"fields": "id", "limit": 1},
+            timeout=15.0,
+        )
+        if messages_permission_response.status_code >= 400:
+            raise HTTPException(status_code=400, detail="Required Instagram permissions were not granted")
+        granted_scopes = set(REQUIRED_META_SCOPES)
+    account_type = str(profile.get("account_type") or "").upper()
+    if account_type and account_type not in {"BUSINESS", "MEDIA_CREATOR", "CREATOR"}:
+        raise HTTPException(status_code=400, detail="A Professional Instagram account is required")
+    return {
+        "access_token": access_token,
+        "expires_in": token_data.get("expires_in"),
+        "external_account_id": external_account_id,
+        "external_username": profile.get("username"),
+        "account_type": account_type,
+        "scopes": sorted(granted_scopes),
+    }
+
+
+@app.get("/oauth/meta/instagram/callback")
+async def instagram_oauth_callback(
+    code: Optional[str] = Query(default=None),
+    state: Optional[str] = Query(default=None),
+    error: Optional[str] = Query(default=None),
+    granted_scopes: Optional[str] = Query(default=None),
+):
+    require_meta_feature("OAuth", config.meta_instagram_oauth_enabled)
+    redirect_base = config.meta_instagram_post_connect_url
+    if error or not code or not state:
+        return RedirectResponse(f"{redirect_base}?instagram=error", status_code=303)
+    oauth_state = await consume_instagram_oauth_state(state)
+    if granted_scopes:
+        granted = {item.strip() for item in granted_scopes.split(",") if item.strip()}
+        if not REQUIRED_META_SCOPES.issubset(granted):
+            return RedirectResponse(f"{redirect_base}?instagram=missing_permissions", status_code=303)
+    token_data = await exchange_instagram_oauth_code(code)
+    if not token_data["external_account_id"]:
+        raise HTTPException(status_code=400, detail="Meta account ID is missing")
+    expires_at = None
+    if token_data.get("expires_in"):
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=int(token_data["expires_in"]))).isoformat()
+    row = {
+        "user_id": oauth_state["user_id"],
+        "provider": META_PROVIDER,
+        "status": "connected",
+        "external_account_id": token_data["external_account_id"],
+        "external_username": token_data.get("external_username"),
+        "scopes": token_data["scopes"],
+        "access_token_encrypted": encrypt_secret(token_data["access_token"], config.messaging_token_encryption_key),
+        "token_expires_at": expires_at,
+        "connected_at": now_iso(),
+        "disconnected_at": None,
+        "metadata": {"account_type": token_data.get("account_type"), "webhook_subscription": "app_dashboard"},
+    }
+    async with httpx.AsyncClient() as http:
+        response = await http.post(
+            SUPABASE_MESSAGING_CONNECTIONS_URL,
+            headers={**supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+            params={"on_conflict": "user_id,provider"},
+            json=row,
+            timeout=10.0,
+        )
+    response.raise_for_status()
+    await upsert_user_singleton_row(
+        SUPABASE_BETA_ACCOUNT_SETTINGS_URL, str(oauth_state["user_id"]),
+        {"active_messaging_provider": META_PROVIDER, "updated_at": now_iso()},
+    )
+    emit_messaging_metric("meta.connection.created", tenant_id=oauth_state["user_id"], provider=META_PROVIDER)
+    return RedirectResponse(f"{redirect_base}?instagram=connected", status_code=303)
+
+
+@app.post("/integrations/instagram/disconnect")
+async def disconnect_instagram(user_id: str = Depends(require_jwt)):
+    connection = await get_messaging_connection(user_id=user_id, provider=META_PROVIDER)
+    if not connection:
+        return {"success": True, "status": "disconnected"}
+    try:
+        token = await get_valid_access_token(connection)
+        async with httpx.AsyncClient() as http:
+            await http.delete(
+                f"https://graph.instagram.com/{META_GRAPH_API_VERSION}/{connection['external_account_id']}/permissions",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+    except Exception:
+        pass
+    await patch_messaging_connection(connection["id"], {
+        "status": "disconnected",
+        "access_token_encrypted": None,
+        "token_expires_at": None,
+        "disconnected_at": now_iso(),
+    })
+    async with httpx.AsyncClient() as http:
+        response = await http.patch(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=minimal"},
+            params={"user_id": f"eq.{user_id}", "messaging_connection_id": f"eq.{connection['id']}"},
+            json={"automation_mode": "disabled", "agent_active": False, "pending_message": None, "pending_message_at": None},
+            timeout=10.0,
+        )
+    response.raise_for_status()
+    await upsert_user_singleton_row(
+        SUPABASE_BETA_ACCOUNT_SETTINGS_URL, user_id,
+        {"active_messaging_provider": MANYCHAT_PROVIDER, "updated_at": now_iso()},
+    )
+    emit_messaging_metric("meta.connection.disconnected", tenant_id=user_id, connection_id=connection["id"], provider=META_PROVIDER)
+    return {"success": True, "status": "disconnected"}
+
+
+@app.get("/webhooks/meta/instagram")
+async def verify_instagram_webhook(
+    hub_mode: Optional[str] = Query(default=None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(default=None, alias="hub.verify_token"),
+    hub_challenge: Optional[str] = Query(default=None, alias="hub.challenge"),
+):
+    require_meta_feature("webhook", config.meta_instagram_webhook_enabled)
+    expected = config.meta_webhook_verify_token
+    if hub_mode == "subscribe" and expected and hmac.compare_digest(hub_verify_token or "", expected):
+        return Response(content=hub_challenge or "", media_type="text/plain")
+    raise HTTPException(status_code=403, detail="Invalid Meta webhook verify token")
+
+
+@app.post("/webhooks/meta/instagram")
+async def instagram_webhook(request: Request, x_hub_signature_256: Optional[str] = Header(default=None)):
+    require_meta_feature("webhook", config.meta_instagram_webhook_enabled)
+    body = await request.body()
+    emit_messaging_metric("meta.webhook.received", provider=META_PROVIDER)
+    try:
+        verify_meta_signature(body, x_hub_signature_256)
+    except HTTPException:
+        emit_messaging_metric("meta.webhook.invalid_signature", provider=META_PROVIDER)
+        raise
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    processed = 0
+    for event in parse_meta_instagram_webhook(payload):
+        connection = await get_messaging_connection(provider=META_PROVIDER, external_account_id=event.account_id)
+        if not connection or connection.get("status") != "connected":
+            print(f"[meta-instagram] unknown_or_inactive_account account_id={event.account_id}")
+            continue
+        user_id = str(connection["user_id"])
+        if await get_active_messaging_provider(user_id) != META_PROVIDER:
+            emit_messaging_metric("meta.webhook.provider_inactive", tenant_id=user_id, connection_id=connection["id"], provider=META_PROVIDER)
+            continue
+        if not await reserve_inbound_event(
+            user_id, "instagram", event.external_event_id,
+            provider=META_PROVIDER, messaging_connection_id=connection["id"],
+        ):
+            emit_messaging_metric("meta.webhook.duplicate", tenant_id=user_id, connection_id=connection["id"], provider=META_PROVIDER)
+            continue
+        try:
+            result = await handle_inbound_message(
+                channel="instagram",
+                external_contact_id=event.sender_id,
+                display_name=event.sender_id,
+                message=event.text,
+                user_id=user_id,
+                transport_metadata={
+                    "provider": META_PROVIDER,
+                    "messaging_connection_id": connection["id"],
+                    "account_id": event.account_id,
+                    "message_id": event.external_message_id,
+                    "conversation_id": event.external_conversation_id,
+                    "attachments": event.attachments,
+                },
+            )
+            await finish_inbound_event(
+                user_id, "instagram", event.external_event_id,
+                status="completed", conversation_id=result.get("conversation_id"),
+                provider=META_PROVIDER, messaging_connection_id=connection["id"],
+            )
+            await patch_messaging_connection(connection["id"], {"last_webhook_at": now_iso()})
+            emit_messaging_metric(
+                "meta.message.received", tenant_id=user_id, connection_id=connection["id"],
+                conversation_id=result.get("conversation_id"), provider=META_PROVIDER,
+            )
+        except Exception as exc:
+            await finish_inbound_event(
+                user_id, "instagram", event.external_event_id,
+                status="failed", last_error=str(exc), provider=META_PROVIDER,
+                messaging_connection_id=connection["id"],
+            )
+            raise
+        processed += 1
+    return {"success": True, "processed": processed}
+
+
 # ── Dashboard endpoints ────────────────────────────────────────────────────────
 
 @app.get("/auth/me")
@@ -5471,7 +6011,7 @@ async def get_conversation_summaries(
                 "order": "created_at.desc",
                 "limit": 500,
                 "user_id": f"eq.{user_id}",
-                "select": "id,created_at,username,display_name,message,status,agent_active,automation_mode,pending_message,pending_message_at,channel,external_contact_id,phone_e164,last_inbound_at",
+                "select": "id,created_at,username,display_name,message,status,agent_active,automation_mode,pending_message,pending_message_at,channel,external_contact_id,phone_e164,last_inbound_at,messaging_provider,messaging_connection_id,human_takeover,contact_status,opted_out_at",
             },
             timeout=10.0,
         )
@@ -5861,6 +6401,42 @@ async def update_automation_mode(
         )
         res.raise_for_status()
     return {"success": True}
+
+
+@app.post("/conversations/{conversation_id}/human-takeover")
+async def enable_human_takeover(conversation_id: str, user_id: str = Depends(require_jwt)):
+    async with httpx.AsyncClient() as http:
+        response = await http.patch(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=representation"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
+            json={"human_takeover": True, "pending_message": None, "pending_message_at": None},
+            timeout=10.0,
+        )
+    response.raise_for_status()
+    if not response.json():
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"success": True, "human_takeover": True}
+
+
+@app.post("/conversations/{conversation_id}/resume-angellos")
+async def resume_angellos(conversation_id: str, user_id: str = Depends(require_jwt)):
+    async with httpx.AsyncClient() as http:
+        response = await http.patch(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=representation"},
+            params={
+                "id": f"eq.{conversation_id}",
+                "user_id": f"eq.{user_id}",
+                "contact_status": "neq.opted_out",
+            },
+            json={"human_takeover": False, "agent_active": True},
+            timeout=10.0,
+        )
+    response.raise_for_status()
+    if not response.json():
+        raise HTTPException(status_code=409, detail="Opted-out contacts cannot resume automation")
+    return {"success": True, "human_takeover": False}
 
 
 @app.post("/conversations/bulk-automation-mode")
@@ -6484,7 +7060,7 @@ async def get_due_follow_ups(
                 "order": "created_at.desc",
                 "limit": "500",
                 "user_id": f"eq.{user_id}",
-                "select": "id,created_at,user_id,username,display_name,message,status,agent_active,automation_mode,history,conversation_memory,conversation_memory_through_message_count,channel,external_contact_id,phone_e164,last_inbound_at",
+                "select": "id,created_at,user_id,username,display_name,message,status,agent_active,automation_mode,history,conversation_memory,conversation_memory_through_message_count,channel,external_contact_id,phone_e164,last_inbound_at,messaging_provider,messaging_connection_id,human_takeover,contact_status,opted_out_at",
             },
             timeout=10.0,
         )
@@ -6727,7 +7303,7 @@ async def cron_auto_follow_up_check(
             params={
                 "order": "created_at.desc",
                 "limit": "500",
-                "select": "id,created_at,user_id,username,display_name,message,status,agent_active,automation_mode,history,conversation_memory,conversation_memory_through_message_count,channel,external_contact_id,phone_e164,last_inbound_at",
+                "select": "id,created_at,user_id,username,display_name,message,status,agent_active,automation_mode,history,conversation_memory,conversation_memory_through_message_count,channel,external_contact_id,phone_e164,last_inbound_at,messaging_provider,messaging_connection_id,human_takeover,contact_status,opted_out_at",
             },
             timeout=10.0,
         )

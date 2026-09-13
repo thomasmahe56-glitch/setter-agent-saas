@@ -27,6 +27,18 @@ class Config:
     whatsapp_phone_number_id: str
     whatsapp_verify_token: str
     meta_app_secret: str
+    meta_app_id: str
+    meta_webhook_verify_token: str
+    meta_instagram_redirect_uri: str
+    meta_instagram_post_connect_url: str
+    meta_graph_api_version: str
+    messaging_token_encryption_key: str
+    meta_instagram_enabled: bool
+    meta_instagram_oauth_enabled: bool
+    meta_instagram_webhook_enabled: bool
+    meta_instagram_send_enabled: bool
+    meta_instagram_history_sync_enabled: bool
+    meta_instagram_reply_window_hours: int
     graph_api_version: str
     business_name: str
     coach_name: str
@@ -66,6 +78,18 @@ def load_config() -> Config:
         whatsapp_phone_number_id=os.environ.get("WHATSAPP_PHONE_NUMBER_ID", ""),
         whatsapp_verify_token=os.environ.get("WHATSAPP_VERIFY_TOKEN", ""),
         meta_app_secret=os.environ.get("META_APP_SECRET", ""),
+        meta_app_id=os.environ.get("META_APP_ID", ""),
+        meta_webhook_verify_token=os.environ.get("META_WEBHOOK_VERIFY_TOKEN", ""),
+        meta_instagram_redirect_uri=os.environ.get("META_INSTAGRAM_REDIRECT_URI", ""),
+        meta_instagram_post_connect_url=os.environ.get("META_INSTAGRAM_POST_CONNECT_URL", "http://localhost:3000/settings/integrations"),
+        meta_graph_api_version=os.environ.get("META_GRAPH_API_VERSION", "v26.0").strip(),
+        messaging_token_encryption_key=os.environ.get("MESSAGING_TOKEN_ENCRYPTION_KEY", ""),
+        meta_instagram_enabled=env_bool("META_INSTAGRAM_ENABLED", False),
+        meta_instagram_oauth_enabled=env_bool("META_INSTAGRAM_OAUTH_ENABLED", False),
+        meta_instagram_webhook_enabled=env_bool("META_INSTAGRAM_WEBHOOK_ENABLED", False),
+        meta_instagram_send_enabled=env_bool("META_INSTAGRAM_SEND_ENABLED", False),
+        meta_instagram_history_sync_enabled=env_bool("META_INSTAGRAM_HISTORY_SYNC_ENABLED", False),
+        meta_instagram_reply_window_hours=max(1, int(os.environ.get("META_INSTAGRAM_REPLY_WINDOW_HOURS", "24"))),
         graph_api_version=os.environ.get("GRAPH_API_VERSION", "v23.0"),
         business_name=os.environ.get("BUSINESS_NAME", ""),
         coach_name=os.environ.get("COACH_NAME", ""),
