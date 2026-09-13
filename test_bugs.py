@@ -3,7 +3,7 @@ import asyncio
 import json
 import types
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 # ---------------------------------------------------------------------------
@@ -63,6 +63,11 @@ from main import (
     estimate_claude_cost_eur,
     enforce_ai_cost_cap,
     configured_follow_up_stage,
+    auto_reply_delay_seconds,
+    auto_reply_delivery_time,
+    deliver_due_scheduled_reply,
+    find_scheduled_auto_reply,
+    supersede_scheduled_auto_replies,
     is_within_allowed_send_window,
     next_allowed_send_at,
     normalize_beta_account_settings,
@@ -662,6 +667,137 @@ class TestManyChatWebhookAutoSend:
         assert final_patch["pending_message"] == "No worries, appreciate you getting back to me."
         assert assistant["pending_delivery"] is True
         assert assistant["delivery_status"] == "pending_delivery"
+
+    def test_auto_mode_with_configured_delay_is_queued_not_sent(self, monkeypatch):
+        _PatchCaptureAsyncClient.patches = []
+
+        async def fake_get_contact_by_external_id(*args, **kwargs):
+            return {
+                "id": "conv-delayed",
+                "user_id": "user-1",
+                "channel": "instagram",
+                "external_contact_id": "subscriber-123",
+                "username": "prospect_handle",
+                "display_name": "prospect_handle",
+                "automation_mode": "auto",
+                "agent_active": True,
+                "history": [],
+            }
+
+        async def fake_get_active_prompt(user_id):
+            return build_training_center_prompt("Base prompt", {"is_angellos_acquisition": True}, {}, {})
+
+        async def fake_get_beta_cost_settings(user_id):
+            return normalize_beta_account_settings(row={
+                "allowed_send_start": "00:00",
+                "allowed_send_end": "23:59",
+                "min_auto_delay_seconds": 60,
+                "random_auto_delay_seconds": 0,
+            })
+
+        fake_send = AsyncMock(return_value={"status_code": 200, "body": "ok"})
+        before = datetime.now(timezone.utc)
+        monkeypatch.setattr("main.get_contact_by_external_id", fake_get_contact_by_external_id)
+        monkeypatch.setattr("main.get_active_prompt", fake_get_active_prompt)
+        monkeypatch.setattr("main.get_beta_cost_settings", fake_get_beta_cost_settings)
+        monkeypatch.setattr("main.send_channel_message", fake_send)
+        monkeypatch.setattr("main.httpx.AsyncClient", _PatchCaptureAsyncClient)
+
+        result = asyncio.run(handle_inbound_message(
+            channel="instagram",
+            external_contact_id="subscriber-123",
+            display_name="prospect_handle",
+            message="No thanks bro",
+            user_id="user-1",
+            transport_metadata={"provider": "meta", "message_id": "msg-delayed"},
+            auto_send_transport=True,
+        ))
+
+        queued_at = datetime.fromisoformat(result["queued_until"])
+        patch_body = _PatchCaptureAsyncClient.patches[-1]["kwargs"]["json"]
+        assistant = patch_body["history"][-1]
+        assert result["should_send"] is False
+        assert result["sent"] is False
+        assert result["reason"] == "configured_reply_delay"
+        assert queued_at >= before + timedelta(seconds=59)
+        assert patch_body["pending_message"] == "No worries, appreciate you getting back to me."
+        assert patch_body["pending_message_at"] == result["queued_until"]
+        assert assistant["source"] == "inbound_auto_queued"
+        assert assistant["delivery_status"] == "scheduled"
+        assert assistant["configured_delay_seconds"] == 60
+        fake_send.assert_not_awaited()
+
+
+class TestScheduledAutoReply:
+    def test_delay_uses_minimum_plus_random_extra_and_send_window(self):
+        settings = normalize_beta_account_settings(row={
+            "allowed_send_start": "08:00",
+            "allowed_send_end": "22:00",
+            "min_auto_delay_seconds": 60,
+            "random_auto_delay_seconds": 540,
+        })
+        assert auto_reply_delay_seconds(settings, randbelow=lambda upper: 120) == 180
+
+        send_at, delay = auto_reply_delivery_time(
+            datetime(2026, 8, 20, 21, 59, tzinfo=timezone.utc),
+            settings,
+            randbelow=lambda upper: 120,
+        )
+        assert delay == 180
+        assert send_at.isoformat() == "2026-08-21T08:00:00+00:00"
+
+    def test_due_reply_is_delivered_and_cleared(self, monkeypatch):
+        _PatchCaptureAsyncClient.patches = []
+        scheduled_message = {
+            "role": "assistant",
+            "content": "Delayed reply",
+            "source": "inbound_auto_queued",
+            "sent": False,
+            "ignored": False,
+            "delivery_id": "delivery-1",
+            "delivery_status": "scheduled",
+            "queued_until": "2026-08-20T09:00:00+00:00",
+        }
+        conversation = {
+            "id": "conv-1",
+            "user_id": "user-1",
+            "automation_mode": "auto",
+            "agent_active": True,
+            "history": [{"role": "user", "content": "Hello"}, scheduled_message],
+        }
+
+        async def fake_get_conversation_by_id(conversation_id, user_id):
+            return conversation
+
+        fake_send = AsyncMock(return_value={"status_code": 200, "body": '{"message_id":"mid.1"}'})
+        monkeypatch.setattr("main.get_conversation_by_id", fake_get_conversation_by_id)
+        monkeypatch.setattr("main.send_channel_message", fake_send)
+        monkeypatch.setattr("main.httpx.AsyncClient", _PatchCaptureAsyncClient)
+
+        delivered = asyncio.run(deliver_due_scheduled_reply("conv-1", "user-1"))
+        patch_body = _PatchCaptureAsyncClient.patches[-1]["kwargs"]["json"]
+        assistant = patch_body["history"][-1]
+        assert delivered is True
+        fake_send.assert_awaited_once_with(conversation, "Delayed reply")
+        assert assistant["sent"] is True
+        assert assistant["delivery_status"] == "sent"
+        assert patch_body["pending_message"] is None
+        assert patch_body["pending_message_at"] is None
+
+    def test_new_inbound_supersedes_older_scheduled_reply(self):
+        history = [{
+            "role": "assistant",
+            "content": "Old reply",
+            "source": "inbound_auto_queued",
+            "sent": False,
+            "ignored": False,
+            "delivery_status": "scheduled",
+            "queued_until": "2026-08-20T09:00:00+00:00",
+        }]
+        updated = supersede_scheduled_auto_replies(history)
+        assert updated[0]["ignored"] is True
+        assert updated[0]["delivery_status"] == "superseded"
+        assert find_scheduled_auto_reply(updated, now=datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)) is None
 
 
 class TestPendingDeliveryHelpers:
