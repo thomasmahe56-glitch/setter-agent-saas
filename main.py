@@ -2383,7 +2383,14 @@ def text_has_emoji(text: str) -> bool:
 
 
 def sanitize_angellos_beta_reply(reply: str, prospect_message: str) -> str:
-    cleaned = re.sub(r"[—–-]", " ", reply or "")
+    # Keep ASCII hyphens inside URLs intact. The no-dash tone rule applies to
+    # prose, and mutating a configured URL can turn a trusted destination into
+    # a different or invalid address before the allowlist check runs.
+    reply_parts = re.split(r"(https?://\S+)", reply or "")
+    cleaned = "".join(
+        part if part.startswith(("http://", "https://")) else re.sub(r"[—–-]", " ", part)
+        for part in reply_parts
+    )
     if not text_has_emoji(prospect_message):
         cleaned = re.sub(r"[\U0001F300-\U0001FAFF\U00002700-\U000027BF]", "", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)

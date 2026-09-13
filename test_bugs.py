@@ -45,6 +45,7 @@ from main import (
     learn_refinement_rule,
     merge_rule_list,
     tenant_language_from_prompt,
+    sanitize_angellos_beta_reply,
     validate_agent_reply,
     _cancel_pending_replies_for_mode_off,
     _generate_and_queue_auto_reply,
@@ -637,6 +638,14 @@ class TestModeSelectionReactivation:
 
 
 class TestReplyUrlSafety:
+    def test_style_sanitizer_preserves_hyphens_inside_urls(self):
+        result = sanitize_angellos_beta_reply(
+            "Start here - https://my-beta.example/free-trial",
+            "Try the beta",
+        )
+
+        assert result == "Start here https://my-beta.example/free-trial"
+
     def test_replaces_hallucinated_beta_url_with_configured_sales_page(self):
         prompt = (
             "BASE\n\n<!-- AGENT_OPTIONS_START -->\n"
