@@ -3050,6 +3050,37 @@ async def get_valid_access_token(connection: dict) -> str:
     return token
 
 
+async def resolve_meta_instagram_contact_name(connection: dict, ig_scoped_id: str) -> Optional[str]:
+    """Resolve an Instagram messaging sender without delaying or breaking webhook processing.
+
+    Meta identifies people in messaging webhooks with an Instagram-scoped ID. The
+    User Profile endpoint can exchange that ID for the username/name after the
+    person has initiated a conversation. Profile lookup is best-effort: the raw
+    scoped ID remains the delivery identifier when Meta does not return a profile.
+    """
+    try:
+        token = await get_valid_access_token(connection)
+        async with httpx.AsyncClient() as http:
+            response = await http.get(
+                f"https://graph.instagram.com/{META_GRAPH_API_VERSION}/{ig_scoped_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"fields": "name,username"},
+                timeout=10.0,
+            )
+        if response.status_code >= 400:
+            return None
+        profile = response.json()
+        for candidate in (profile.get("username"), profile.get("name")):
+            cleaned = str(candidate or "").strip().lstrip("@")
+            if cleaned and not is_placeholder_display_name(cleaned):
+                return cleaned
+    except Exception:
+        # An unavailable profile must never make Meta retry an otherwise valid
+        # inbound message. The next message will retry resolution naturally.
+        return None
+    return None
+
+
 async def send_meta_instagram_message(conversation: dict, text: str) -> dict:
     if not config.meta_instagram_enabled or not config.meta_instagram_send_enabled:
         return {"status_code": 503, "body": '{"error":"meta_instagram_send_disabled"}'}
@@ -5893,10 +5924,11 @@ async def instagram_webhook(request: Request, x_hub_signature_256: Optional[str]
             emit_messaging_metric("meta.webhook.duplicate", tenant_id=user_id, connection_id=connection["id"], provider=META_PROVIDER)
             continue
         try:
+            contact_name = await resolve_meta_instagram_contact_name(connection, event.sender_id)
             result = await handle_inbound_message(
                 channel="instagram",
                 external_contact_id=event.sender_id,
-                display_name=event.sender_id,
+                display_name=contact_name or event.sender_id,
                 message=event.text,
                 user_id=user_id,
                 transport_metadata={
