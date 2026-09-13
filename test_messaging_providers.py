@@ -322,6 +322,62 @@ def test_duplicate_meta_webhook_never_enters_setter_twice(monkeypatch):
     assert handle.await_count == 1
 
 
+def test_meta_profile_resolution_prefers_username_and_keeps_token_out_of_url(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    import main
+
+    captured = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"name": "Prospect Name", "username": "prospect.username"}
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+
+        async def get(self, url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return Response()
+
+    monkeypatch.setattr(main, "get_valid_access_token", AsyncMock(return_value="server-only-token"))
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+
+    result = asyncio.run(main.resolve_meta_instagram_contact_name({"id": "connection"}, "123456"))
+
+    assert result == "prospect.username"
+    assert captured["url"].endswith("/123456")
+    assert "server-only-token" not in captured["url"]
+    assert captured["headers"] == {"Authorization": "Bearer server-only-token"}
+    assert captured["params"] == {"fields": "name,username"}
+
+
+def test_meta_profile_resolution_is_best_effort(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    import main
+
+    class Response:
+        status_code = 403
+
+        def json(self):
+            return {"error": {"message": "not available"}}
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        async def get(self, *args, **kwargs): return Response()
+
+    monkeypatch.setattr(main, "get_valid_access_token", AsyncMock(return_value="server-only-token"))
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+
+    assert asyncio.run(main.resolve_meta_instagram_contact_name({"id": "connection"}, "123456")) is None
+
+
 def test_mocked_meta_e2e_webhook_core_ai_and_send(monkeypatch):
     import asyncio
     import hashlib
