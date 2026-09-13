@@ -3486,7 +3486,31 @@ def validate_agent_reply(reply: str, system_prompt: str) -> str:
         if url.rstrip("/") not in allowed_urls
     ]
     if unexpected_urls:
-        raise HTTPException(status_code=502, detail="AI reply contains an unauthorized URL")
+        links = extract_agent_links(system_prompt)
+        trusted_call_url = (links.get("calendly_url") or config.url_call or "").strip()
+        trusted_sales_url = (links.get("sales_page_url") or config.url_page or "").strip()
+        lowered = cleaned.lower()
+        if trusted_call_url and re.search(r"\b(book|booking|calendar|calendly|call|demo|meeting)\b", lowered):
+            replacement_url = trusted_call_url
+        elif trusted_sales_url:
+            replacement_url = trusted_sales_url
+        else:
+            replacement_url = trusted_call_url
+        if not replacement_url:
+            raise HTTPException(status_code=502, detail="AI reply contains an unauthorized URL")
+        for url in unexpected_urls:
+            cleaned = cleaned.replace(url, replacement_url)
+        print(
+            f"[reply-safety] replaced {len(unexpected_urls)} unauthorized URL(s) "
+            "with a configured destination",
+            flush=True,
+        )
+        remaining_unexpected = [
+            url for url in extract_urls(cleaned)
+            if url.rstrip("/") not in allowed_urls
+        ]
+        if remaining_unexpected:
+            raise HTTPException(status_code=502, detail="AI reply contains an unauthorized URL")
     return cleaned
 
 
