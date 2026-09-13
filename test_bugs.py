@@ -681,6 +681,44 @@ class TestReplyUrlSafety:
 
         assert getattr(exc_info.value, "status_code", None) == 502
 
+    def test_training_center_sales_link_overrides_legacy_global_prompt_link(self):
+        legacy_prompt = (
+            "BASE\n\n<!-- AGENT_OPTIONS_START -->\n"
+            "Sales page link: https://legacy.example/global\n"
+            "<!-- AGENT_OPTIONS_END -->"
+        )
+        prompt = build_training_center_prompt(
+            legacy_prompt,
+            {"business_name": "Angellos", "sales_page_url": "https://tally.so/r/tenant"},
+            {},
+            {},
+        )
+
+        result = validate_agent_reply(
+            "Start here: https://invented.example/beta",
+            prompt,
+        )
+
+        assert result == "Start here: https://tally.so/r/tenant"
+
+    def test_empty_training_center_link_does_not_fall_back_to_legacy_link(self):
+        legacy_prompt = (
+            "BASE\n\n<!-- AGENT_OPTIONS_START -->\n"
+            "Sales page link: https://legacy.example/global\n"
+            "<!-- AGENT_OPTIONS_END -->"
+        )
+        prompt = build_training_center_prompt(
+            legacy_prompt,
+            {"business_name": "Tenant", "sales_page_url": ""},
+            {},
+            {},
+        )
+
+        with pytest.raises(Exception) as exc_info:
+            validate_agent_reply("Open https://invented.example", prompt)
+
+        assert getattr(exc_info.value, "status_code", None) == 502
+
 
 # ===========================================================================
 # BUG 3 — ManyChat webhook auto mode sends directly from backend
