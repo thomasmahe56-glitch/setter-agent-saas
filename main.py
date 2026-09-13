@@ -3463,13 +3463,31 @@ def manual_contact_url(conversation: dict) -> Optional[str]:
     return f"https://ig.me/m/{display_name}" if display_name else None
 
 
-def allowed_reply_urls(system_prompt: str) -> set[str]:
+def trusted_reply_links(system_prompt: str) -> dict[str, str]:
+    """Resolve tenant destinations without leaking global links across accounts.
+
+    Once a Training Center block exists it is the source of truth, including
+    intentionally empty link fields. Legacy prompt options and environment
+    defaults remain available only for prompts that have not been migrated.
+    """
+    if TRAINING_CENTER_START in system_prompt:
+        profile = training_center_profile(system_prompt)
+        return {
+            "calendly_url": str(profile.get("calendly_url") or "").strip(),
+            "sales_page_url": str(profile.get("sales_page_url") or "").strip(),
+        }
     links = extract_agent_links(system_prompt)
+    return {
+        "calendly_url": str(links.get("calendly_url") or config.url_call or "").strip(),
+        "sales_page_url": str(links.get("sales_page_url") or config.url_page or "").strip(),
+    }
+
+
+def allowed_reply_urls(system_prompt: str) -> set[str]:
+    links = trusted_reply_links(system_prompt)
     return {
         url.rstrip("/")
         for url in [
-            config.url_call,
-            config.url_page,
             links.get("calendly_url", ""),
             links.get("sales_page_url", ""),
         ]
@@ -3493,9 +3511,9 @@ def validate_agent_reply(reply: str, system_prompt: str) -> str:
         if url.rstrip("/") not in allowed_urls
     ]
     if unexpected_urls:
-        links = extract_agent_links(system_prompt)
-        trusted_call_url = (links.get("calendly_url") or config.url_call or "").strip()
-        trusted_sales_url = (links.get("sales_page_url") or config.url_page or "").strip()
+        links = trusted_reply_links(system_prompt)
+        trusted_call_url = links.get("calendly_url", "")
+        trusted_sales_url = links.get("sales_page_url", "")
         lowered = cleaned.lower()
         if trusted_call_url and re.search(r"\b(book|booking|calendar|calendly|call|demo|meeting)\b", lowered):
             replacement_url = trusted_call_url
