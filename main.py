@@ -6365,34 +6365,61 @@ def _last_prospect_message(history: list) -> Optional[dict]:
     return None
 
 
-def _needs_supervised_pending(conversation: dict) -> bool:
-    """True when activation should generate a supervised pending reply."""
-    if conversation.get("automation_mode") != "supervised":
-        return False
+def _needs_activation_reply(conversation: dict) -> bool:
+    """True when the latest prospect message still needs an Angellos reply."""
     if conversation.get("pending_message"):
         return False
     history = conversation.get("history") or []
     if not history:
         return False
     last = history[-1]
-    # Any assistant message (sent or unsent) that isn't explicitly ignored means
-    # the prospect's last message has already been handled.
+    # A delivered or still-actionable assistant reply already handled the latest
+    # prospect message. Ignored/cancelled drafts deliberately make it eligible
+    # again when the operator re-enables Angellos.
     if last.get("role") == "assistant" and not last.get("ignored"):
         return False
     return _last_prospect_message(history) is not None
 
 
-async def _generate_and_save_supervised_pending(
+def _needs_supervised_pending(conversation: dict) -> bool:
+    """True when activation should generate a supervised pending reply."""
+    if conversation.get("automation_mode") != "supervised":
+        return False
+    return _needs_activation_reply(conversation)
+
+
+def _cancel_pending_replies_for_mode_off(history: list) -> list:
+    """Cancel unsent assistant work so a later mode selection can regenerate it."""
+    cancelled_at = now_iso()
+    updated: list[dict] = []
+    for original in history:
+        message = dict(original)
+        if (
+            message.get("role") == "assistant"
+            and not message.get("sent")
+            and not message.get("ignored")
+            and (
+                message.get("source") in {
+                    "activation_supervised", "activation_auto_manual", "inbound_supervised", "inbound_auto_queued",
+                }
+                or message.get("delivery_status") in {"scheduled", "pending_delivery", "send_failed", "manual_required"}
+            )
+        ):
+            message["ignored"] = True
+            message["delivery_status"] = "cancelled_mode_off"
+            message["cancelled_at"] = cancelled_at
+        updated.append(message)
+    return updated
+
+
+async def _generate_activation_reply(
     conversation: dict,
     conversation_id: str,
     user_id: str,
-) -> Optional[str]:
-    """Generate a supervised reply for the unanswered prospect message and persist it.
-
-    Returns the generated reply text, or None if generation was skipped or failed.
-    Errors from the AI provider are allowed to propagate so the caller can decide
-    whether to treat them as fatal.
-    """
+    *,
+    request_kind: str,
+) -> Optional[dict]:
+    """Generate one reply for the latest unanswered prospect message."""
     if not provider_is_configured(str(select_setter_route(reasoning_level="none")["provider"])):
         return None
     history = conversation.get("history") or []
@@ -6403,8 +6430,6 @@ async def _generate_and_save_supervised_pending(
 
     active_prompt = await get_active_prompt(user_id)
     system_prompt = build_generation_prompt(active_prompt)
-
-    # Build message list up to and including the last user message
     messages_for_gen_full: list[dict] = []
     for msg in history:
         messages_for_gen_full.append(msg)
@@ -6436,18 +6461,45 @@ async def _generate_and_save_supervised_pending(
 
     await record_ai_usage_event(
         user_id,
-        "activation_supervised",
+        request_kind,
         json.dumps(messages_for_gen, ensure_ascii=False),
         reply,
         usage=generation.usage,
         conversation_id=conversation_id,
-        request_kind="activation_supervised",
+        request_kind=request_kind,
         metadata={
             "history_message_count": len(history),
             "sent_message_count": len(messages_for_gen),
             "conversation_memory_used": bool(conversation.get("conversation_memory")),
         },
     )
+    return {
+        "reply": reply,
+        "should_human_mode": should_human_mode,
+        "history": history,
+        "last_user_message": last_user_msg,
+    }
+
+
+async def _generate_and_save_supervised_pending(
+    conversation: dict,
+    conversation_id: str,
+    user_id: str,
+) -> Optional[str]:
+    """Generate a supervised reply for the unanswered prospect message and persist it.
+
+    Returns the generated reply text, or None if generation was skipped or failed.
+    Errors from the AI provider are allowed to propagate so the caller can decide
+    whether to treat them as fatal.
+    """
+    generated = await _generate_activation_reply(
+        conversation, conversation_id, user_id, request_kind="activation_supervised",
+    )
+    if generated is None:
+        return None
+    history = generated["history"]
+    reply = generated["reply"]
+    should_human_mode = generated["should_human_mode"]
 
     now = now_iso()
     assistant_entry = {
@@ -6481,6 +6533,100 @@ async def _generate_and_save_supervised_pending(
 
     print(f"[activate] supervised pending generated conversation_id={conversation_id}")
     return reply
+
+
+async def _generate_and_queue_auto_reply(
+    conversation: dict,
+    conversation_id: str,
+    user_id: str,
+) -> dict:
+    """Generate and persist the reply that a reactivated auto conversation owes."""
+    generated = await _generate_activation_reply(
+        conversation, conversation_id, user_id, request_kind="activation_auto",
+    )
+    if generated is None:
+        return {"outcome": "generation_skipped", "pending_message": None}
+
+    history = generated["history"]
+    reply = generated["reply"]
+    now = datetime.now(timezone.utc)
+    settings = await get_beta_cost_settings(user_id)
+    delivery_time, delay_seconds = auto_reply_delivery_time(now, settings)
+    last_interaction = parse_iso(conversation.get("last_inbound_at"))
+    if last_interaction is None:
+        last_interaction = get_message_time(generated["last_user_message"])
+    within_reply_window = bool(
+        last_interaction
+        and delivery_time <= last_interaction + timedelta(hours=config.meta_instagram_reply_window_hours)
+    )
+    manual_required = generated["should_human_mode"] or not within_reply_window
+
+    if manual_required:
+        created_at = now_iso()
+        assistant_entry = {
+            "role": "assistant",
+            "content": reply,
+            "timestamp": created_at,
+            "sent": False,
+            "ignored": False,
+            "source": "activation_auto_manual",
+            "delivery_status": "manual_required",
+            "send_blocked_reason": (
+                "human_review_required" if generated["should_human_mode"] else "outside_standard_messaging_window"
+            ),
+        }
+        patch_body = {
+            "automation_mode": "supervised",
+            "agent_active": True,
+            "pending_message": reply,
+            "pending_message_at": created_at,
+            "history": history + [assistant_entry],
+        }
+        outcome = "manual_draft"
+        queued_until = None
+    else:
+        queued_until = delivery_time.isoformat()
+        assistant_entry = {
+            "role": "assistant",
+            "content": reply,
+            "timestamp": now_iso(),
+            "channel": conversation.get("channel") or "instagram",
+            "sent": False,
+            "ignored": False,
+            "source": "inbound_auto_queued",
+            "activation_trigger": "mode_selected",
+            "delivery_id": str(uuid4()),
+            "delivery_status": "scheduled",
+            "pending_delivery": False,
+            "queued_until": queued_until,
+            "send_blocked_reason": "configured_reply_delay",
+            "configured_delay_seconds": delay_seconds,
+        }
+        patch_body = {
+            "automation_mode": "auto",
+            "agent_active": True,
+            "pending_message": reply,
+            "pending_message_at": queued_until,
+            "history": history + [assistant_entry],
+            "status": "en_cours",
+        }
+        outcome = "auto_scheduled"
+
+    async with httpx.AsyncClient() as http:
+        response = await http.patch(
+            SUPABASE_CONVERSATIONS_URL,
+            headers={**supabase_headers(), "Prefer": "return=minimal"},
+            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
+            json=patch_body,
+            timeout=10.0,
+        )
+    response.raise_for_status()
+    print(
+        f"[activate-auto] conversation_id={conversation_id} outcome={outcome} "
+        f"delay_seconds={delay_seconds}",
+        flush=True,
+    )
+    return {"outcome": outcome, "pending_message": reply, "queued_until": queued_until}
 
 
 @app.post("/conversations/{conversation_id}/activate")
@@ -6619,15 +6765,81 @@ async def update_automation_mode(
 
     if payload.automation_mode not in ("auto", "supervised", "disabled"):
         raise HTTPException(status_code=400, detail="Invalid automation_mode")
+    conversation = await get_conversation_by_id(conversation_id, user_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if payload.automation_mode != "disabled" and (
+        conversation.get("contact_status") == "opted_out" or conversation.get("opted_out_at")
+    ):
+        raise HTTPException(status_code=409, detail="Opted-out contacts cannot resume automation")
+
+    enabled = payload.automation_mode != "disabled"
+    patch_body: dict = {
+        "automation_mode": payload.automation_mode,
+        "agent_active": enabled,
+    }
+    if payload.automation_mode == "disabled":
+        patch_body.update({
+            "pending_message": None,
+            "pending_message_at": None,
+            "history": _cancel_pending_replies_for_mode_off(conversation.get("history") or []),
+        })
     async with httpx.AsyncClient() as http:
         res = await http.patch(
             SUPABASE_CONVERSATIONS_URL,
             headers={**supabase_headers(), "Prefer": "return=minimal"},
             params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
-            json={"automation_mode": payload.automation_mode},
+            json=patch_body,
+            timeout=10.0,
         )
         res.raise_for_status()
-    return {"success": True}
+
+    result: dict = {
+        "success": True,
+        "automation_mode": payload.automation_mode,
+        "agent_active": enabled,
+        "outcome": "disabled" if not enabled else "activated",
+        "pending_message": None,
+        "queued_until": None,
+    }
+    if not enabled or conversation.get("human_takeover"):
+        if conversation.get("human_takeover"):
+            result["outcome"] = "human_takeover"
+        return result
+
+    activated_conversation = {
+        **conversation,
+        **patch_body,
+    }
+    if not _needs_activation_reply(activated_conversation):
+        result["outcome"] = "no_unanswered_message"
+        return result
+
+    try:
+        if payload.automation_mode == "supervised":
+            pending_message = await _generate_and_save_supervised_pending(
+                activated_conversation, conversation_id, user_id,
+            )
+            result.update({
+                "outcome": "manual_draft" if pending_message else "generation_skipped",
+                "pending_message": pending_message,
+            })
+        else:
+            auto_result = await _generate_and_queue_auto_reply(
+                activated_conversation, conversation_id, user_id,
+            )
+            result.update(auto_result)
+            if auto_result.get("outcome") == "manual_draft":
+                result["automation_mode"] = "supervised"
+    except ProviderGenerationError as error:
+        print(
+            f"[automation-mode] generation failed conversation_id={conversation_id} "
+            f"type={error.error_type}",
+            flush=True,
+        )
+        result["outcome"] = "generation_failed"
+        result["error"] = provider_error_payload(error)
+    return result
 
 
 @app.post("/conversations/{conversation_id}/human-takeover")
