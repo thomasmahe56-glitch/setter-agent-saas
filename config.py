@@ -52,6 +52,7 @@ class Config:
     allowed_user_ids: str
     cors_allowed_origins: str
     commercial_conversion_enabled: bool
+    commercial_lead_server_token: str
     environment: str
 
 
@@ -104,5 +105,6 @@ def load_config() -> Config:
         allowed_user_ids=os.environ.get("ALLOWED_USER_IDS", ""),
         cors_allowed_origins=os.environ.get("CORS_ALLOWED_ORIGINS", ""),
         commercial_conversion_enabled=env_bool("COMMERCIAL_CONVERSION_ENABLED", False),
+        commercial_lead_server_token=os.environ.get("COMMERCIAL_LEAD_SERVER_TOKEN", ""),
         environment=os.environ.get("ENVIRONMENT", "development"),
     )
