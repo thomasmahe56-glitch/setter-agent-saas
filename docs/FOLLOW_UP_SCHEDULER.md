@@ -41,10 +41,12 @@ through `/follow-ups/jobs`.
    `migrations/test_only_follow_up_baseline.sql` and
    `migrations/add_persistent_follow_up_jobs.sql`. Confirm grants, RLS,
    triggers, PostgREST schema cache, and RPC functions using test queries.
-2. Deploy both branches to test environments. Keep Railway Serverless disabled
-   or otherwise prove the worker stays awake. Confirm the startup worker logs
-   and at least one claim from a safe test conversation. Railway's standard
-   start command runs one FastAPI instance with the worker in lifespan.
+2. Deploy the backend branch to the isolated Railway project and point a local
+   dashboard at that service and the isolated Supabase database. Keep Railway
+   Serverless disabled or otherwise prove the worker stays awake. Confirm the
+   startup worker logs and at least one claim from a safe test conversation.
+   Railway's standard start command runs one FastAPI instance with the worker
+   in lifespan.
 3. Verify Training Center save/reload, future jobs, closed-hours deferral,
    prospect reply cancellation, Meta manual state, a backend restart, and two
    concurrent claim attempts against the test database. Use provider mocks;
@@ -85,10 +87,11 @@ succeeded. Live counts remained 92 conversations, 887 prospects, one settings
 row, and zero follow-up jobs.
 
 Local automated tests use virtual time and mocked provider/database responses.
-The browser demo uses test fixtures, and the local backend uses a dummy Supabase
-URL. Real Training Center save/reload, worker queue processing, and Railway
-restart behavior remain to be verified end to end before deploying the new
-applications to production.
+The initial browser demo used test fixtures and the initial local backend used
+a dummy Supabase URL. The later isolated Railway/Supabase setup verified real
+Training Center save/reload, worker queue processing, and Railway redeployment
+with synthetic records, as described below. Provider delivery remains disabled
+in that setup, so production rollout still requires approval and monitoring.
 
 Read-only Railway inspection found that the connected `Angellos` project has
 only a `production` environment, sourced from `main`, and no Railway cron
