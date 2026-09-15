@@ -90,9 +90,13 @@ def build_public_catalog(
         return safe_catalog()
 
     required_offer_ids = PHASE_OFFERS[phase]
-    active_by_id = {row.get("offer_id"): row for row in plan_rows if isinstance(row, dict)}
+    active_by_id: dict[str, list[dict[str, Any]]] = {}
+    for row in plan_rows:
+        if isinstance(row, dict) and isinstance(row.get("offer_id"), str):
+            active_by_id.setdefault(row["offer_id"], []).append(row)
     if any(
-        not _matching_active_offer(active_by_id.get(offer_id, {}), offer_id)
+        len(active_by_id.get(offer_id, [])) != 1
+        or not _matching_active_offer(active_by_id[offer_id][0], offer_id)
         for offer_id in required_offer_ids
     ):
         return safe_catalog()
