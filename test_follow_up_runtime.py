@@ -134,6 +134,64 @@ def test_legacy_dashboard_due_request_stays_loadable_during_backend_first_rollou
         main.app.dependency_overrides.pop(main.require_jwt, None)
 
 
+def test_queued_legacy_h23_settings_cannot_create_or_send_a_job(monkeypatch):
+    legacy_stages = [
+        {"mode": "auto", "stage": "auto_23h", "delay_hours": 23},
+        {"mode": "manual", "stage": "j3", "delay_hours": 72},
+        {"mode": "manual", "stage": "j10", "delay_hours": 240},
+        {"mode": "manual", "stage": "j30", "delay_hours": 720},
+    ]
+    queue = [{"conversation_id": "conversation-1", "user_id": "tenant-1",
+              "queued_at": NOW.isoformat(), "claimed_at": None}]
+
+    class Response:
+        def __init__(self, payload): self.payload = payload
+        def raise_for_status(self): pass
+        def json(self): return self.payload
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        async def get(self, url, **kwargs):
+            if url == main.SUPABASE_FOLLOW_UP_QUEUE_URL:
+                return Response([{"conversation_id": row["conversation_id"],
+                                  "user_id": row["user_id"], "queued_at": row["queued_at"]}
+                                 for row in queue if row["claimed_at"] is None])
+            assert url == main.SUPABASE_FOLLOW_UP_JOBS_URL
+            return Response([])
+        async def patch(self, url, *, json, **kwargs):
+            assert url == main.SUPABASE_FOLLOW_UP_QUEUE_URL
+            queue[0]["claimed_at"] = json["claimed_at"]
+            return Response([{"conversation_id": "conversation-1"}])
+        async def delete(self, url, **kwargs):
+            assert url == main.SUPABASE_FOLLOW_UP_QUEUE_URL
+            queue.clear()
+            return Response([])
+        async def post(self, url, **kwargs):
+            assert url.endswith(("release_stale_follow_up_refresh_claims",
+                                 "reconcile_stale_follow_up_processing",
+                                 "claim_due_follow_up_jobs"))
+            return Response([])
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(main, "get_conversation_by_id", AsyncMock(return_value=conversation()))
+    monkeypatch.setattr(main, "get_follow_up_settings_strict", AsyncMock(
+        return_value=settings(follow_up_config=legacy_stages)))
+    patch = AsyncMock()
+    send = AsyncMock()
+    monkeypatch.setattr(main, "patch_follow_up_job", patch)
+    monkeypatch.setattr(main, "send_channel_message", send)
+
+    async def run():
+        assert await main.process_follow_up_refresh_queue() == 1
+        assert queue == []
+        assert await main.process_due_follow_up_jobs() == 0
+
+    asyncio.run(run())
+    patch.assert_not_awaited()
+    send.assert_not_awaited()
+
+
 def test_prospect_reply_cancels_old_job_before_send(monkeypatch):
     latest = ANCHOR + timedelta(hours=4)
     patch, send = setup(monkeypatch, conv=conversation(last_inbound_at=latest.isoformat(),
