@@ -329,8 +329,11 @@ The virtual-time end-to-end test now traverses the queue refresh, persisted
 job claim, AI preparation, channel router, Meta eligibility gate, mocked Meta
 delivery receipt, usage ledger, sent-job transition, and idempotent CRM history
 append. It asserts the adapter receives the scoped recipient and `max_attempts=1`,
-including after a simulated AI preparation retry. This is a local mock of the
-provider response; it does not send a real Instagram DM.
+including after a simulated AI preparation retry. Stage 2 remains absent until
+stage 1 is sent and appended to CRM history; a subsequent queue refresh then
+schedules it at its own +1 hour delay and sends it once with a distinct Meta
+receipt. This is a local mock of the provider response; it does not send a real
+Instagram DM.
 
 The transport-refresh migration was applied only to the isolated test project
 after checking that its three synthetic conversations and project ref differ

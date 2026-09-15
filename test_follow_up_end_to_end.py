@@ -9,7 +9,7 @@ import main
 
 
 @pytest.mark.parametrize("preparation_failure", [False, True])
-def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypatch, preparation_failure):
+def test_cloud_worker_pipeline_sends_sequential_stages_once_with_virtual_time(monkeypatch, preparation_failure):
     start = datetime(2026, 9, 15, 14, 59, tzinfo=timezone.utc)
     anchor = start - timedelta(hours=6, minutes=59)
     inbound = anchor - timedelta(minutes=30)
@@ -30,8 +30,12 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
     settings = {
         "follow_up_config_version": 1, "timezone": "Europe/Paris",
         "allowed_send_start": "08:00", "allowed_send_end": "20:00",
-        "follow_up_config": [{"stage": "follow_up_1", "enabled": True,
-            "delay_value": 7, "delay_unit": "hours", "mode": "auto"}],
+        "follow_up_config": [
+            {"stage": "follow_up_1", "enabled": True,
+             "delay_value": 7, "delay_unit": "hours", "mode": "auto"},
+            {"stage": "follow_up_2", "enabled": True,
+             "delay_value": 1, "delay_unit": "hours", "mode": "auto"},
+        ],
     }
     queue = [{"conversation_id": conversation_id, "user_id": tenant,
         "queued_at": start.isoformat(), "claimed_at": None}]
@@ -58,6 +62,8 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
             if url.endswith("append_sent_follow_up_history"):
                 if not any(m.get("follow_up_job_id") == json["p_job_id"] for m in conversation["history"]):
                     conversation["history"].append(json["p_message"])
+                    queue.append({"conversation_id": conversation_id, "user_id": tenant,
+                                  "queued_at": clock["now"].isoformat(), "claimed_at": None})
                 return Response(True)
             if url.endswith("release_stale_follow_up_refresh_claims") or url.endswith("reconcile_stale_follow_up_processing"):
                 return Response(0)
@@ -102,10 +108,12 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
     async def execute_at_virtual_time(row):
         return await real_execute(row, now=clock["now"])
 
-    provider = AsyncMock(return_value={
-        "status_code": 200,
-        "body": '{"recipient_id":"recipient-test","message_id":"outbound-test"}',
-    })
+    provider = AsyncMock(side_effect=[
+        {"status_code": 200,
+         "body": '{"recipient_id":"recipient-test","message_id":"outbound-1"}'},
+        {"status_code": 200,
+         "body": '{"recipient_id":"recipient-test","message_id":"outbound-2"}'},
+    ])
     connection = {
         "id": "connection-test", "external_account_id": "instagram-account-test",
         "status": "connected",
@@ -116,6 +124,7 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
         **kwargs, now=clock["now"]))
     monkeypatch.setattr(main.config, "meta_instagram_enabled", True)
     monkeypatch.setattr(main.config, "meta_instagram_send_enabled", True)
+    monkeypatch.setattr(main, "now_iso", lambda: clock["now"].isoformat())
     monkeypatch.setattr(main.httpx, "AsyncClient", Client)
     monkeypatch.setattr(main, "get_conversation_by_id", AsyncMock(return_value=conversation))
     monkeypatch.setattr(main, "get_follow_up_settings_strict", AsyncMock(return_value=settings))
@@ -124,7 +133,8 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
     monkeypatch.setattr(main, "enforce_ai_cost_cap", AsyncMock())
     generated = SimpleNamespace(text="Virtual follow-up")
     monkeypatch.setattr(main, "generate_follow_up_result", AsyncMock(
-        side_effect=[RuntimeError("Temporary AI outage"), generated] if preparation_failure else None,
+        side_effect=[RuntimeError("Temporary AI outage"), generated, generated]
+        if preparation_failure else None,
         return_value=generated,
     ))
     monkeypatch.setattr(main, "record_ai_usage_event", AsyncMock())
@@ -164,9 +174,28 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
             "max_attempts": 1,
         }
         main.record_usage_ledger_event.assert_awaited_once()
-        assert main.record_usage_ledger_event.await_args.kwargs["provider_event_id"] == "outbound-test"
+        assert main.record_usage_ledger_event.await_args.kwargs["provider_event_id"] == "outbound-1"
 
         assert await main.process_due_follow_up_jobs() == 0
         assert provider.await_count == 1
+
+        assert await main.process_follow_up_refresh_queue() == 1
+        assert len(jobs) == 2
+        assert jobs[1]["stage"] == "follow_up_2"
+        assert jobs[1]["due_at"] == (clock["now"] + timedelta(hours=1)).isoformat()
+        assert jobs[1]["scheduled_at"] == jobs[1]["due_at"]
+        assert jobs[1]["status"] == "scheduled"
+        assert await main.process_due_follow_up_jobs() == 0
+        assert provider.await_count == 1
+
+        clock["now"] += timedelta(hours=1)
+        assert await main.process_due_follow_up_jobs() == 1
+        assert jobs[1]["status"] == "sent"
+        assert conversation["history"][-1]["follow_up_job_id"] == jobs[1]["id"]
+        assert conversation["history"][-1]["follow_up_stage"] == "follow_up_2"
+        assert provider.await_count == 2
+        assert [call.kwargs["max_attempts"] for call in provider.await_args_list] == [1, 1]
+        assert [call.kwargs["provider_event_id"] for call in
+                main.record_usage_ledger_event.await_args_list] == ["outbound-1", "outbound-2"]
 
     asyncio.run(run())
