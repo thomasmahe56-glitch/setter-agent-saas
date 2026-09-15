@@ -34,8 +34,11 @@ key in the current provider adapters. Such a job becomes `manual_required` and
 is never retried automatically. This guarantees at-most-once automatic attempts;
 an operator must reconcile ambiguous provider outcomes before a manual action.
 
-The channel window is checked before generation and again by the Meta adapter
-at send time. The configured delay is never shortened to fit Meta's window.
+The channel window is checked when planning, before generation, and again by
+the Meta adapter at send time. If the planned instant already lies beyond the
+Meta window, the future job is labelled manual and keeps the channel reason;
+it becomes `manual_required` only at its configured time. The configured delay
+is never shortened to fit Meta's window.
 `manual_required`, `blocked`, `failed`, `sent`, and `cancelled` remain visible
 through `/follow-ups/jobs`.
 

@@ -227,6 +227,38 @@ def test_supervised_conversation_uses_manual_job_then_recalculates_on_auto_switc
     assert inserted[1]["idempotency_key"] != inserted[0]["idempotency_key"]
 
 
+def test_future_job_outside_meta_window_is_manual_from_planning(monkeypatch):
+    old_inbound = ANCHOR - timedelta(days=2)
+    conv = conversation(last_inbound_at=old_inbound.isoformat())
+    patch, send = setup(monkeypatch, conv=conv)
+    inserted = []
+
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return []
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        async def get(self, *args, **kwargs): return Response()
+        async def post(self, *args, **kwargs):
+            inserted.extend(kwargs["json"])
+            return Response()
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    asyncio.run(main.reconcile_follow_up_conversation("conversation-1", "tenant-1"))
+    assert len(inserted) == 1
+    assert inserted[0]["due_at"] == NOW.isoformat()
+    assert inserted[0]["scheduled_at"] == NOW.isoformat()
+    assert inserted[0]["mode"] == "manual"
+    assert "Meta automatic messaging window closed" in inserted[0]["last_error"]
+
+    due_job = job(mode=inserted[0]["mode"], last_error=inserted[0]["last_error"])
+    assert asyncio.run(main.execute_follow_up_job(due_job, now=NOW)) == "manual_required"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["last_error"] == inserted[0]["last_error"]
+
+
 def test_prospect_reply_reconciliation_cancels_unsent_job(monkeypatch):
     reply_at = ANCHOR + timedelta(hours=2)
     patch, send = setup(monkeypatch, conv=conversation(last_inbound_at=reply_at.isoformat(),

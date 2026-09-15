@@ -7437,6 +7437,15 @@ async def reconcile_follow_up_conversation(conversation_id: str, user_id: str) -
             due_at, scheduled_at = schedule_stage(anchor_at, stage, settings)
             effective_mode = ("auto" if stage["mode"] == "auto" and
                 conversation.get("automation_mode") == "auto" else "manual")
+            manual_reason = None
+            channel = conversation.get("channel") or "instagram"
+            if effective_mode == "auto" and channel in {"instagram", "whatsapp"}:
+                inbound_at = parse_iso(conversation.get("last_inbound_at"))
+                window_hours = (config.meta_instagram_reply_window_hours
+                    if channel == "instagram" else 24)
+                if not inbound_at or scheduled_at > inbound_at + timedelta(hours=window_hours):
+                    effective_mode = "manual"
+                    manual_reason = f"{channel}/Meta automatic messaging window closed at scheduled time"
             key = (f"{conversation_id}:{anchor_at.isoformat()}:{stage['stage']}:"
                 f"{settings['follow_up_config_version']}:{effective_mode}")
             desired.add(key)
@@ -7446,7 +7455,7 @@ async def reconcile_follow_up_conversation(conversation_id: str, user_id: str) -
                 "anchor_at": anchor_at.isoformat(), "due_at": due_at.isoformat(),
                 "scheduled_at": scheduled_at.isoformat(), "mode": effective_mode,
                 "status": "scheduled", "config_version": settings["follow_up_config_version"],
-                "idempotency_key": key,
+                "idempotency_key": key, "last_error": manual_reason,
             })
     for old in existing:
         if old["idempotency_key"] not in desired and old["status"] == "scheduled":
@@ -7531,7 +7540,8 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
         return "cancelled"
     if job["mode"] != "auto" or conversation.get("automation_mode") != "auto":
         await patch_follow_up_job(job["id"], {"status": "manual_required",
-            "last_error": "This stage or conversation is in manual mode"}, expected_status="processing")
+            "last_error": job.get("last_error") or "This stage or conversation is in manual mode"},
+            expected_status="processing")
         return "manual_required"
     channel = conversation.get("channel") or "instagram"
     if channel in {"instagram", "whatsapp"}:
