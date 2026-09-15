@@ -370,3 +370,11 @@ planned time, sent time, and `Europe/Paris` timezone; the layout had no overlay
 and browser console errors were empty. The exact disposable row was deleted
 after inspection, and a second reload showed **Envoyées (0)** again. This
 verifies sent-state rendering, not a real provider delivery.
+
+The **À échéance / en cours** group was checked separately with one disposable
+synthetic `processing` job in the same isolated database. A browser reload
+showed **À échéance / en cours (1)**, the **En cours** badge, its due time, and
+the tenant timezone. The card was visually inspected, browser console errors
+were empty, and the exact synthetic row was removed. A further reload showed
+the group back at zero. This verifies processing-state presentation without a
+provider call.
