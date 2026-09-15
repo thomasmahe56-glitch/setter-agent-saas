@@ -7608,7 +7608,8 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
         await record_ai_usage_event(job["user_id"], "follow_up_worker",
             json.dumps(conversation.get("history") or [], ensure_ascii=False), generated.text,
             usage=getattr(generated, "usage", None), conversation_id=job["conversation_id"],
-            request_kind="follow_up_worker", idempotency_key=f"{job['idempotency_key']}:ai")
+            request_kind="follow_up_worker",
+            idempotency_key=f"{job['idempotency_key']}:ai:{job.get('attempt_count') or 1}")
         # Check inbound again immediately before the external effect.
         fresh = await get_conversation_by_id(job["conversation_id"], job["user_id"])
         fresh_settings = await get_follow_up_settings_strict(job["user_id"])

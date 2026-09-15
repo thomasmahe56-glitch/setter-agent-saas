@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import pytest
 from fastapi.testclient import TestClient
 
 import main
@@ -141,7 +142,8 @@ def test_virtual_clock_honors_custom_delay_before_provider_call(monkeypatch):
     assert patch.await_args.args[1]["status"] == "scheduled"
 
 
-def test_due_job_sends_once_and_records_successful_delivery(monkeypatch):
+@pytest.mark.parametrize("attempt_count", [1, 2])
+def test_due_job_sends_once_and_records_successful_delivery(monkeypatch, attempt_count):
     patch, send = setup(monkeypatch)
     conversation_updates = []
 
@@ -159,7 +161,7 @@ def test_due_job_sends_once_and_records_successful_delivery(monkeypatch):
 
     monkeypatch.setattr(main.httpx, "AsyncClient", Client)
 
-    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "sent"
+    assert asyncio.run(main.execute_follow_up_job(job(attempt_count=attempt_count), now=NOW)) == "sent"
     send.assert_awaited_once()
     assert send.await_args.kwargs["at_most_once"] is True
     assert patch.await_args.args[1]["status"] == "sent"
@@ -169,6 +171,9 @@ def test_due_job_sends_once_and_records_successful_delivery(monkeypatch):
     assert delivered["follow_up_job_id"] == "job-1"
     assert delivered["content"] == "A short follow-up"
     assert delivered["sent"] is True
+    assert main.record_ai_usage_event.await_args.kwargs["idempotency_key"] == (
+        f"conversation-1:follow_up_1:1:ai:{attempt_count}"
+    )
 
 
 def test_reply_added_to_history_during_generation_cancels_before_provider(monkeypatch):
