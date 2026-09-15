@@ -7512,6 +7512,7 @@ async def process_follow_up_refresh_queue() -> int:
 
 
 async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> str:
+    use_real_clock = now is None
     now = now or datetime.now(timezone.utc)
     if now < parse_iso(job["due_at"]) or now < parse_iso(job["scheduled_at"]):
         await patch_follow_up_job(job["id"], {"status": "scheduled"}, expected_status="processing")
@@ -7575,10 +7576,40 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
             request_kind="follow_up_worker", idempotency_key=f"{job['idempotency_key']}:ai")
         # Check inbound again immediately before the external effect.
         fresh = await get_conversation_by_id(job["conversation_id"], job["user_id"])
-        if not fresh or parse_iso(fresh.get("last_inbound_at")) != parse_iso(conversation.get("last_inbound_at")):
+        fresh_settings = await get_follow_up_settings_strict(job["user_id"])
+        fresh_history = (fresh or {}).get("history") or []
+        fresh_newer_message = any(
+            m.get("role") in {"user", "assistant"} and
+            (m.get("role") == "user" or (m.get("sent") is not False and not m.get("ignored"))) and
+            get_message_time(m) and get_message_time(m) > anchor
+            for m in fresh_history
+        )
+        if (not fresh or fresh_settings["follow_up_config_version"] != job["config_version"] or
+            parse_iso(fresh.get("last_inbound_at")) != parse_iso(conversation.get("last_inbound_at")) or
+            fresh_newer_message or not fresh.get("agent_active") or fresh.get("human_takeover") or
+            fresh.get("contact_status") == "opted_out" or
+            fresh.get("status") in {"appel_booke", "signe"} or
+            fresh.get("automation_mode") != "auto" or
+            (fresh.get("channel") or "instagram") != channel):
             await patch_follow_up_job(job["id"], {"status": "cancelled", "cancelled_at": now_iso(),
-                "last_error": "Prospect replied while follow-up was prepared"}, expected_status="processing")
+                "last_error": "Conversation or configuration changed while follow-up was prepared"},
+                expected_status="processing")
             return "cancelled"
+        send_time = datetime.now(timezone.utc) if use_real_clock else now
+        if channel in {"instagram", "whatsapp"}:
+            fresh_inbound = parse_iso(fresh.get("last_inbound_at"))
+            window_hours = config.meta_instagram_reply_window_hours if channel == "instagram" else 24
+            if not fresh_inbound or send_time - fresh_inbound > timedelta(hours=window_hours):
+                await patch_follow_up_job(job["id"], {"status": "manual_required",
+                    "last_error": f"{channel}/Meta automatic messaging window closed during preparation"},
+                    expected_status="processing")
+                return "manual_required"
+        next_send_window = next_allowed_send_at(send_time, fresh_settings)
+        if next_send_window > send_time:
+            await patch_follow_up_job(job["id"], {"status": "scheduled",
+                "scheduled_at": next_send_window.isoformat(), "last_error": "Messaging hours closed during preparation"},
+                expected_status="processing")
+            return "scheduled"
         external_attempted = True
         result = await send_channel_message(fresh, generated.text, at_most_once=True)
         sent = int(result.get("status_code") or 500) < 400

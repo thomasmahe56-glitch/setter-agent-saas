@@ -19,7 +19,10 @@ cancelled. When Angellos replies again, a new cycle is scheduled. When a tenant
 changes a delay, mode, opening time, or timezone, the settings trigger increments
 `follow_up_config_version` and enqueues the tenant's active conversations. Old
 unsent jobs are cancelled and new jobs receive a new versioned idempotency key.
-The worker also checks the version and latest inbound timestamp before sending.
+The worker also checks the version and conversation state before sending. After
+AI generation, it re-reads the latest history, inbound timestamp, tenant version,
+takeover/opt-out flags, channel, Meta window, and opening hours before calling
+the provider. A reply recorded only in history still cancels the prepared job.
 An auto tenant stage on a supervised conversation creates a manual job. The
 effective mode is part of the idempotency key, so a supervised-to-auto switch
 cancels the old job and creates a new auto job without promising an automatic
@@ -34,8 +37,8 @@ key in the current provider adapters. Such a job becomes `manual_required` and
 is never retried automatically. This guarantees at-most-once automatic attempts;
 an operator must reconcile ambiguous provider outcomes before a manual action.
 
-The channel window is checked when planning, before generation, and again by
-the Meta adapter at send time. If the planned instant already lies beyond the
+The channel window is checked when planning, before generation, after
+generation, and again by the Meta adapter at send time. If the planned instant already lies beyond the
 Meta window, the future job is labelled manual and keeps the channel reason;
 it becomes `manual_required` only at its configured time. The configured delay
 is never shortened to fit Meta's window.

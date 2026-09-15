@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from fastapi.testclient import TestClient
 
@@ -156,6 +156,61 @@ def test_due_job_sends_once_and_records_successful_delivery(monkeypatch):
     assert delivered["follow_up_job_id"] == "job-1"
     assert delivered["content"] == "A short follow-up"
     assert delivered["sent"] is True
+
+
+def test_reply_added_to_history_during_generation_cancels_before_provider(monkeypatch):
+    patch, send = setup(monkeypatch)
+    fresh = conversation(history=conversation()["history"] + [
+        {"role": "user", "content": "Stop", "timestamp": (ANCHOR + timedelta(hours=1)).isoformat()}
+    ])
+    main.get_conversation_by_id.side_effect = [conversation(), fresh]
+    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "cancelled"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["status"] == "cancelled"
+
+
+def test_takeover_during_generation_cancels_before_provider(monkeypatch):
+    patch, send = setup(monkeypatch)
+    main.get_conversation_by_id.side_effect = [conversation(), conversation(human_takeover=True)]
+    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "cancelled"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["status"] == "cancelled"
+
+
+def test_settings_change_during_generation_cancels_before_provider(monkeypatch):
+    patch, send = setup(monkeypatch)
+    main.get_follow_up_settings_strict.side_effect = [settings(), settings(follow_up_config_version=2)]
+    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "cancelled"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["status"] == "cancelled"
+
+
+def test_closed_hours_during_generation_defer_before_provider(monkeypatch):
+    patch, send = setup(monkeypatch)
+    next_open = NOW + timedelta(hours=15)
+    window = Mock(side_effect=[NOW, next_open])
+    monkeypatch.setattr(main, "next_allowed_send_at", window)
+    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "scheduled"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["scheduled_at"] == next_open.isoformat()
+
+
+def test_meta_window_expiring_during_generation_requires_manual_action(monkeypatch):
+    inbound = NOW - timedelta(hours=23, minutes=59)
+    patch, send = setup(monkeypatch, conv=conversation(last_inbound_at=inbound.isoformat()))
+
+    class AdvancingClock(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            return NOW if cls.calls == 1 else NOW + timedelta(minutes=2)
+
+    monkeypatch.setattr(main, "datetime", AdvancingClock)
+    assert asyncio.run(main.execute_follow_up_job(job())) == "manual_required"
+    send.assert_not_awaited()
+    assert "during preparation" in patch.await_args.args[1]["last_error"]
 
 
 def test_changed_config_cancels_stale_job(monkeypatch):
