@@ -41,6 +41,11 @@ it becomes `manual_required` only at its configured time. The configured delay
 is never shortened to fit Meta's window.
 `manual_required`, `blocked`, `failed`, `sent`, and `cancelled` remain visible
 through `/follow-ups/jobs`.
+The existing `/usage/summary` field `follow_ups` counts AI generations
+(`follow_up_generated`), including drafts that never reached a provider. It is
+not a delivery counter. The Follow-ups page's **Sent** group reads
+`follow_up_jobs.status = sent`, which the worker writes only after a successful
+provider response. No separate `auto_sent` field exists in these repositories.
 
 ## Rollout
 
