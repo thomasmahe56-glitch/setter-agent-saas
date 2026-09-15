@@ -104,8 +104,7 @@ reconciliation error; an operator must compare the Meta thread with CRM history.
    do not contact a real prospect.
 4. Review the test evidence with Thomas. The persistent-jobs migration is
    already present on the live database; apply the additive preparation-retry
-   and atomic-history migrations
-   migration and deploy the backend before dashboard
+   and atomic-history migrations, then deploy the backend before the dashboard
    to production only after approval. The old dashboard still calls
    `/follow-ups/due` with browser-supplied delays. During the short interval
    before the dashboard deploy, that legacy route returns an empty list rather
@@ -127,6 +126,11 @@ not redeployed.
 The schema, three triggers, service-role-only RPC grants, and RLS/grants were
 verified. The backfill placed 92 active conversations in the refresh queue;
 there are zero follow-up jobs and zero settings with explicitly enabled stages.
+Most legacy conversations have no tenant follow-up settings, so the strict
+server reader uses disabled default stages rather than starting outreach.
+The refresh worker processes at most 50 queued rows per poll. A malformed
+historical conversation is logged and left in the queue for retry while later
+rows in the same batch continue; it cannot starve the current Meta tenant.
 In a rolled-back SQL transaction, a fictional due job was claimed once and a
 second claim returned zero. A rolled-back tenant timezone update incremented
 the config version. After both probes, the project still had zero jobs, 92

@@ -7525,12 +7525,21 @@ async def process_follow_up_refresh_queue() -> int:
             continue
         try:
             await reconcile_follow_up_conversation(row["conversation_id"], row["user_id"])
-        except Exception:
-            async with httpx.AsyncClient() as http:
-                await http.patch(SUPABASE_FOLLOW_UP_QUEUE_URL, headers=supabase_headers(),
-                    params={"conversation_id": f"eq.{row['conversation_id']}",
-                            "claimed_at": f"eq.{claim_time}"}, json={"claimed_at": None})
-            raise
+        except Exception as exc:
+            print(f"[follow-up] refresh_failed conversation={row['conversation_id']} "
+                  f"error={type(exc).__name__}", flush=True)
+            try:
+                async with httpx.AsyncClient() as http:
+                    reset = await http.patch(SUPABASE_FOLLOW_UP_QUEUE_URL,
+                        headers=supabase_headers(),
+                        params={"conversation_id": f"eq.{row['conversation_id']}",
+                                "claimed_at": f"eq.{claim_time}"},
+                        json={"claimed_at": None}, timeout=10.0)
+                    reset.raise_for_status()
+            except Exception as reset_exc:
+                print(f"[follow-up] refresh_reset_failed conversation={row['conversation_id']} "
+                      f"error={type(reset_exc).__name__}", flush=True)
+            continue
         async with httpx.AsyncClient() as http:
             done = await http.delete(SUPABASE_FOLLOW_UP_QUEUE_URL, headers=supabase_headers(),
                 params={"conversation_id": f"eq.{row['conversation_id']}",

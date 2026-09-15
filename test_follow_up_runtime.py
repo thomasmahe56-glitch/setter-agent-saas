@@ -299,6 +299,48 @@ def test_meta_window_expiring_during_generation_requires_manual_action(monkeypat
     assert "during preparation" in patch.await_args.args[1]["last_error"]
 
 
+def test_bad_refresh_row_does_not_starve_other_tenants(monkeypatch, capsys):
+    rows = [{"conversation_id": "bad-conversation", "user_id": "old-tenant",
+             "queued_at": "2026-09-15T10:00:00Z", "claimed_at": None},
+            {"conversation_id": "good-conversation", "user_id": "meta-tenant",
+             "queued_at": "2026-09-15T10:01:00Z", "claimed_at": None}]
+
+    class Response:
+        def __init__(self, payload): self.payload = payload
+        def raise_for_status(self): pass
+        def json(self): return self.payload
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        async def post(self, url, **kwargs):
+            assert url.endswith("release_stale_follow_up_refresh_claims")
+            return Response(0)
+        async def get(self, url, **kwargs):
+            assert url == main.SUPABASE_FOLLOW_UP_QUEUE_URL
+            return Response([{k: v for k, v in row.items() if k != "claimed_at"}
+                             for row in rows if row["claimed_at"] is None])
+        async def patch(self, url, *, params, json, **kwargs):
+            assert url == main.SUPABASE_FOLLOW_UP_QUEUE_URL
+            row = next(row for row in rows if params["conversation_id"] == f"eq.{row['conversation_id']}")
+            row["claimed_at"] = json["claimed_at"]
+            return Response([{"conversation_id": row["conversation_id"]}])
+        async def delete(self, url, *, params, **kwargs):
+            assert url == main.SUPABASE_FOLLOW_UP_QUEUE_URL
+            rows[:] = [row for row in rows
+                       if params["conversation_id"] != f"eq.{row['conversation_id']}"]
+            return Response([])
+
+    reconcile = AsyncMock(side_effect=[ValueError("old history malformed"), None])
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(main, "reconcile_follow_up_conversation", reconcile)
+    assert asyncio.run(main.process_follow_up_refresh_queue()) == 1
+    assert [row["conversation_id"] for row in rows] == ["bad-conversation"]
+    assert rows[0]["claimed_at"] is None
+    assert reconcile.await_count == 2
+    assert "refresh_failed conversation=bad-conversation" in capsys.readouterr().out
+
+
 def test_changed_config_cancels_stale_job(monkeypatch):
     patch, send = setup(monkeypatch, config=settings(follow_up_config_version=2))
     assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "cancelled"
