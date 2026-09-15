@@ -103,10 +103,10 @@ from the live `Angellos` project. The service is configured with `/health`,
 restart-always, app sleeping disabled, and Meta sending disabled. The cloud
 container deployed successfully and logs show `[follow-up] worker_started`.
 Its worker was observed starting in cloud logs. Its `SUPABASE_KEY` is a
-nonfunctional placeholder. `SUPABASE_URL` has been staged on the separate
-Railway project to point to `fagjhniuoopsgmbgdurb`; deploys were skipped, so
-the running container retains its previous inert configuration until the next
-deployment. `BACKEND_WORKERS_ENABLED=false` remains set. Do not use credentials
+nonfunctional placeholder. `SUPABASE_URL` now points to
+`fagjhniuoopsgmbgdurb` on the separate Railway project. Deployment
+`aa5b9994-028a-4458-9b23-9897eafbdebd` succeeded; its logs show
+`[workers] disabled by BACKEND_WORKERS_ENABLED`. Do not use credentials
 for `lyrlvipkwzbsojqbposh`.
 
 An isolated Supabase project, `angellos-follow-up-test`
@@ -120,6 +120,13 @@ there are zero jobs until the backend worker processes it. The synthetic stage
 is manual, so it cannot send a provider message. A new project's own secret
 key must be configured on the isolated Railway service before cloud worker
 verification. The live project's key must never be used there.
+
+Database checks on the isolated project confirmed that the conversation insert
+queued one refresh item, a service-role RPC claimed one fictional due job, a
+second claim returned zero, and rollback left zero persistent jobs. The
+privileged enqueue trigger functions deny direct authenticated execution.
+Security advisors reported only informational `rls_enabled_no_policy` notices
+for the four deliberately service-role-only test tables.
 
 For `SUPABASE_KEY`, prefer an existing `sb_secret_...` key from a **new,
 isolated test** project; it maps to PostgreSQL `service_role` and is sent only
