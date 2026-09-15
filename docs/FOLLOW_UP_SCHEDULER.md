@@ -58,6 +58,13 @@ generation, and again by the Meta adapter at send time. If the planned instant a
 Meta window, the future job is labelled manual and keeps the channel reason;
 it becomes `manual_required` only at its configured time. The configured delay
 is never shortened to fit Meta's window.
+For follow-ups, the Meta adapter makes one HTTP attempt and requires a 2xx
+response with a nonempty `message_id` and, when present, the expected
+`recipient_id`. A 2xx response without this delivery receipt is ambiguous:
+the job becomes `manual_required`, no sent usage is recorded, and a human must
+compare the Meta thread before retrying. Meta's published [Instagram Send API
+example](https://www.postman.com/meta/instagram/request/1rgmhuk/text-message)
+shows both receipt fields.
 `manual_required`, `blocked`, `failed`, `sent`, and `cancelled` remain visible
 through `/follow-ups/jobs`.
 The existing `/usage/summary` field `follow_ups` counts AI generations
@@ -302,3 +309,11 @@ recorded on the other scheduled conversation. The cloud worker consumed that
 refresh item, cancelled its future job, and the browser's scheduled count fell
 from two to one; the closed-hours job stayed visible. Browser console had no
 errors, only Next.js smooth-scroll warnings. No DM was sent in either test.
+
+Meta follow-up receipt verification was tested with mocked HTTP 200 responses:
+only a matching `message_id` receipt counts as sent; missing, malformed, or
+wrong-recipient receipts produce `meta.message.unverified` and never count sent
+usage. A disposable `manual_required` row with this error was rendered in the
+real local Follow-ups page. The card explained in French that the Instagram
+thread must be checked before another send, browser console errors were zero,
+and the synthetic row was deleted from the isolated database afterward.

@@ -3005,8 +3005,24 @@ async def send_meta_instagram_message(conversation: dict, text: str, *, at_most_
         access_token=token,
         **({"max_attempts": 1} if at_most_once else {}),
     )
+    delivery_unverified = False
+    if at_most_once and 200 <= int(result.get("status_code") or 500) < 300:
+        try:
+            delivery = json.loads(result.get("body") or "")
+        except (json.JSONDecodeError, TypeError):
+            delivery = None
+        expected_recipient = str(conversation.get("external_contact_id") or conversation.get("username") or "")
+        message_id = delivery.get("message_id") if isinstance(delivery, dict) else None
+        returned_recipient = delivery.get("recipient_id") if isinstance(delivery, dict) else None
+        if (not isinstance(message_id, str) or not message_id.strip() or
+            (returned_recipient is not None and str(returned_recipient) != expected_recipient)):
+            delivery_unverified = True
+            result = {"status_code": 503,
+                "body": '{"error":"meta_delivery_unverified","action":"reconcile_before_retry"}'}
     emit_messaging_metric(
-        "meta.message.sent" if int(result.get("status_code") or 500) < 400 else "meta.message.failed",
+        ("meta.message.unverified" if delivery_unverified else
+         "meta.message.sent" if int(result.get("status_code") or 500) < 400
+         else "meta.message.failed"),
         tenant_id=conversation.get("user_id"), connection_id=connection["id"],
         conversation_id=conversation.get("id"), provider=META_PROVIDER,
         status=result.get("status_code"),

@@ -117,6 +117,48 @@ def test_meta_send_eligibility_accepts_recent_user_initiated_conversation():
     assert can_send_meta_message(connection=_connection(), conversation=_conversation()) == (True, "eligible")
 
 
+@pytest.mark.parametrize("body,expected_status", [
+    ('{"recipient_id":"meta-recipient","message_id":"message-1"}', 200),
+    ('{"message_id":"message-1","recipient_id":"different-person"}', 503),
+    ('{"status":"error"}', 503),
+    ('{}', 503),
+    ('not-json', 503),
+])
+def test_follow_up_meta_send_requires_delivery_receipt_before_counting_success(
+    monkeypatch, capsys, body, expected_status,
+):
+    import asyncio
+    from unittest.mock import AsyncMock
+    import main
+
+    connection = {"id": "connection-1", "status": "connected", "user_id": "tenant-1",
+                  "external_account_id": "account-1",
+                  "scopes": ["instagram_business_basic", "instagram_business_manage_messages"]}
+    conversation = {"id": "conversation-1", "user_id": "tenant-1", "channel": "instagram",
+                    "messaging_provider": META_PROVIDER, "messaging_connection_id": "connection-1",
+                    "external_contact_id": "meta-recipient", "automation_mode": "auto",
+                    "agent_active": True, "last_inbound_at": datetime.now(timezone.utc).isoformat()}
+    provider_send = AsyncMock(return_value={"status_code": 200, "body": body})
+    usage = AsyncMock()
+    monkeypatch.setattr(main.config, "meta_instagram_enabled", True)
+    monkeypatch.setattr(main.config, "meta_instagram_send_enabled", True)
+    monkeypatch.setattr(main, "get_messaging_connection", AsyncMock(return_value=connection))
+    monkeypatch.setattr(main, "get_valid_access_token", AsyncMock(return_value="synthetic-token"))
+    monkeypatch.setattr(main.META_INSTAGRAM_PROVIDER, "send_message", provider_send)
+    monkeypatch.setattr(main, "record_usage_ledger_event", usage)
+
+    result = asyncio.run(main.send_channel_message(conversation, "Synthetic follow-up", at_most_once=True))
+    assert result["status_code"] == expected_status
+    assert provider_send.await_args.kwargs["max_attempts"] == 1
+    if expected_status == 200:
+        usage.assert_awaited_once()
+        assert "meta.message.sent" in capsys.readouterr().out
+    else:
+        assert "meta_delivery_unverified" in result["body"]
+        usage.assert_not_awaited()
+        assert "meta.message.unverified" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("message", [
     "STOP", "unsubscribe please", "Don't contact me again", "ne me contacte plus", "arrête",
 ])
