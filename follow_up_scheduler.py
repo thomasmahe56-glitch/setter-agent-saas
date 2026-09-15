@@ -34,18 +34,23 @@ def normalize_stages(raw: list[dict]) -> list[dict]:
     return stages
 
 
-def _local_candidate(day, hour: int, minute: int, zone: ZoneInfo) -> datetime:
-    """Choose the first real local instant at or after the requested wall time.
+def _local_candidates(day, hour: int, minute: int, zone: ZoneInfo) -> list[datetime]:
+    """Return real instants for the first valid opening wall minute.
 
-    During a spring-forward gap, advance to the next valid minute. During an
-    autumn overlap, use the first occurrence, unless it is already past.
+    A spring-forward gap advances to the next valid minute. An autumn overlap
+    may have two real instants for the same opening wall time.
     """
     naive = datetime(day.year, day.month, day.day, hour, minute)
     for offset in range(180):
         wall = naive + timedelta(minutes=offset)
-        aware = wall.replace(tzinfo=zone, fold=0)
-        if aware.astimezone(timezone.utc).astimezone(zone).replace(tzinfo=None) == wall:
-            return aware.astimezone(timezone.utc)
+        candidates = set()
+        for fold in (0, 1):
+            aware = wall.replace(tzinfo=zone, fold=fold)
+            instant = aware.astimezone(timezone.utc)
+            if instant.astimezone(zone).replace(tzinfo=None) == wall:
+                candidates.add(instant)
+        if candidates:
+            return sorted(candidates)
     raise ValueError("No valid local opening instant")
 
 
@@ -64,10 +69,11 @@ def next_open_at(instant: datetime, start: str, end: str, tz_name: str) -> datet
         opening > closing and (minute >= opening or minute < closing)
     ):
         return instant
-    candidate = _local_candidate(local.date(), sh, sm, zone)
-    if candidate <= instant:
-        candidate = _local_candidate(local.date() + timedelta(days=1), sh, sm, zone)
-    return candidate
+    today = _local_candidates(local.date(), sh, sm, zone)
+    candidate = next((opening_at for opening_at in today if opening_at > instant), None)
+    if candidate is not None:
+        return candidate
+    return _local_candidates(local.date() + timedelta(days=1), sh, sm, zone)[0]
 
 
 def schedule_stage(anchor: datetime, stage: dict, settings: dict) -> tuple[datetime, datetime]:

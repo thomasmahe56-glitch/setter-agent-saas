@@ -43,6 +43,15 @@ def test_paris_timezone_and_dst():
     assert next_open_at(at(2026, 10, 25, 1), "08:00", "20:00", "Europe/Paris") == at(2026, 10, 25, 7)
 
 
+def test_autumn_overlap_uses_the_next_occurrence_of_opening_wall_time():
+    assert next_open_at(at(2026, 10, 25, 0, 15), "02:30", "03:30", "Europe/Paris") == at(2026, 10, 25, 0, 30)
+    assert next_open_at(at(2026, 10, 25, 1, 15), "02:30", "03:30", "Europe/Paris") == at(2026, 10, 25, 1, 30)
+
+
+def test_spring_gap_advances_nonexistent_opening_to_first_real_minute():
+    assert next_open_at(at(2026, 3, 29, 0, 30), "02:30", "04:00", "Europe/Paris") == at(2026, 3, 29, 1)
+
+
 def test_generic_stages_preserve_order_and_enabled_state():
     stages = normalize_stages([
         {"delay_value": 12, "delay_unit": "hours", "mode": "manual", "enabled": False},

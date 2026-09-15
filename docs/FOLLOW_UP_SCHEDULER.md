@@ -19,6 +19,10 @@ The backend polls the queue and computes future `follow_up_jobs`. It stores both
 `due_at` (the configured elapsed delay) and `scheduled_at` (the first eligible
 instant inside the tenant messaging window). UTC instants plus an IANA timezone
 preserve correct behavior across daylight-saving transitions.
+For an opening time inside the repeated autumn hour, the scheduler chooses the
+next real occurrence of that wall time; it can use the second occurrence after
+the first has passed. An opening time inside the missing spring hour advances
+to the first real local minute.
 
 After a prospect replies, unsent jobs from the previous conversation cycle are
 cancelled. When Angellos replies again, a new cycle is scheduled. When a tenant
