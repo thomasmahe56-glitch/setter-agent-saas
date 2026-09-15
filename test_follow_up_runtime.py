@@ -219,6 +219,31 @@ def test_due_job_sends_once_and_records_successful_delivery(monkeypatch, attempt
     )
 
 
+def test_history_sync_failure_remains_sent_and_requires_reconciliation(monkeypatch):
+    patch, send = setup(monkeypatch)
+    calls = []
+
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return False
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        async def post(self, url, *, json, **kwargs):
+            calls.append(json)
+            return Response()
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(main.asyncio, "sleep", AsyncMock())
+    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "sent"
+    send.assert_awaited_once()
+    assert len(calls) == 3
+    assert all(call["p_job_id"] == "job-1" for call in calls)
+    assert patch.await_args.args[1]["last_error"].startswith("Meta accepted the DM")
+    assert patch.await_args.kwargs["expected_status"] == "sent"
+
+
 def test_reply_added_to_history_during_generation_cancels_before_provider(monkeypatch):
     patch, send = setup(monkeypatch)
     fresh = conversation(history=conversation()["history"] + [

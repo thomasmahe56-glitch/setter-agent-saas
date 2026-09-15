@@ -80,6 +80,9 @@ After Meta accepts a follow-up, the worker calls the service-role-only
 even if a prospect replied between delivery and history persistence. It updates
 the conversation's latest `response` and `status` only when history and the
 inbound timestamp still match the pre-send snapshot.
+This idempotent database-only sync may retry three times without repeating the
+provider send. If it still fails, the job remains `sent` with a visible
+reconciliation error; an operator must compare the Meta thread with CRM history.
 
 ## Rollout
 

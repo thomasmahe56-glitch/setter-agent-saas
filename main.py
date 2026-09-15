@@ -7712,22 +7712,43 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
         message = {"role": "assistant", "content": generated.text, "timestamp": now_iso(),
             "follow_up_stage": job["stage"], "follow_up_mode": "auto", "source": "follow_up_worker",
             "follow_up_job_id": job["id"], "sent": True}
-        async with httpx.AsyncClient() as http:
-            update = await http.post(f"{SUPABASE_RPC_URL}/append_sent_follow_up_history",
-                headers=supabase_headers(), json={
-                    "p_job_id": job["id"], "p_user_id": job["user_id"],
-                    "p_conversation_id": job["conversation_id"], "p_message": message,
-                    "p_expected_history": fresh.get("history") or [],
-                    "p_expected_inbound_at": fresh.get("last_inbound_at"),
-                    "p_response": generated.text,
-                }, timeout=10.0)
-            update.raise_for_status()
-            if update.json() is not True:
-                print(f"[follow-up] sent_but_history_not_appended job={job['id']}", flush=True)
+        sync_payload = {
+            "p_job_id": job["id"], "p_user_id": job["user_id"],
+            "p_conversation_id": job["conversation_id"], "p_message": message,
+            "p_expected_history": fresh.get("history") or [],
+            "p_expected_inbound_at": fresh.get("last_inbound_at"),
+            "p_response": generated.text,
+        }
+        history_synced = False
+        for sync_attempt in range(3):
+            try:
+                async with httpx.AsyncClient() as http:
+                    update = await http.post(f"{SUPABASE_RPC_URL}/append_sent_follow_up_history",
+                        headers=supabase_headers(), json=sync_payload, timeout=10.0)
+                    update.raise_for_status()
+                    history_synced = update.json() is True
+                if history_synced:
+                    break
+            except Exception as sync_exc:
+                print(f"[follow-up] history_sync_retry job={job['id']} "
+                      f"attempt={sync_attempt + 1} error={type(sync_exc).__name__}", flush=True)
+            if sync_attempt < 2:
+                await asyncio.sleep(0.5 * (sync_attempt + 1))
+        if not history_synced:
+            await patch_follow_up_job(job["id"], {
+                "last_error": "Meta accepted the DM but CRM history sync failed; reconcile delivery"
+            }, expected_status="sent")
+            print(f"[follow-up] sent_but_history_not_appended job={job['id']}", flush=True)
         print(f"[follow-up] sent job={job['id']} stage={job['stage']}", flush=True)
         return "sent"
     except Exception as exc:
         if sent:
+            try:
+                await patch_follow_up_job(job["id"], {
+                    "last_error": "Provider accepted the DM but CRM sync failed; reconcile delivery"
+                }, expected_status="sent")
+            except Exception:
+                pass
             print(f"[follow-up] sent_but_sync_failed job={job['id']} error={type(exc).__name__}", flush=True)
             return "sent"
         if external_attempted:
