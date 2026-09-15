@@ -381,3 +381,12 @@ the tenant timezone. The card was visually inspected, browser console errors
 were empty, and the exact synthetic row was removed. A further reload showed
 the group back at zero. This verifies processing-state presentation without a
 provider call.
+
+After removal of the unused H+23 client methods and proxy allowances in the
+dashboard draft, a fresh real-browser reload on 2026-09-15 showed the same
+scheduled and Meta-manual cards. Railway's isolated service HTTP stream recorded
+two `GET /follow-ups/jobs` requests at 14:12:42 and 14:12:43 UTC, both HTTP 200,
+with no `/follow-ups/due` request in that observation window. Direct reads of
+the isolated Supabase database showed one scheduled job, one `manual_required`
+job, 13 cancelled jobs, and an empty refresh queue. Browser console errors
+were empty. This correlates the UI with the new endpoint and persisted data.
