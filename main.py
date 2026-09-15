@@ -437,11 +437,13 @@ app.add_middleware(RequestBodyLimitMiddleware)
 
 
 def supabase_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    headers = {
         "apikey": SUPABASE_SERVICE_KEY,
         "Content-Type": "application/json",
     }
+    if not SUPABASE_SERVICE_KEY.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {SUPABASE_SERVICE_KEY}"
+    return headers
 
 
 async def require_secret(x_webhook_secret: Optional[str]) -> str:

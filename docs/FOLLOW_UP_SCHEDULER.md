@@ -90,6 +90,11 @@ conversations. The test database still contains zero jobs and zero enabled
 stages. A test-project service-role credential must be configured securely
 before end-to-end processing can be checked.
 
+For `SUPABASE_KEY`, prefer an existing `sb_secret_...` key from the **test**
+project; it maps to PostgreSQL `service_role` and is sent only as `apikey`.
+The legacy `service_role` JWT also works, with `apikey` and Bearer headers.
+Never use the publishable/anon key or the JWT signing secret for this worker.
+
 While the credential is missing, set `BACKEND_WORKERS_ENABLED=false` on this
 isolated service to avoid repeated unauthorized database polls. It defaults to
 `true` in the backend, and must be restored to `true` once the test credential

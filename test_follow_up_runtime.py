@@ -53,6 +53,17 @@ def setup(monkeypatch, *, conv=None, config=None):
     return patch, send
 
 
+def test_server_api_key_headers_support_new_and_legacy_supabase_keys(monkeypatch):
+    monkeypatch.setattr(main, "SUPABASE_SERVICE_KEY", "sb_secret_test_only")
+    new_headers = main.supabase_headers()
+    assert new_headers["apikey"] == "sb_secret_test_only"
+    assert "Authorization" not in new_headers
+    monkeypatch.setattr(main, "SUPABASE_SERVICE_KEY", "eyJlegacy-test-only")
+    legacy_headers = main.supabase_headers()
+    assert legacy_headers["apikey"] == "eyJlegacy-test-only"
+    assert legacy_headers["Authorization"] == "Bearer eyJlegacy-test-only"
+
+
 def test_test_service_can_pause_workers_until_credentials_are_configured(monkeypatch):
     monkeypatch.setenv("BACKEND_WORKERS_ENABLED", "false")
     scheduled = AsyncMock()
