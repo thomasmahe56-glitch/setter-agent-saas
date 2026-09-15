@@ -70,3 +70,9 @@ The browser demo uses test fixtures, and the local backend uses a dummy Supabase
 URL. PostgREST access with the test backend credentials, real Training Center
 save/reload, worker queue processing, and Railway restart behavior remain to
 be verified end to end before a production rollout.
+
+Read-only Railway inspection found that the connected `Angellos` project has
+only a `production` environment, sourced from `main`, and no Railway cron
+schedule. Its current deployment logs still show dashboard calls to
+`/follow-ups/due` with browser-provided delay query parameters. There is no
+isolated Railway test environment available for the new backend yet.
