@@ -7643,7 +7643,11 @@ async def follow_up_worker() -> None:
 async def get_due_follow_ups(
     user_id: str = Depends(require_jwt),
 ):
-    raise HTTPException(status_code=410, detail="Use /follow-ups/jobs; browser timing overrides are retired")
+    # The currently deployed dashboard still requests this route with timing
+    # parameters from localStorage. Keep the page loadable during the
+    # backend-first rollout, but never let that browser state schedule or send
+    # a message. The replacement dashboard reads /follow-ups/jobs.
+    return []
 
 
 @app.get("/follow-ups/jobs")

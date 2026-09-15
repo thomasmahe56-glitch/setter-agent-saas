@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from fastapi.testclient import TestClient
+
 import main
 
 
@@ -76,6 +78,21 @@ def test_test_service_can_pause_workers_until_credentials_are_configured(monkeyp
     asyncio.run(run())
     scheduled.assert_not_awaited()
     follow_up.assert_not_awaited()
+
+
+def test_legacy_dashboard_due_request_stays_loadable_during_backend_first_rollout(monkeypatch):
+    monkeypatch.setenv("BACKEND_WORKERS_ENABLED", "false")
+    main.app.dependency_overrides[main.require_jwt] = lambda: "tenant-1"
+    try:
+        with TestClient(main.app) as client:
+            response = client.get("/follow-ups/due", params={
+                "auto_hours": 23, "manual1_days": 3,
+                "manual2_days": 10, "manual3_days": 30,
+            })
+        assert response.status_code == 200
+        assert response.json() == []
+    finally:
+        main.app.dependency_overrides.pop(main.require_jwt, None)
 
 
 def test_prospect_reply_cancels_old_job_before_send(monkeypatch):

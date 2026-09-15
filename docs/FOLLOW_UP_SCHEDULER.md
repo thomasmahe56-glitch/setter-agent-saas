@@ -53,10 +53,14 @@ through `/follow-ups/jobs`.
    do not contact a real prospect.
 4. Review the test evidence with Thomas. The persistent-jobs migration is
    already present on the live database; deploy the backend before dashboard
-   to production only after approval. Check queue depth, oldest scheduled
-   job, `manual_required` count, logs, and one known-safe tenant. A rollback
-   must stop the worker before reverting the application; retain job records
-   for reconciliation.
+   to production only after approval. The old dashboard still calls
+   `/follow-ups/due` with browser-supplied delays. During the short interval
+   before the dashboard deploy, that legacy route returns an empty list rather
+   than an error; no browser rule can schedule or send a job. Deploy the new
+   dashboard promptly to expose the server jobs. Check queue depth, oldest
+   scheduled job, `manual_required` count, logs, and one known-safe tenant.
+   A rollback must stop the worker before reverting the application; retain
+   job records for reconciliation.
 
 ## Live-project migration incident and validation (2026-09-15)
 
