@@ -54,10 +54,19 @@ through `/follow-ups/jobs`.
    must stop the worker before reverting the application; retain job records
    for reconciliation.
 
-## Current validation limit
+## Test-project validation (2026-09-15)
+
+The migration was applied to `setter-saas-test` (`lyrlvipkwzbsojqbposh`).
+The schema, three triggers, service-role-only RPC grants, and RLS/grants were
+verified. The backfill placed 92 active conversations in the refresh queue;
+there are zero follow-up jobs and zero settings with explicitly enabled stages.
+In a rolled-back SQL transaction, a fictional due job was claimed once and a
+second claim returned zero. A rolled-back tenant timezone update incremented
+the config version. After both probes, the project still had zero jobs, 92
+queued conversations, and the original tenant settings version.
 
 Local automated tests use virtual time and mocked provider/database responses.
-The local browser demo uses test fixtures, and the local backend uses a dummy
-Supabase URL. A real test Supabase project and test tenant are required to
-verify the migration, PostgREST RPCs, persistent saves, and Railway restart
-behavior end to end.
+The browser demo uses test fixtures, and the local backend uses a dummy Supabase
+URL. PostgREST access with the test backend credentials, real Training Center
+save/reload, worker queue processing, and Railway restart behavior remain to
+be verified end to end before a production rollout.
