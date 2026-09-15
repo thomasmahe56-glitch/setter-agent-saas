@@ -80,6 +80,29 @@ def test_successful_provider_response_survives_usage_ledger_failure(monkeypatch,
     assert "sent_but_ledger_failed" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("body,expected_status", [
+    ('{"status":"success","data":{}}', 200),
+    ('{"status":"error","code":3011,"message":"outside window"}', 400),
+    ('{"error":{"code":3011}}', 400),
+])
+def test_manychat_body_status_controls_delivery_and_usage(monkeypatch, body, expected_status):
+    provider = AsyncMock(return_value={"status_code": 200, "body": body})
+    usage = AsyncMock()
+    monkeypatch.setattr(main.MANYCHAT_PROVIDER_CLIENT, "send_message", provider)
+    monkeypatch.setattr(main, "record_usage_ledger_event", usage)
+    result = asyncio.run(main.send_channel_message({
+        "id": "conversation-1", "user_id": "tenant-1", "channel": "instagram",
+        "messaging_provider": main.MANYCHAT_PROVIDER, "external_contact_id": "synthetic-contact",
+    }, "A short follow-up", at_most_once=True))
+    assert result["status_code"] == expected_status
+    provider.assert_awaited_once()
+    if expected_status == 200:
+        usage.assert_awaited_once()
+    else:
+        usage.assert_not_awaited()
+        assert main.is_manychat_pending_delivery_error(result)
+
+
 def test_test_service_can_pause_workers_until_credentials_are_configured(monkeypatch):
     monkeypatch.setenv("BACKEND_WORKERS_ENABLED", "false")
     scheduled = AsyncMock()
@@ -425,6 +448,16 @@ def test_meta_window_expired_requires_manual_action(monkeypatch):
     assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "manual_required"
     send.assert_not_awaited()
     assert "window closed" in patch.await_args.args[1]["last_error"]
+
+
+def test_provider_window_error_never_marks_follow_up_sent(monkeypatch):
+    patch, send = setup(monkeypatch)
+    send.return_value = {"status_code": 400,
+        "body": '{"status":"error","code":3011,"message":"outside window"}'}
+    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "manual_required"
+    send.assert_awaited_once()
+    assert patch.await_args.args[1]["status"] == "manual_required"
+    assert "sent_at" not in patch.await_args.args[1]
 
 
 def test_closed_hours_requeue_without_early_send(monkeypatch):

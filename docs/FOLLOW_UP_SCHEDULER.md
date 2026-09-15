@@ -67,6 +67,9 @@ uses the single job claim and never automatically retries an ambiguous send.
 If the provider accepted a message but usage-ledger recording fails, the
 adapter logs that accounting failure and still returns the successful delivery
 response so the job becomes `sent` instead of an ambiguous retry.
+The ManyChat adapter also rejects a JSON body declaring `status: error` (or an
+`error` object) even if a gateway returned HTTP 200. Such a response does not
+increment sent usage or mark the job `sent`; code 3011 requires manual action.
 
 ## Rollout
 

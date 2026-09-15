@@ -2775,6 +2775,18 @@ def generate_ai_generation(
 
 async def send_manychat_message(subscriber_id: str, text: str) -> dict:
     result = await MANYCHAT_PROVIDER_CLIENT.send_message(recipient_id=subscriber_id, text=text)
+    if int(result.get("status_code") or 500) < 400:
+        try:
+            body = json.loads(result.get("body") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            body = None
+        if isinstance(body, dict) and (
+            str(body.get("status") or "").lower() in {"error", "failed", "failure"} or
+            body.get("error")
+        ):
+            # ManyChat normally returns HTTP 400 for an API error. Protect
+            # delivery state and counters if a gateway returns a 200 error body.
+            result = {**result, "provider_http_status": result["status_code"], "status_code": 400}
     print(f"[manychat] status={result['status_code']} body_len={len(result.get('body') or '')}")
     return result
 
