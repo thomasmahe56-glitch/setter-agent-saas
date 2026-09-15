@@ -26,6 +26,8 @@ create table public.beta_account_settings (
   follow_up_config jsonb not null default '[]'::jsonb,
   ai_cost_cap_eur numeric not null default 50.00,
   ai_cost_guardrail_enabled boolean not null default true,
+  min_auto_delay_seconds integer not null default 0,
+  random_auto_delay_seconds integer not null default 0,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );

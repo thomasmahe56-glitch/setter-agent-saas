@@ -102,24 +102,23 @@ environment is named `production` by Railway default but is a separate project
 from the live `Angellos` project. The service is configured with `/health`,
 restart-always, app sleeping disabled, and Meta sending disabled. The cloud
 container deployed successfully and logs show `[follow-up] worker_started`.
-Its worker was observed starting in cloud logs. Its `SUPABASE_KEY` is a
-nonfunctional placeholder. `SUPABASE_URL` now points to
-`fagjhniuoopsgmbgdurb` on the separate Railway project. Deployment
-`aa5b9994-028a-4458-9b23-9897eafbdebd` succeeded; its logs show
-`[workers] disabled by BACKEND_WORKERS_ENABLED`. Do not use credentials
-for `lyrlvipkwzbsojqbposh`.
+`SUPABASE_URL` and the server-only `SUPABASE_KEY` belong to the isolated
+Supabase project `fagjhniuoopsgmbgdurb`. `BACKEND_WORKERS_ENABLED=true`,
+`SCHEDULED_REPLY_WORKER_ENABLED=false`, and the test Auth user is the only
+`ALLOWED_USER_IDS` entry. Its public test API domain is
+`https://setter-agent-follow-up-test-production.up.railway.app`; the local
+dashboard proxy uses a separate test-only `DASHBOARD_SECRET`. Do not use
+credentials for `lyrlvipkwzbsojqbposh` here.
 
 An isolated Supabase project, `angellos-follow-up-test`
 (`fagjhniuoopsgmbgdurb`, `eu-west-1`), was created on 2026-09-15. It is a
 separate PostgreSQL database on the Free plan. Its scheduler-specific baseline
-and persistent-jobs migrations have been applied. All four public test tables
-have RLS enabled; service-role grants are present. A synthetic Auth row,
-tenant settings row, and conversation were inserted without an email or login
-credential. The conversation trigger placed one item in the refresh queue;
-there are zero jobs until the backend worker processes it. The synthetic stage
-is manual, so it cannot send a provider message. A new project's own secret
-key must be configured on the isolated Railway service before cloud worker
-verification. The live project's key must never be used there.
+and persistent-jobs migrations have been applied. Test-only support migrations
+add the empty tables needed by Training Center and `prompt-versions`; all
+public test tables have RLS enabled and service-role grants. A synthetic Auth
+user was made login-capable with a non-deliverable `.invalid` email address
+and a test-only password that is not committed. All conversations are synthetic.
+The live project's key must never be used here.
 
 With the isolated credential configured, the cloud follow-up worker processed
 the one synthetic queue item and created one scheduled manual job. The same
@@ -129,6 +128,34 @@ test-only database intentionally lacks its tables. Set
 backend now supports this switch while retaining its default enabled state
 for existing installations.
 
+Cloud integration checks with only synthetic conversations then showed:
+
+- a tenant-configured manual stage created a future `scheduled` job;
+- a later synthetic inbound reply changed that job to `cancelled` and emptied
+  the refresh queue;
+- an auto stage whose Instagram inbound was 48 hours old changed to
+  `manual_required` with `instagram/Meta automatic messaging window closed`;
+- an opening window of 23:00-23:01 in `Europe/Paris` deferred a synthetic
+  due job to 21:00 UTC, with `scheduled_at > due_at`;
+- Railway redeployment `20b59b8f-a78d-44ea-8781-e805724c7f75` succeeded;
+  the job states persisted and logs showed only the follow-up worker starting.
+
+The separate test service still has Meta outbound disabled. The isolated
+database has no real prospects. The local dashboard at `localhost:3002` used
+an ignored `.env.local` that points only to the isolated Supabase project and
+Railway test API. Browser verification completed normal login, Training Center
+save/reload for `follow_up_1 = 7 hours`, `08:00-20:00`, `Europe/Paris`, and a
+direct SQL read confirmed these values persisted in `beta_account_settings`
+with config version 4. Changing the hours to `23:00-23:01` incremented the
+version to 5; the backend cancelled prior scheduled jobs and created new jobs
+with `due_at` around 19:33 Paris and `scheduled_at` 23:00 Paris. The Follow-ups
+page showed scheduled future jobs, the closed-hours explanation, Meta manual
+state, and cancelled jobs. The initial browser overlay was caused by the
+minimal test schema lacking `prompt_versions`; after adding that empty support
+table and reloading, Training Center and Follow-ups showed no error overlay.
+Real browser screenshots were inspected inline; the earlier demo screenshots
+are stored in the dashboard branch for review.
+
 Database checks on the isolated project confirmed that the conversation insert
 queued one refresh item, a service-role RPC claimed one fictional due job, a
 second claim returned zero, and rollback left zero persistent jobs. The
@@ -136,13 +163,12 @@ privileged enqueue trigger functions deny direct authenticated execution.
 Security advisors reported only informational `rls_enabled_no_policy` notices
 for the four deliberately service-role-only test tables.
 
-For `SUPABASE_KEY`, prefer an existing `sb_secret_...` key from a **new,
-isolated test** project; it maps to PostgreSQL `service_role` and is sent only
+For `SUPABASE_KEY`, prefer an existing `sb_secret_...` key from an **isolated
+test** project; it maps to PostgreSQL `service_role` and is sent only
 as `apikey`.
 The legacy `service_role` JWT also works, with `apikey` and Bearer headers.
 Never use the publishable/anon key or the JWT signing secret for this worker.
 
-While the credential is missing, set `BACKEND_WORKERS_ENABLED=false` on this
-isolated service to avoid repeated unauthorized database polls. It defaults to
-`true` in the backend, and must be restored to `true` once the test credential
-is configured, before testing the cloud scheduler.
+The workers were paused while the credential was missing; they are now enabled
+on the isolated Railway service. The unrelated scheduled-reply worker remains
+disabled there because the scheduler-specific test database lacks its tables.
