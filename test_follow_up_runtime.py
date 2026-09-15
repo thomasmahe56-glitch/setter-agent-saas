@@ -128,6 +128,36 @@ def test_virtual_clock_honors_custom_delay_before_provider_call(monkeypatch):
     assert patch.await_args.args[1]["status"] == "scheduled"
 
 
+def test_due_job_sends_once_and_records_successful_delivery(monkeypatch):
+    patch, send = setup(monkeypatch)
+    conversation_updates = []
+
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return [{"id": "conversation-1"}]
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        async def patch(self, url, *, json, **kwargs):
+            assert url == main.SUPABASE_CONVERSATIONS_URL
+            conversation_updates.append(json)
+            return Response()
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+
+    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "sent"
+    send.assert_awaited_once()
+    assert send.await_args.kwargs["at_most_once"] is True
+    assert patch.await_args.args[1]["status"] == "sent"
+    assert patch.await_args.args[1]["sent_at"]
+    assert len(conversation_updates) == 1
+    delivered = conversation_updates[0]["history"][-1]
+    assert delivered["follow_up_job_id"] == "job-1"
+    assert delivered["content"] == "A short follow-up"
+    assert delivered["sent"] is True
+
+
 def test_changed_config_cancels_stale_job(monkeypatch):
     patch, send = setup(monkeypatch, config=settings(follow_up_config_version=2))
     assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "cancelled"

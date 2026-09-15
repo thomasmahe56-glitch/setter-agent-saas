@@ -91,6 +91,10 @@ succeeded. Live counts remained 92 conversations, 887 prospects, one settings
 row, and zero follow-up jobs.
 
 Local automated tests use virtual time and mocked provider/database responses.
+The successful-delivery test follows a due job through one provider attempt,
+`sent` persistence, and a `follow_up_job_id` entry in conversation history;
+timeout and competing-worker tests cover the opposite outcomes. No test
+provider sends to a real account.
 The initial browser demo used test fixtures and the initial local backend used
 a dummy Supabase URL. The later isolated Railway/Supabase setup verified real
 Training Center save/reload, worker queue processing, and Railway redeployment
