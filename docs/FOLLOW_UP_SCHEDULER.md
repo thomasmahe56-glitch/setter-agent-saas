@@ -347,3 +347,11 @@ The worker tests also covered an inactive tenant Meta provider and an
 inactive-provider job rendered a French connection-repair explanation on the
 real Follow-ups page; browser console errors were empty, and the row was
 deleted from the isolated database afterward.
+
+A final visual check inserted a single test-only `sent` job for the synthetic
+`Synthetic Follow Up` conversation, without contacting Meta. A real browser
+reload showed **Envoyées (1)** and a French card with the theoretical due time,
+planned time, sent time, and `Europe/Paris` timezone; the layout had no overlay
+and browser console errors were empty. The exact disposable row was deleted
+after inspection, and a second reload showed **Envoyées (0)** again. This
+verifies sent-state rendering, not a real provider delivery.
