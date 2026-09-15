@@ -183,6 +183,17 @@ table and reloading, Training Center and Follow-ups showed no error overlay.
 Real browser screenshots were inspected inline; the earlier demo screenshots
 are stored in the dashboard branch for review.
 
+A further isolated browser check changed the same tenant to an enabled
+`follow_up_1` in **auto** mode at `+7 hours`, with `08:00-20:00` and
+`Europe/Paris`. SQL confirmed configuration version 6. The cloud worker
+replaced the earlier manual jobs with a synthetic future auto job due at
+19:33 Paris. For a second synthetic conversation whose Instagram inbound was
+already 48 hours old, it cancelled the stale auto job and created a future
+manual job due at 19:32 Paris, retaining the Meta-window reason. The Follow-ups
+page showed the auto job before its due time and explained that the Meta-limited
+job needs manual action **after** its due time. No provider connection or real
+prospect exists in this test database, and outbound Meta is disabled.
+
 Database checks on the isolated project confirmed that the conversation insert
 queued one refresh item, a service-role RPC claimed one fictional due job, a
 second claim returned zero, and rollback left zero persistent jobs. The
