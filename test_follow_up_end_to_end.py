@@ -102,7 +102,20 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
     async def execute_at_virtual_time(row):
         return await real_execute(row, now=clock["now"])
 
-    provider = AsyncMock(return_value={"status_code": 200, "body": "{}"})
+    provider = AsyncMock(return_value={
+        "status_code": 200,
+        "body": '{"recipient_id":"recipient-test","message_id":"outbound-test"}',
+    })
+    connection = {
+        "id": "connection-test", "external_account_id": "instagram-account-test",
+        "status": "connected",
+        "scopes": ["instagram_business_basic", "instagram_business_manage_messages"],
+    }
+    real_meta_gate = main.can_send_meta_message
+    monkeypatch.setattr(main, "can_send_meta_message", lambda **kwargs: real_meta_gate(
+        **kwargs, now=clock["now"]))
+    monkeypatch.setattr(main.config, "meta_instagram_enabled", True)
+    monkeypatch.setattr(main.config, "meta_instagram_send_enabled", True)
     monkeypatch.setattr(main.httpx, "AsyncClient", Client)
     monkeypatch.setattr(main, "get_conversation_by_id", AsyncMock(return_value=conversation))
     monkeypatch.setattr(main, "get_follow_up_settings_strict", AsyncMock(return_value=settings))
@@ -115,7 +128,10 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
         return_value=generated,
     ))
     monkeypatch.setattr(main, "record_ai_usage_event", AsyncMock())
-    monkeypatch.setattr(main, "send_channel_message", provider)
+    monkeypatch.setattr(main, "get_messaging_connection", AsyncMock(return_value=connection))
+    monkeypatch.setattr(main, "get_valid_access_token", AsyncMock(return_value="token-test"))
+    monkeypatch.setattr(main, "record_usage_ledger_event", AsyncMock())
+    monkeypatch.setattr(main.META_INSTAGRAM_PROVIDER, "send_message", provider)
 
     async def run():
         assert await main.process_follow_up_refresh_queue() == 1
@@ -140,7 +156,15 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
         assert conversation["history"][-1]["follow_up_job_id"] == jobs[0]["id"]
         assert conversation["history"][-1]["sent"] is True
         provider.assert_awaited_once()
-        assert provider.await_args.kwargs["at_most_once"] is True
+        assert provider.await_args.kwargs == {
+            "account_id": "instagram-account-test",
+            "recipient_id": "recipient-test",
+            "text": "Virtual follow-up",
+            "access_token": "token-test",
+            "max_attempts": 1,
+        }
+        main.record_usage_ledger_event.assert_awaited_once()
+        assert main.record_usage_ledger_event.await_args.kwargs["provider_event_id"] == "outbound-test"
 
         assert await main.process_due_follow_up_jobs() == 0
         assert provider.await_count == 1

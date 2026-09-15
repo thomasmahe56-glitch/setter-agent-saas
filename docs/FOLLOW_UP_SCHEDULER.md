@@ -325,6 +325,13 @@ real local Follow-ups page. The card explained in French that the Instagram
 thread must be checked before another send, browser console errors were zero,
 and the synthetic row was deleted from the isolated database afterward.
 
+The virtual-time end-to-end test now traverses the queue refresh, persisted
+job claim, AI preparation, channel router, Meta eligibility gate, mocked Meta
+delivery receipt, usage ledger, sent-job transition, and idempotent CRM history
+append. It asserts the adapter receives the scoped recipient and `max_attempts=1`,
+including after a simulated AI preparation retry. This is a local mock of the
+provider response; it does not send a real Instagram DM.
+
 The transport-refresh migration was applied only to the isolated test project
 after checking that its three synthetic conversations and project ref differ
 from the live project with 92 conversations. Transactional probes changed a
