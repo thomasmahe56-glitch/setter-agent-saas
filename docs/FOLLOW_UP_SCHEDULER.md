@@ -54,9 +54,15 @@ through `/follow-ups/jobs`.
    must stop the worker before reverting the application; retain job records
    for reconciliation.
 
-## Test-project validation (2026-09-15)
+## Live-project migration incident and validation (2026-09-15)
 
-The migration was applied to `setter-saas-test` (`lyrlvipkwzbsojqbposh`).
+The migration was applied to the Supabase project named `setter-saas-test`
+(`lyrlvipkwzbsojqbposh`) after Thomas approved that named project. Further
+workspace inspection showed that its project ref is also used by the deployed
+dashboard: despite its name, this is **not an isolated test database**. No
+Supabase project was renamed or deleted. The live backend and dashboard were
+not redeployed.
+
 The schema, three triggers, service-role-only RPC grants, and RLS/grants were
 verified. The backfill placed 92 active conversations in the refresh queue;
 there are zero follow-up jobs and zero settings with explicitly enabled stages.
@@ -65,11 +71,22 @@ second claim returned zero. A rolled-back tenant timezone update incremented
 the config version. After both probes, the project still had zero jobs, 92
 queued conversations, and the original tenant settings version.
 
+The initial trigger functions used invoker privileges while the queue denied
+`authenticated` access. A rolled-back update of one owned conversation as an
+authenticated user reproduced `permission denied for table
+follow_up_refresh_queue`; this could have blocked live conversation writes.
+The corrective migration `fix_follow_up_refresh_trigger_permissions.sql` was
+applied immediately. Its three trigger functions now run as their `postgres`
+owner with an empty search path, and client roles still cannot execute them
+directly or access the queue. The same rolled-back authenticated update then
+succeeded. Live counts remained 92 conversations, 887 prospects, one settings
+row, and zero follow-up jobs.
+
 Local automated tests use virtual time and mocked provider/database responses.
 The browser demo uses test fixtures, and the local backend uses a dummy Supabase
-URL. PostgREST access with the test backend credentials, real Training Center
+URL. An actually isolated Supabase test database, real Training Center
 save/reload, worker queue processing, and Railway restart behavior remain to
-be verified end to end before a production rollout.
+be verified end to end before deploying the new applications to production.
 
 Read-only Railway inspection found that the connected `Angellos` project has
 only a `production` environment, sourced from `main`, and no Railway cron
@@ -84,14 +101,15 @@ environment is named `production` by Railway default but is a separate project
 from the live `Angellos` project. The service is configured with `/health`,
 restart-always, app sleeping disabled, and Meta sending disabled. The cloud
 container deployed successfully and logs show `[follow-up] worker_started`.
-Its `SUPABASE_KEY` is intentionally a nonfunctional placeholder, so the worker
-currently logs an authorization failure and cannot process the 92 queued
-conversations. The test database still contains zero jobs and zero enabled
-stages. A test-project service-role credential must be configured securely
-before end-to-end processing can be checked.
+Its worker was observed starting in cloud logs. Its `SUPABASE_KEY` is a
+nonfunctional placeholder and `SUPABASE_URL` has been changed to an invalid
+placeholder so this service cannot connect to the live database. Its workers
+are paused until an actually isolated Supabase test database exists. Do not
+replace either placeholder with credentials for `lyrlvipkwzbsojqbposh`.
 
-For `SUPABASE_KEY`, prefer an existing `sb_secret_...` key from the **test**
-project; it maps to PostgreSQL `service_role` and is sent only as `apikey`.
+For `SUPABASE_KEY`, prefer an existing `sb_secret_...` key from a **new,
+isolated test** project; it maps to PostgreSQL `service_role` and is sent only
+as `apikey`.
 The legacy `service_role` JWT also works, with `apikey` and Bearer headers.
 Never use the publishable/anon key or the JWT signing secret for this worker.
 

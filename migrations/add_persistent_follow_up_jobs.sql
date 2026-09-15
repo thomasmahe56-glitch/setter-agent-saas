@@ -53,7 +53,7 @@ grant select, insert, update on public.follow_up_jobs to service_role;
 grant select, insert, update, delete on public.follow_up_refresh_queue to service_role;
 
 create or replace function public.enqueue_follow_up_refresh() returns trigger
-language plpgsql security invoker set search_path = '' as $$
+language plpgsql security definer set search_path = '' as $$
 begin
   if new.user_id is null then
     return new;
@@ -74,7 +74,7 @@ create trigger conversations_follow_up_refresh after insert or update of
   for each row execute function public.enqueue_follow_up_refresh();
 
 create or replace function public.enqueue_follow_up_settings_refresh() returns trigger
-language plpgsql security invoker set search_path = '' as $$
+language plpgsql security definer set search_path = '' as $$
 begin
   if old.follow_up_config is distinct from new.follow_up_config or
      old.allowed_send_start is distinct from new.allowed_send_start or
@@ -96,7 +96,7 @@ create trigger beta_settings_follow_up_refresh before update on public.beta_acco
   for each row execute function public.enqueue_follow_up_settings_refresh();
 
 create or replace function public.enqueue_new_follow_up_settings() returns trigger
-language plpgsql security invoker set search_path = '' as $$
+language plpgsql security definer set search_path = '' as $$
 begin
   insert into public.follow_up_refresh_queue(conversation_id, user_id)
     select c.id, c.user_id from public.conversations c
