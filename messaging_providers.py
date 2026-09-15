@@ -194,10 +194,10 @@ class MetaInstagramProvider:
         self.graph_api_version = graph_api_version
         self.base_url = base_url.rstrip("/")
 
-    async def send_message(self, *, account_id: str, recipient_id: str, text: str, access_token: str) -> dict:
+    async def send_message(self, *, account_id: str, recipient_id: str, text: str, access_token: str, max_attempts: int = 3) -> dict:
         url = f"{self.base_url}/{self.graph_api_version}/{account_id}/messages"
         retry_after: Optional[float] = None
-        for attempt in range(3):
+        for attempt in range(max_attempts):
             try:
                 async with httpx.AsyncClient() as http:
                     response = await http.post(
@@ -207,14 +207,14 @@ class MetaInstagramProvider:
                         timeout=15.0,
                     )
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                if attempt == 2:
+                if attempt == max_attempts - 1:
                     return {"status_code": 503, "body": json.dumps({"error": "network_error", "detail": type(exc).__name__})}
                 await asyncio.sleep((2 ** attempt) + random.random())
                 continue
             if response.status_code < 400:
                 return {"status_code": response.status_code, "body": response.text}
             if response.status_code == 429 or response.status_code >= 500:
-                if attempt == 2:
+                if attempt == max_attempts - 1:
                     return {"status_code": response.status_code, "body": response.text, "retry_after": retry_after}
                 header = response.headers.get("retry-after")
                 try:
