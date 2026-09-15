@@ -8,6 +8,7 @@ create table public.conversations (
   display_name text,
   external_contact_id text not null,
   channel text default 'instagram' check (channel in ('instagram', 'whatsapp')),
+  messaging_provider text not null default 'meta_instagram',
   status text default 'nouveau',
   agent_active boolean default true,
   automation_mode text default 'supervised' check (automation_mode in ('auto', 'supervised', 'disabled')),

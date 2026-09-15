@@ -7435,13 +7435,16 @@ async def reconcile_follow_up_conversation(conversation_id: str, user_id: str) -
             if not stage["enabled"] or stage["stage_index"] <= previous_index:
                 continue
             due_at, scheduled_at = schedule_stage(anchor_at, stage, settings)
-            key = f"{conversation_id}:{anchor_at.isoformat()}:{stage['stage']}:{settings['follow_up_config_version']}"
+            effective_mode = ("auto" if stage["mode"] == "auto" and
+                conversation.get("automation_mode") == "auto" else "manual")
+            key = (f"{conversation_id}:{anchor_at.isoformat()}:{stage['stage']}:"
+                f"{settings['follow_up_config_version']}:{effective_mode}")
             desired.add(key)
             inserts.append({
                 "user_id": user_id, "conversation_id": conversation_id,
                 "stage": stage["stage"], "stage_index": stage["stage_index"],
                 "anchor_at": anchor_at.isoformat(), "due_at": due_at.isoformat(),
-                "scheduled_at": scheduled_at.isoformat(), "mode": stage["mode"],
+                "scheduled_at": scheduled_at.isoformat(), "mode": effective_mode,
                 "status": "scheduled", "config_version": settings["follow_up_config_version"],
                 "idempotency_key": key,
             })

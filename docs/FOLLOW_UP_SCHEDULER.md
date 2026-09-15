@@ -20,6 +20,10 @@ changes a delay, mode, opening time, or timezone, the settings trigger increment
 `follow_up_config_version` and enqueues the tenant's active conversations. Old
 unsent jobs are cancelled and new jobs receive a new versioned idempotency key.
 The worker also checks the version and latest inbound timestamp before sending.
+An auto tenant stage on a supervised conversation creates a manual job. The
+effective mode is part of the idempotency key, so a supervised-to-auto switch
+cancels the old job and creates a new auto job without promising an automatic
+send while supervision is active.
 
 The Railway backend starts the worker in FastAPI lifespan. It polls every 60
 seconds by default. An indexed due-job query and `FOR UPDATE SKIP LOCKED` claim
@@ -136,6 +140,8 @@ add the empty tables needed by Training Center and `prompt-versions`; all
 public test tables have RLS enabled and service-role grants. A synthetic Auth
 user was made login-capable with a non-deliverable `.invalid` email address
 and a test-only password that is not committed. All conversations are synthetic.
+The test-only `messaging_provider` support migration routes synthetic auto
+jobs to the Meta adapter, whose outbound switch is disabled on this service.
 The live project's key must never be used here.
 
 With the isolated credential configured, the cloud follow-up worker processed

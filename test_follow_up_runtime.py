@@ -191,6 +191,42 @@ def test_config_change_recalculates_future_job_and_cancels_previous_version(monk
     assert inserted[0]["config_version"] == 2
 
 
+def test_supervised_conversation_uses_manual_job_then_recalculates_on_auto_switch(monkeypatch):
+    conv = conversation(automation_mode="supervised")
+    patch, send = setup(monkeypatch, conv=conv)
+    existing = []
+    inserted = []
+
+    class Response:
+        def __init__(self, data=None): self.data = data or []
+        def raise_for_status(self): pass
+        def json(self): return self.data
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        async def get(self, *args, **kwargs): return Response(existing)
+        async def post(self, *args, **kwargs):
+            inserted.extend(kwargs["json"])
+            return Response()
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    asyncio.run(main.reconcile_follow_up_conversation("conversation-1", "tenant-1"))
+    assert len(inserted) == 1
+    assert inserted[0]["mode"] == "manual"
+    send.assert_not_awaited()
+
+    existing.append({"id": "manual-job", "status": "scheduled",
+        "idempotency_key": inserted[0]["idempotency_key"]})
+    conv["automation_mode"] = "auto"
+    asyncio.run(main.reconcile_follow_up_conversation("conversation-1", "tenant-1"))
+    assert patch.await_args.args[0] == "manual-job"
+    assert patch.await_args.args[1]["status"] == "cancelled"
+    assert len(inserted) == 2
+    assert inserted[1]["mode"] == "auto"
+    assert inserted[1]["idempotency_key"] != inserted[0]["idempotency_key"]
+
+
 def test_prospect_reply_reconciliation_cancels_unsent_job(monkeypatch):
     reply_at = ANCHOR + timedelta(hours=2)
     patch, send = setup(monkeypatch, conv=conversation(last_inbound_at=reply_at.isoformat(),
