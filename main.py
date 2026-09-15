@@ -7618,6 +7618,7 @@ async def process_due_follow_up_jobs() -> int:
 
 async def follow_up_worker() -> None:
     """Cloud backend worker; the dashboard is never used as a scheduler."""
+    print(f"[follow-up] worker_started poll_seconds={FOLLOW_UP_POLL_SECONDS}", flush=True)
     while True:
         try:
             await process_follow_up_refresh_queue()
