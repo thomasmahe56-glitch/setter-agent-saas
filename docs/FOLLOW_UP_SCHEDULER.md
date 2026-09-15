@@ -97,6 +97,13 @@ Read-only Railway inspection found that the connected `Angellos` project has
 only a `production` environment, sourced from `main`, and no Railway cron
 schedule. Its current deployment logs still show dashboard calls to
 `/follow-ups/due` with browser-provided delay query parameters.
+The production service `setter-agent-saas` is still on a successful deployment
+from 2026-09-13. Its Railway configuration specifies one replica in `us-west2`
+and has no `BACKEND_WORKERS_ENABLED` or `SCHEDULED_REPLY_WORKER_ENABLED`
+override; after the new backend is deployed, both workers use their default
+enabled state. `SUPABASE_URL` and `SUPABASE_KEY` variable names are present,
+but Railway's connected OAuth view withholds their values. The isolated test
+credential must not replace either production variable.
 
 An isolated Railway project, `angellos-follow-up-test`
 (`85d9ac6d-558c-40a4-b0e9-5fcf4d2a8ebb`), was subsequently created with
