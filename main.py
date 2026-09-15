@@ -9,6 +9,7 @@ except ImportError:  # Installed in production through requirements.txt.
     OpenAI = None
 from dotenv import load_dotenv
 from config import DEFAULT_ANTHROPIC_SETTER_MODEL, DEFAULT_OPENAI_SETTER_MODEL, load_config
+from commercial_catalog import build_public_catalog
 from prompts import build_system_prompt, build_analysis_prompt, build_follow_up_prompt, build_conversation_review_prompt
 from collections import Counter
 from contextlib import asynccontextmanager, suppress
@@ -88,6 +89,8 @@ SUPABASE_BETA_ACCOUNT_SETTINGS_URL = f"{config.supabase_url}/beta_account_settin
 SUPABASE_USAGE_LEDGER_URL = f"{config.supabase_url}/usage_ledger"
 SUPABASE_CREDIT_RULES_URL = f"{config.supabase_url}/credit_rules"
 SUPABASE_CREDIT_TRANSACTIONS_URL = f"{config.supabase_url}/credit_transactions"
+SUPABASE_COMMERCIAL_CATALOG_STATE_URL = f"{config.supabase_url}/commercial_catalog_state"
+SUPABASE_COMMERCIAL_PLAN_VERSIONS_URL = f"{config.supabase_url}/commercial_plan_versions"
 SUPABASE_PROSPECTS_URL = f"{config.supabase_url}/prospects"
 SUPABASE_PROCESSED_INBOUND_EVENTS_URL = f"{config.supabase_url}/processed_inbound_events"
 SUPABASE_MESSAGING_CONNECTIONS_URL = f"{config.supabase_url}/messaging_connections"
@@ -6107,6 +6110,53 @@ async def auth_me(
         "owner_user_id_configured": bool(config.owner_user_id),
         "matches_owner_user_id": (not config.owner_user_id) or hmac.compare_digest(user_id, config.owner_user_id),
     }
+
+
+@app.get("/commercial/catalog")
+async def commercial_catalog() -> dict[str, Any]:
+    """Serve only the validated aggregate catalog to the marketing site.
+
+    A missing or malformed configuration is an intentional, non-convertible
+    private-beta response. No customer, payment, reservation or trial data is
+    selected by this route.
+    """
+    if not SUPABASE_SERVICE_KEY or not config.supabase_url:
+        return build_public_catalog([], [], conversion_enabled=False)
+    try:
+        async with httpx.AsyncClient() as http:
+            state_response = await http.get(
+                SUPABASE_COMMERCIAL_CATALOG_STATE_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params={
+                    "select": "version,phase,founding_availability,conversion_ready",
+                    "limit": "2",
+                },
+                timeout=5.0,
+            )
+            plans_response = await http.get(
+                SUPABASE_COMMERCIAL_PLAN_VERSIONS_URL,
+                headers={**supabase_headers(), "Accept": "application/json"},
+                params={
+                    "select": "offer_id,price_usd,monthly_credits,modules,active",
+                    "active": "eq.true",
+                },
+                timeout=5.0,
+            )
+        if state_response.status_code >= 400 or plans_response.status_code >= 400:
+            raise HTTPException(status_code=503, detail="Commercial catalog service unavailable")
+        state_rows = state_response.json()
+        plan_rows = plans_response.json()
+        if not isinstance(state_rows, list) or not isinstance(plan_rows, list):
+            raise HTTPException(status_code=503, detail="Commercial catalog service unavailable")
+        return build_public_catalog(
+            state_rows,
+            plan_rows,
+            conversion_enabled=config.commercial_conversion_enabled,
+        )
+    except HTTPException:
+        raise
+    except (httpx.HTTPError, ValueError, TypeError):
+        raise HTTPException(status_code=503, detail="Commercial catalog service unavailable")
 
 
 @app.get("/simulator/scenarios")
