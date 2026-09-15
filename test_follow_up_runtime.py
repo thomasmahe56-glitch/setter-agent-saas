@@ -209,6 +209,27 @@ def test_worker_loop_is_server_side_and_independent_of_dashboard(monkeypatch):
     due.assert_awaited_once()
 
 
+def test_test_service_can_run_follow_up_without_scheduled_reply_worker(monkeypatch):
+    monkeypatch.setenv("BACKEND_WORKERS_ENABLED", "true")
+    monkeypatch.setenv("SCHEDULED_REPLY_WORKER_ENABLED", "false")
+    follow_up_started = asyncio.Event()
+    scheduled_reply = AsyncMock()
+
+    async def held_follow_up():
+        follow_up_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main, "scheduled_reply_worker", scheduled_reply)
+    monkeypatch.setattr(main, "follow_up_worker", held_follow_up)
+
+    async def check():
+        async with main.app_lifespan(main.app):
+            await asyncio.wait_for(follow_up_started.wait(), timeout=1)
+            scheduled_reply.assert_not_awaited()
+
+    asyncio.run(check())
+
+
 def test_persisted_claim_is_processed_once_after_worker_reinstantiation(monkeypatch):
     stored = job(status="scheduled")  # The row remains in the fake database, not in a browser or worker instance.
     execute = AsyncMock(return_value="sent")

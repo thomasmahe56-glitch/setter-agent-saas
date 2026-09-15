@@ -121,6 +121,14 @@ is manual, so it cannot send a provider message. A new project's own secret
 key must be configured on the isolated Railway service before cloud worker
 verification. The live project's key must never be used there.
 
+With the isolated credential configured, the cloud follow-up worker processed
+the one synthetic queue item and created one scheduled manual job. The same
+container's unrelated scheduled-reply worker logged HTTP errors because this
+test-only database intentionally lacks its tables. Set
+`SCHEDULED_REPLY_WORKER_ENABLED=false` on the isolated Railway service; the
+backend now supports this switch while retaining its default enabled state
+for existing installations.
+
 Database checks on the isolated project confirmed that the conversation insert
 queued one refresh item, a service-role RPC claimed one fictional due job, a
 second claim returned zero, and rollback left zero persistent jobs. The

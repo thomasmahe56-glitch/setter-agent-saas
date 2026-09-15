@@ -385,17 +385,20 @@ async def app_lifespan(_: FastAPI):
         print("[workers] disabled by BACKEND_WORKERS_ENABLED", flush=True)
         yield
         return
-    scheduled_reply_task = asyncio.create_task(scheduled_reply_worker())
-    follow_up_task = asyncio.create_task(follow_up_worker())
+    tasks = []
+    if os.environ.get("SCHEDULED_REPLY_WORKER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}:
+        tasks.append(asyncio.create_task(scheduled_reply_worker()))
+    else:
+        print("[scheduled-reply] worker disabled by SCHEDULED_REPLY_WORKER_ENABLED", flush=True)
+    tasks.append(asyncio.create_task(follow_up_worker()))
     try:
         yield
     finally:
-        scheduled_reply_task.cancel()
-        follow_up_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await scheduled_reply_task
-        with suppress(asyncio.CancelledError):
-            await follow_up_task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 app = FastAPI(
