@@ -76,3 +76,16 @@ only a `production` environment, sourced from `main`, and no Railway cron
 schedule. Its current deployment logs still show dashboard calls to
 `/follow-ups/due` with browser-provided delay query parameters. There is no
 isolated Railway test environment available for the new backend yet.
+
+An isolated Railway project, `angellos-follow-up-test`
+(`85d9ac6d-558c-40a4-b0e9-5fcf4d2a8ebb`), was subsequently created with
+service `setter-agent-follow-up-test` sourced only from this branch. Its
+environment is named `production` by Railway default but is a separate project
+from the live `Angellos` project. The service is configured with `/health`,
+restart-always, app sleeping disabled, and Meta sending disabled. The cloud
+container deployed successfully and logs show `[follow-up] worker_started`.
+Its `SUPABASE_KEY` is intentionally a nonfunctional placeholder, so the worker
+currently logs an authorization failure and cannot process the 92 queued
+conversations. The test database still contains zero jobs and zero enabled
+stages. A test-project service-role credential must be configured securely
+before end-to-end processing can be checked.
