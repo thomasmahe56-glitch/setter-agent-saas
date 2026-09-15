@@ -7401,6 +7401,18 @@ async def patch_follow_up_job(job_id: str, values: dict, *, expected_status: str
         return bool(response.json())
 
 
+def next_enabled_follow_up_stage(last_agent_message: dict, settings: dict) -> dict | None:
+    previous_index = 0
+    prior_stage = str(last_agent_message.get("follow_up_stage") or "")
+    if prior_stage.startswith("follow_up_"):
+        try:
+            previous_index = int(prior_stage.rsplit("_", 1)[1])
+        except ValueError:
+            pass
+    return next((stage for stage in normalize_stages(settings["follow_up_config"])
+                 if stage["enabled"] and stage["stage_index"] > previous_index), None)
+
+
 async def reconcile_follow_up_conversation(conversation_id: str, user_id: str) -> None:
     conversation = await get_conversation_by_id(conversation_id, user_id)
     if not conversation:
@@ -7430,16 +7442,8 @@ async def reconcile_follow_up_conversation(conversation_id: str, user_id: str) -
     inserts = []
     if active:
         anchor_at, last_agent_message = latest_agent
-        previous_index = 0
-        prior_stage = str(last_agent_message.get("follow_up_stage") or "")
-        if prior_stage.startswith("follow_up_"):
-            try:
-                previous_index = int(prior_stage.rsplit("_", 1)[1])
-            except ValueError:
-                pass
-        for stage in normalize_stages(settings["follow_up_config"]):
-            if not stage["enabled"] or stage["stage_index"] <= previous_index:
-                continue
+        stage = next_enabled_follow_up_stage(last_agent_message, settings)
+        if stage:
             due_at, scheduled_at = schedule_stage(anchor_at, stage, settings)
             effective_mode = ("auto" if stage["mode"] == "auto" and
                 conversation.get("automation_mode") == "auto" else "manual")
@@ -7559,6 +7563,15 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
         return "cancelled"
     history = conversation.get("history") or []
     anchor = parse_iso(job["anchor_at"])
+    sent_agents = [(get_message_time(m), m) for m in history if m.get("role") == "assistant" and
+                   m.get("sent") is not False and not m.get("ignored") and get_message_time(m)]
+    latest_agent = max(sent_agents, key=lambda item: item[0]) if sent_agents else None
+    next_stage = next_enabled_follow_up_stage(latest_agent[1], settings) if latest_agent else None
+    if not next_stage or next_stage["stage"] != job["stage"]:
+        await patch_follow_up_job(job["id"], {"status": "cancelled", "cancelled_at": now_iso(),
+            "last_error": "Earlier follow-up stage is unresolved or this stage is superseded"},
+            expected_status="processing")
+        return "cancelled"
     inbound_at = parse_iso(conversation.get("last_inbound_at"))
     newer_user = (bool(inbound_at and inbound_at > anchor) or
         any(m.get("role") == "user" and get_message_time(m) and get_message_time(m) > anchor

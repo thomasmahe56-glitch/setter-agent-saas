@@ -264,6 +264,76 @@ def test_config_change_recalculates_future_job_and_cancels_previous_version(monk
     assert inserted[0]["config_version"] == 2
 
 
+@pytest.mark.parametrize("first_mode", ["auto", "manual"])
+def test_only_next_enabled_stage_is_planned_even_when_later_delay_is_shorter(monkeypatch, first_mode):
+    config = settings(follow_up_config=[
+        {"enabled": True, "delay_value": 12, "delay_unit": "hours", "mode": first_mode},
+        {"enabled": True, "delay_value": 7, "delay_unit": "hours", "mode": "auto"},
+    ])
+    patch, send = setup(monkeypatch, config=config)
+    inserted = []
+
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return []
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        async def get(self, *args, **kwargs): return Response()
+        async def post(self, *args, **kwargs):
+            inserted.extend(kwargs["json"])
+            return Response()
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    asyncio.run(main.reconcile_follow_up_conversation("conversation-1", "tenant-1"))
+    assert len(inserted) == 1
+    assert inserted[0]["stage"] == "follow_up_1"
+    assert inserted[0]["mode"] == first_mode
+    assert inserted[0]["due_at"] == (ANCHOR + timedelta(hours=12)).isoformat()
+    send.assert_not_awaited()
+
+    # A higher-stage job created by an older backend version is rejected even
+    # if it has already been atomically claimed before reconciliation.
+    old_stage_two = job(stage="follow_up_2", due_at=NOW.isoformat(), scheduled_at=NOW.isoformat())
+    assert asyncio.run(main.execute_follow_up_job(old_stage_two, now=NOW)) == "cancelled"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["status"] == "cancelled"
+
+
+def test_sent_first_stage_advances_planning_to_second_stage(monkeypatch):
+    config = settings(follow_up_config=[
+        {"enabled": True, "delay_value": 12, "delay_unit": "hours", "mode": "auto"},
+        {"enabled": True, "delay_value": 7, "delay_unit": "hours", "mode": "auto"},
+    ])
+    conv = conversation(history=[
+        {"role": "assistant", "timestamp": (ANCHOR - timedelta(hours=12)).isoformat(), "sent": True},
+        {"role": "assistant", "timestamp": ANCHOR.isoformat(), "sent": True,
+         "follow_up_stage": "follow_up_1"},
+    ])
+    _, send = setup(monkeypatch, conv=conv, config=config)
+    inserted = []
+
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return []
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        async def get(self, *args, **kwargs): return Response()
+        async def post(self, *args, **kwargs):
+            inserted.extend(kwargs["json"])
+            return Response()
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    asyncio.run(main.reconcile_follow_up_conversation("conversation-1", "tenant-1"))
+    assert len(inserted) == 1
+    assert inserted[0]["stage"] == "follow_up_2"
+    assert inserted[0]["due_at"] == (ANCHOR + timedelta(hours=7)).isoformat()
+    send.assert_not_awaited()
+
+
 def test_supervised_conversation_uses_manual_job_then_recalculates_on_auto_switch(monkeypatch):
     conv = conversation(automation_mode="supervised")
     patch, send = setup(monkeypatch, conv=conv)

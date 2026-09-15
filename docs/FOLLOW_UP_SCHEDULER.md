@@ -6,6 +6,12 @@ The backend owns the follow-up rules. The Training Center writes `follow_up_conf
 Legacy settings without an explicit `enabled: true` are treated as disabled.
 New default stages are disabled until the tenant explicitly enables them.
 This prevents the migration/backfill from silently starting outreach.
+Stages are sequential: only the next enabled stage after the latest sent
+assistant message is scheduled. A successful worker send records its
+`follow_up_stage` in conversation history, which advances planning to the next
+stage. A manual or ambiguous stage does not trigger an automatic later stage.
+The worker also rejects higher-stage jobs left by an older backend version,
+even if they have already been claimed.
 
 Each sent assistant message or inbound prospect message changes `conversations`.
 A database trigger enqueues only that conversation in `follow_up_refresh_queue`.
