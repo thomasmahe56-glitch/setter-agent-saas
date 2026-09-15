@@ -7821,8 +7821,10 @@ async def follow_up_worker() -> None:
     print(f"[follow-up] worker_started poll_seconds={FOLLOW_UP_POLL_SECONDS}", flush=True)
     while True:
         try:
-            await process_follow_up_refresh_queue()
-            await process_due_follow_up_jobs()
+            refreshed = await process_follow_up_refresh_queue()
+            claimed = await process_due_follow_up_jobs()
+            if refreshed or claimed:
+                print(f"[follow-up] worker_cycle refreshed={refreshed} claimed={claimed}", flush=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
