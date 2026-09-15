@@ -390,3 +390,13 @@ with no `/follow-ups/due` request in that observation window. Direct reads of
 the isolated Supabase database showed one scheduled job, one `manual_required`
 job, 13 cancelled jobs, and an empty refresh queue. Browser console errors
 were empty. This correlates the UI with the new endpoint and persisted data.
+
+After the `c216ad7` backend draft redeployed to the separate Railway test
+project, a server-side insert enqueued the existing synthetic conversation
+`00000000-0000-4000-8000-000000000002` at 14:23:12 UTC. The Railway runtime
+log for deployment `134c7ea3-4a83-4372-9e42-aedc470e33b7` recorded
+`[follow-up] worker_cycle refreshed=1 claimed=0` at 14:24:04 UTC, and a direct
+Supabase query found the refresh queue empty afterward. The scheduled/manual
+job counts were unchanged. This attributes that refresh to the cloud worker;
+no dashboard scheduling request or Meta send was involved. Productive worker
+cycles are now logged without tenant or conversation identifiers.
