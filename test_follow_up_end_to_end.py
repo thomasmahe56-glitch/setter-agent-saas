@@ -17,6 +17,8 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
     conversation_id = "conversation-test"
     conversation = {
         "id": conversation_id, "user_id": tenant, "channel": "instagram",
+        "messaging_provider": main.META_PROVIDER,
+        "messaging_connection_id": "connection-test", "external_contact_id": "recipient-test",
         "automation_mode": "auto", "agent_active": True,
         "human_takeover": False, "contact_status": "active", "status": "en_cours",
         "last_inbound_at": inbound.isoformat(),
@@ -53,6 +55,10 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
             raise AssertionError(f"Unexpected GET: {url}")
 
         async def post(self, url, *, json, **kwargs):
+            if url.endswith("append_sent_follow_up_history"):
+                if not any(m.get("follow_up_job_id") == json["p_job_id"] for m in conversation["history"]):
+                    conversation["history"].append(json["p_message"])
+                return Response(True)
             if url.endswith("release_stale_follow_up_refresh_claims") or url.endswith("reconcile_stale_follow_up_processing"):
                 return Response(0)
             if url.endswith("claim_due_follow_up_jobs"):

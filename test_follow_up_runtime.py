@@ -27,6 +27,8 @@ def job(**changes):
 def conversation(**changes):
     result = {
         "id": "conversation-1", "user_id": "tenant-1", "channel": "instagram",
+        "messaging_provider": main.META_PROVIDER,
+        "messaging_connection_id": "connection-1", "external_contact_id": "meta-recipient-1",
         "agent_active": True, "automation_mode": "auto", "human_takeover": False,
         "contact_status": "active", "last_inbound_at": (ANCHOR - timedelta(hours=1)).isoformat(),
         "history": [{"role": "assistant", "content": "Hello", "timestamp": ANCHOR.isoformat(), "sent": True}],
@@ -141,6 +143,24 @@ def test_prospect_reply_cancels_old_job_before_send(monkeypatch):
     assert patch.await_args.args[1]["status"] == "cancelled"
 
 
+@pytest.mark.parametrize("provider,connection,recipient", [
+    (main.MANYCHAT_PROVIDER, "connection-1", "old-subscriber"),
+    (main.META_PROVIDER, None, "meta-recipient-1"),
+    (main.META_PROVIDER, "connection-1", None),
+])
+def test_instagram_job_without_meta_delivery_identity_requires_manual_action(
+    monkeypatch, provider, connection, recipient,
+):
+    patch, send = setup(monkeypatch, conv=conversation(
+        messaging_provider=provider, messaging_connection_id=connection,
+        external_contact_id=recipient,
+    ))
+    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "manual_required"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["status"] == "manual_required"
+    assert "Meta" in patch.await_args.args[1]["last_error"]
+
+
 def test_newer_assistant_message_cancels_superseded_job(monkeypatch):
     latest = ANCHOR + timedelta(hours=2)
     patch, send = setup(monkeypatch, conv=conversation(history=[
@@ -172,13 +192,13 @@ def test_due_job_sends_once_and_records_successful_delivery(monkeypatch, attempt
 
     class Response:
         def raise_for_status(self): pass
-        def json(self): return [{"id": "conversation-1"}]
+        def json(self): return True
 
     class Client:
         async def __aenter__(self): return self
         async def __aexit__(self, *args): return False
-        async def patch(self, url, *, json, **kwargs):
-            assert url == main.SUPABASE_CONVERSATIONS_URL
+        async def post(self, url, *, json, **kwargs):
+            assert url.endswith("/append_sent_follow_up_history")
             conversation_updates.append(json)
             return Response()
 
@@ -190,7 +210,7 @@ def test_due_job_sends_once_and_records_successful_delivery(monkeypatch, attempt
     assert patch.await_args.args[1]["status"] == "sent"
     assert patch.await_args.args[1]["sent_at"]
     assert len(conversation_updates) == 1
-    delivered = conversation_updates[0]["history"][-1]
+    delivered = conversation_updates[0]["p_message"]
     assert delivered["follow_up_job_id"] == "job-1"
     assert delivered["content"] == "A short follow-up"
     assert delivered["sent"] is True

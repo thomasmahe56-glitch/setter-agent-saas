@@ -7461,6 +7461,13 @@ async def reconcile_follow_up_conversation(conversation_id: str, user_id: str) -
                 conversation.get("automation_mode") == "auto" else "manual")
             manual_reason = None
             channel = conversation.get("channel") or "instagram"
+            if effective_mode == "auto" and channel == "instagram" and (
+                conversation.get("messaging_provider") != META_PROVIDER or
+                not conversation.get("messaging_connection_id") or
+                not conversation.get("external_contact_id")
+            ):
+                effective_mode = "manual"
+                manual_reason = "Instagram conversation has no usable Meta connection and recipient"
             if effective_mode == "auto" and channel in {"instagram", "whatsapp"}:
                 inbound_at = parse_iso(conversation.get("last_inbound_at"))
                 window_hours = (config.meta_instagram_reply_window_hours
@@ -7604,6 +7611,17 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
             expected_status="processing")
         return "manual_required"
     channel = conversation.get("channel") or "instagram"
+    if channel == "instagram" and conversation.get("messaging_provider") != META_PROVIDER:
+        await patch_follow_up_job(job["id"], {"status": "manual_required",
+            "last_error": "Legacy Instagram conversation has no Meta recipient; reconnect through Instagram before sending"},
+            expected_status="processing")
+        return "manual_required"
+    if channel == "instagram" and (not conversation.get("messaging_connection_id") or
+                                    not conversation.get("external_contact_id")):
+        await patch_follow_up_job(job["id"], {"status": "manual_required",
+            "last_error": "Instagram/Meta connection or recipient is missing"},
+            expected_status="processing")
+        return "manual_required"
     if channel in {"instagram", "whatsapp"}:
         inbound = parse_iso(conversation.get("last_inbound_at"))
         window_hours = config.meta_instagram_reply_window_hours if channel == "instagram" else 24
@@ -7651,7 +7669,11 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
             fresh.get("contact_status") == "opted_out" or
             fresh.get("status") in {"appel_booke", "signe"} or
             fresh.get("automation_mode") != "auto" or
-            (fresh.get("channel") or "instagram") != channel):
+            (fresh.get("channel") or "instagram") != channel or
+            (channel == "instagram" and (
+                fresh.get("messaging_provider") != META_PROVIDER or
+                fresh.get("messaging_connection_id") != conversation.get("messaging_connection_id") or
+                fresh.get("external_contact_id") != conversation.get("external_contact_id")))):
             await patch_follow_up_job(job["id"], {"status": "cancelled", "cancelled_at": now_iso(),
                 "last_error": "Conversation or configuration changed while follow-up was prepared"},
                 expected_status="processing")
@@ -7691,16 +7713,17 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
             "follow_up_stage": job["stage"], "follow_up_mode": "auto", "source": "follow_up_worker",
             "follow_up_job_id": job["id"], "sent": True}
         async with httpx.AsyncClient() as http:
-            update = await http.patch(SUPABASE_CONVERSATIONS_URL,
-                headers={**supabase_headers(), "Prefer": "return=representation"},
-                params={"id": f"eq.{job['conversation_id']}", "user_id": f"eq.{job['user_id']}",
-                        "last_inbound_at": (f"eq.{fresh['last_inbound_at']}" if fresh.get("last_inbound_at") else "is.null"),
-                        "select": "id"},
-                json={"history": (fresh.get("history") or []) + [message], "response": generated.text,
-                      "status": "en_cours"}, timeout=10.0)
+            update = await http.post(f"{SUPABASE_RPC_URL}/append_sent_follow_up_history",
+                headers=supabase_headers(), json={
+                    "p_job_id": job["id"], "p_user_id": job["user_id"],
+                    "p_conversation_id": job["conversation_id"], "p_message": message,
+                    "p_expected_history": fresh.get("history") or [],
+                    "p_expected_inbound_at": fresh.get("last_inbound_at"),
+                    "p_response": generated.text,
+                }, timeout=10.0)
             update.raise_for_status()
-            if not update.json():
-                print(f"[follow-up] sent_but_conversation_changed job={job['id']}", flush=True)
+            if update.json() is not True:
+                print(f"[follow-up] sent_but_history_not_appended job={job['id']}", flush=True)
         print(f"[follow-up] sent job={job['id']} stage={job['stage']}", flush=True)
         return "sent"
     except Exception as exc:

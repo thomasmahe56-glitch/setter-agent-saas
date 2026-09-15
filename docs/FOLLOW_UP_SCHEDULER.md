@@ -29,6 +29,10 @@ The worker also checks the version and conversation state before sending. After
 AI generation, it re-reads the latest history, inbound timestamp, tenant version,
 takeover/opt-out flags, channel, Meta window, and opening hours before calling
 the provider. A reply recorded only in history still cancels the prepared job.
+Instagram follow-ups require `messaging_provider = meta_instagram`, a Meta
+connection ID, and a Meta-scoped recipient ID. Legacy ManyChat conversations
+become visible manual jobs; the worker does not send historical subscriber IDs.
+A changed provider or recipient during AI generation cancels the prepared send.
 An auto tenant stage on a supervised conversation creates a manual job. The
 effective mode is part of the idempotency key, so a supervised-to-auto switch
 cancels the old job and creates a new auto job without promising an automatic
@@ -38,7 +42,7 @@ The Railway backend starts the worker in FastAPI lifespan. It polls every 60
 seconds by default. An indexed due-job query and `FOR UPDATE SKIP LOCKED` claim
 prevent two workers from receiving the same job. No frontend endpoint, browser,
 or local computer is part of the processing path. A timeout or crash after an
-external attempt is ambiguous because Meta/ManyChat do not accept an idempotency
+external attempt is ambiguous because the Meta adapter does not accept an idempotency
 key in the current provider adapters. Such a job becomes `manual_required` and
 is never retried automatically. This guarantees at-most-once automatic attempts;
 an operator must reconcile ambiguous provider outcomes before a manual action.
@@ -70,13 +74,20 @@ response so the job becomes `sent` instead of an ambiguous retry.
 The ManyChat adapter also rejects a JSON body declaring `status: error` (or an
 `error` object) even if a gateway returned HTTP 200. Such a response does not
 increment sent usage or mark the job `sent`; code 3011 requires manual action.
+This is legacy compatibility, not the active Instagram sending path.
+After Meta accepts a follow-up, the worker calls the service-role-only
+`append_sent_follow_up_history` RPC. It appends the sent message once by job ID,
+even if a prospect replied between delivery and history persistence. It updates
+the conversation's latest `response` and `status` only when history and the
+inbound timestamp still match the pre-send snapshot.
 
 ## Rollout
 
 1. On the isolated Supabase project, apply
    `migrations/test_only_follow_up_baseline.sql` and
    `migrations/add_persistent_follow_up_jobs.sql`, followed by
-   `migrations/add_follow_up_preparation_retry.sql`. Confirm grants, RLS,
+   `migrations/add_follow_up_preparation_retry.sql` and
+   `migrations/append_sent_follow_up_history.sql`. Confirm grants, RLS,
    triggers, PostgREST schema cache, and RPC functions using test queries.
 2. Deploy the backend branch to the isolated Railway project and point a local
    dashboard at that service and the isolated Supabase database. Keep Railway
@@ -90,6 +101,7 @@ increment sent usage or mark the job `sent`; code 3011 requires manual action.
    do not contact a real prospect.
 4. Review the test evidence with Thomas. The persistent-jobs migration is
    already present on the live database; apply the additive preparation-retry
+   and atomic-history migrations
    migration and deploy the backend before dashboard
    to production only after approval. The old dashboard still calls
    `/follow-ups/due` with browser-supplied delays. During the short interval
