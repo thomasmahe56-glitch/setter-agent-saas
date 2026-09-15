@@ -128,6 +128,7 @@ DEFAULT_BETA_ACCOUNT_SETTINGS = {
     "allowed_send_start": "08:00",
     "allowed_send_end": "22:00",
     "timezone": "Europe/Paris",
+    "active_messaging_provider": META_PROVIDER,
     "follow_up_config_version": 1,
     "min_auto_delay_seconds": 0,
     "random_auto_delay_seconds": 0,
@@ -569,6 +570,7 @@ def normalize_beta_account_settings(row: Optional[dict] = None, profile: Optiona
         except (KeyError, ValueError):
             pass
     settings["follow_up_config_version"] = int(row.get("follow_up_config_version") or 1)
+    settings["active_messaging_provider"] = row.get("active_messaging_provider") or META_PROVIDER
 
     for key in ("min_auto_delay_seconds", "random_auto_delay_seconds"):
         value = row.get(key, profile.get(f"beta_{key}"))
@@ -7456,6 +7458,7 @@ async def reconcile_follow_up_conversation(conversation_id: str, user_id: str) -
     latest_agent = max(agents, key=lambda item: item[0]) if agents else None
     active = (conversation.get("agent_active") and not conversation.get("human_takeover") and
               conversation.get("contact_status") != "opted_out" and
+              not conversation.get("opted_out_at") and
               conversation.get("automation_mode") != "disabled" and
               conversation.get("status") not in {"appel_booke", "signe"} and latest_agent and
               (not latest_user or latest_agent[0] > latest_user))
@@ -7477,6 +7480,10 @@ async def reconcile_follow_up_conversation(conversation_id: str, user_id: str) -
                 conversation.get("automation_mode") == "auto" else "manual")
             manual_reason = None
             channel = conversation.get("channel") or "instagram"
+            if (effective_mode == "auto" and channel == "instagram" and
+                settings.get("active_messaging_provider", META_PROVIDER) != META_PROVIDER):
+                effective_mode = "manual"
+                manual_reason = "Tenant Instagram/Meta provider is inactive"
             if effective_mode == "auto" and channel == "instagram" and (
                 conversation.get("messaging_provider") != META_PROVIDER or
                 not conversation.get("messaging_connection_id") or
@@ -7625,6 +7632,7 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
         for m in history)
     if (newer_user or not conversation.get("agent_active") or conversation.get("human_takeover") or
         newer_agent or conversation.get("contact_status") == "opted_out" or
+        conversation.get("opted_out_at") or
         conversation.get("status") in {"appel_booke", "signe"} or
         conversation.get("automation_mode") == "disabled"):
         await patch_follow_up_job(job["id"], {"status": "cancelled", "cancelled_at": now_iso(),
@@ -7636,6 +7644,11 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
             expected_status="processing")
         return "manual_required"
     channel = conversation.get("channel") or "instagram"
+    if channel == "instagram" and settings.get("active_messaging_provider", META_PROVIDER) != META_PROVIDER:
+        await patch_follow_up_job(job["id"], {"status": "manual_required",
+            "last_error": "Tenant Instagram/Meta provider is inactive"},
+            expected_status="processing")
+        return "manual_required"
     if channel == "instagram" and conversation.get("messaging_provider") != META_PROVIDER:
         await patch_follow_up_job(job["id"], {"status": "manual_required",
             "last_error": "Legacy Instagram conversation has no Meta recipient; reconnect through Instagram before sending"},
@@ -7691,7 +7704,7 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
         if (not fresh or fresh_settings["follow_up_config_version"] != job["config_version"] or
             parse_iso(fresh.get("last_inbound_at")) != parse_iso(conversation.get("last_inbound_at")) or
             fresh_newer_message or not fresh.get("agent_active") or fresh.get("human_takeover") or
-            fresh.get("contact_status") == "opted_out" or
+            fresh.get("contact_status") == "opted_out" or fresh.get("opted_out_at") or
             fresh.get("status") in {"appel_booke", "signe"} or
             fresh.get("automation_mode") != "auto" or
             (fresh.get("channel") or "instagram") != channel or

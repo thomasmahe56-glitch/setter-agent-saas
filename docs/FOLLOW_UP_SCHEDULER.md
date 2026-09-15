@@ -29,6 +29,11 @@ The worker also checks the version and conversation state before sending. After
 AI generation, it re-reads the latest history, inbound timestamp, tenant version,
 takeover/opt-out flags, channel, Meta window, and opening hours before calling
 the provider. A reply recorded only in history still cancels the prepared job.
+The transport-refresh migration also enqueues a conversation when its provider,
+connection, scoped recipient, or opt-out timestamp changes. A tenant switch of
+`active_messaging_provider` increments the configuration version and enqueues
+its conversations. An inactive tenant Meta provider plans Instagram jobs as
+manual and blocks a claimed auto job before any provider call.
 Instagram follow-ups require `messaging_provider = meta_instagram`, a Meta
 connection ID, and a Meta-scoped recipient ID. Legacy ManyChat conversations
 become visible manual jobs; the worker does not send historical subscriber IDs.
@@ -97,7 +102,8 @@ reconciliation error; an operator must compare the Meta thread with CRM history.
    `migrations/test_only_follow_up_baseline.sql` and
    `migrations/add_persistent_follow_up_jobs.sql`, followed by
    `migrations/add_follow_up_preparation_retry.sql` and
-   `migrations/append_sent_follow_up_history.sql`. Confirm grants, RLS,
+   `migrations/append_sent_follow_up_history.sql`, then
+   `migrations/refresh_follow_up_transport_changes.sql`. Confirm grants, RLS,
    triggers, PostgREST schema cache, and RPC functions using test queries.
 2. Deploy the backend branch to the isolated Railway project and point a local
    dashboard at that service and the isolated Supabase database. Keep Railway
@@ -110,8 +116,9 @@ reconciliation error; an operator must compare the Meta thread with CRM history.
    concurrent claim attempts against the test database. Use provider mocks;
    do not contact a real prospect.
 4. Review the test evidence with Thomas. The persistent-jobs migration is
-   already present on the live database; apply the additive preparation-retry
-   and atomic-history migrations, then deploy the backend before the dashboard
+   already present on the live database; apply the additive preparation-retry,
+   atomic-history, and transport-refresh migrations, then deploy the backend
+   before the dashboard
    to production only after approval. The old dashboard still calls
    `/follow-ups/due` with browser-supplied delays. During the short interval
    before the dashboard deploy, that legacy route returns an empty list rather
@@ -317,3 +324,16 @@ usage. A disposable `manual_required` row with this error was rendered in the
 real local Follow-ups page. The card explained in French that the Instagram
 thread must be checked before another send, browser console errors were zero,
 and the synthetic row was deleted from the isolated database afterward.
+
+The transport-refresh migration was applied only to the isolated test project
+after checking that its three synthetic conversations and project ref differ
+from the live project with 92 conversations. Transactional probes changed a
+synthetic connection ID and the tenant's active provider: the first enqueued
+that conversation, and the second incremented config version and enqueued all
+three tenant conversations. Both probes were rolled back; version 7, active
+Meta provider, and an empty refresh queue were confirmed afterward.
+The worker tests also covered an inactive tenant Meta provider and an
+`opted_out_at` timestamp without a matching contact-status update. A disposable
+inactive-provider job rendered a French connection-repair explanation on the
+real Follow-ups page; browser console errors were empty, and the row was
+deleted from the isolated database afterward.

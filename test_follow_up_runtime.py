@@ -161,6 +161,39 @@ def test_instagram_job_without_meta_delivery_identity_requires_manual_action(
     assert "Meta" in patch.await_args.args[1]["last_error"]
 
 
+def test_inactive_tenant_meta_provider_prevents_auto_follow_up(monkeypatch):
+    patch, send = setup(monkeypatch, config=settings(active_messaging_provider=main.MANYCHAT_PROVIDER))
+    inserted = []
+
+    class Response:
+        def raise_for_status(self): pass
+        def json(self): return []
+
+    class Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        async def get(self, *args, **kwargs): return Response()
+        async def post(self, *args, **kwargs):
+            inserted.extend(kwargs["json"])
+            return Response()
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    asyncio.run(main.reconcile_follow_up_conversation("conversation-1", "tenant-1"))
+    assert len(inserted) == 1
+    assert inserted[0]["mode"] == "manual"
+    assert "provider is inactive" in inserted[0]["last_error"]
+    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "manual_required"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["status"] == "manual_required"
+
+
+def test_opt_out_timestamp_alone_cancels_follow_up(monkeypatch):
+    patch, send = setup(monkeypatch, conv=conversation(opted_out_at=NOW.isoformat()))
+    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "cancelled"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["status"] == "cancelled"
+
+
 def test_newer_assistant_message_cancels_superseded_job(monkeypatch):
     latest = ANCHOR + timedelta(hours=2)
     patch, send = setup(monkeypatch, conv=conversation(history=[
