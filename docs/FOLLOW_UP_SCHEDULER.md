@@ -37,9 +37,10 @@ through `/follow-ups/jobs`.
 
 ## Rollout
 
-1. Apply `migrations/add_persistent_follow_up_jobs.sql` to a **test** Supabase
-   project. Confirm table grants, RLS, trigger creation, PostgREST schema cache,
-   and the RPC functions using test queries.
+1. On the isolated Supabase project, apply
+   `migrations/test_only_follow_up_baseline.sql` and
+   `migrations/add_persistent_follow_up_jobs.sql`. Confirm grants, RLS,
+   triggers, PostgREST schema cache, and RPC functions using test queries.
 2. Deploy both branches to test environments. Keep Railway Serverless disabled
    or otherwise prove the worker stays awake. Confirm the startup worker logs
    and at least one claim from a safe test conversation. Railway's standard
@@ -48,8 +49,9 @@ through `/follow-ups/jobs`.
    prospect reply cancellation, Meta manual state, a backend restart, and two
    concurrent claim attempts against the test database. Use provider mocks;
    do not contact a real prospect.
-4. Review the test evidence with Thomas. Then apply the migration and deploy
-   backend before dashboard to production. Check queue depth, oldest scheduled
+4. Review the test evidence with Thomas. The persistent-jobs migration is
+   already present on the live database; deploy the backend before dashboard
+   to production only after approval. Check queue depth, oldest scheduled
    job, `manual_required` count, logs, and one known-safe tenant. A rollback
    must stop the worker before reverting the application; retain job records
    for reconciliation.
@@ -84,15 +86,14 @@ row, and zero follow-up jobs.
 
 Local automated tests use virtual time and mocked provider/database responses.
 The browser demo uses test fixtures, and the local backend uses a dummy Supabase
-URL. An actually isolated Supabase test database, real Training Center
-save/reload, worker queue processing, and Railway restart behavior remain to
-be verified end to end before deploying the new applications to production.
+URL. Real Training Center save/reload, worker queue processing, and Railway
+restart behavior remain to be verified end to end before deploying the new
+applications to production.
 
 Read-only Railway inspection found that the connected `Angellos` project has
 only a `production` environment, sourced from `main`, and no Railway cron
 schedule. Its current deployment logs still show dashboard calls to
-`/follow-ups/due` with browser-provided delay query parameters. There is no
-isolated Railway test environment available for the new backend yet.
+`/follow-ups/due` with browser-provided delay query parameters.
 
 An isolated Railway project, `angellos-follow-up-test`
 (`85d9ac6d-558c-40a4-b0e9-5fcf4d2a8ebb`), was subsequently created with
@@ -102,10 +103,23 @@ from the live `Angellos` project. The service is configured with `/health`,
 restart-always, app sleeping disabled, and Meta sending disabled. The cloud
 container deployed successfully and logs show `[follow-up] worker_started`.
 Its worker was observed starting in cloud logs. Its `SUPABASE_KEY` is a
-nonfunctional placeholder and `SUPABASE_URL` has been changed to an invalid
-placeholder so this service cannot connect to the live database. Its workers
-are paused until an actually isolated Supabase test database exists. Do not
-replace either placeholder with credentials for `lyrlvipkwzbsojqbposh`.
+nonfunctional placeholder. `SUPABASE_URL` has been staged on the separate
+Railway project to point to `fagjhniuoopsgmbgdurb`; deploys were skipped, so
+the running container retains its previous inert configuration until the next
+deployment. `BACKEND_WORKERS_ENABLED=false` remains set. Do not use credentials
+for `lyrlvipkwzbsojqbposh`.
+
+An isolated Supabase project, `angellos-follow-up-test`
+(`fagjhniuoopsgmbgdurb`, `eu-west-1`), was created on 2026-09-15. It is a
+separate PostgreSQL database on the Free plan. Its scheduler-specific baseline
+and persistent-jobs migrations have been applied. All four public test tables
+have RLS enabled; service-role grants are present. A synthetic Auth row,
+tenant settings row, and conversation were inserted without an email or login
+credential. The conversation trigger placed one item in the refresh queue;
+there are zero jobs until the backend worker processes it. The synthetic stage
+is manual, so it cannot send a provider message. A new project's own secret
+key must be configured on the isolated Railway service before cloud worker
+verification. The live project's key must never be used there.
 
 For `SUPABASE_KEY`, prefer an existing `sb_secret_...` key from a **new,
 isolated test** project; it maps to PostgreSQL `service_role` and is sent only
