@@ -89,7 +89,7 @@ def load_config() -> Config:
         meta_instagram_webhook_enabled=env_bool("META_INSTAGRAM_WEBHOOK_ENABLED", False),
         meta_instagram_send_enabled=env_bool("META_INSTAGRAM_SEND_ENABLED", False),
         meta_instagram_history_sync_enabled=env_bool("META_INSTAGRAM_HISTORY_SYNC_ENABLED", False),
-        meta_instagram_reply_window_hours=max(1, int(os.environ.get("META_INSTAGRAM_REPLY_WINDOW_HOURS", "24"))),
+        meta_instagram_reply_window_hours=min(24, max(1, int(os.environ.get("META_INSTAGRAM_REPLY_WINDOW_HOURS", "24")))),
         graph_api_version=os.environ.get("GRAPH_API_VERSION", "v23.0"),
         business_name=os.environ.get("BUSINESS_NAME", ""),
         coach_name=os.environ.get("COACH_NAME", ""),

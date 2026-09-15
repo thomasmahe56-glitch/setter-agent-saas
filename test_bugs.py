@@ -69,7 +69,6 @@ from main import (
     estimate_token_count,
     estimate_claude_cost_eur,
     enforce_ai_cost_cap,
-    configured_follow_up_stage,
     auto_reply_delay_seconds,
     auto_reply_delivery_time,
     deliver_due_scheduled_reply,
@@ -953,7 +952,7 @@ class TestScheduledAutoReply:
             randbelow=lambda upper: 120,
         )
         assert delay == 180
-        assert send_at.isoformat() == "2026-08-21T08:00:00+00:00"
+        assert send_at.isoformat() == "2026-08-21T06:00:00+00:00"  # 08:00 Europe/Paris
 
     def test_due_reply_is_delivered_and_cleared(self, monkeypatch):
         _PatchCaptureAsyncClient.patches = []
@@ -1628,14 +1627,16 @@ class TestNounesBetaReadinessControls:
         assert settings["allowed_send_end"] == "22:00"
         assert settings["min_auto_delay_seconds"] == 30
         assert settings["random_auto_delay_seconds"] == 90
-        assert [item["stage"] for item in settings["follow_up_config"]] == ["auto_23h", "j2"]
+        assert [item["stage"] for item in settings["follow_up_config"]] == ["follow_up_1", "follow_up_2"]
+        assert [item["delay_value"] for item in settings["follow_up_config"]] == [48, 23]
+        assert all(item["enabled"] is False for item in settings["follow_up_config"])
 
     def test_allowed_send_window_blocks_after_hours_and_returns_next_window(self):
         settings = normalize_beta_account_settings(row={"allowed_send_start": "08:00", "allowed_send_end": "22:00"})
         assert is_within_allowed_send_window(datetime(2026, 8, 20, 9, 0, tzinfo=timezone.utc), settings) is True
         after_hours = datetime(2026, 8, 20, 23, 15, tzinfo=timezone.utc)
         assert is_within_allowed_send_window(after_hours, settings) is False
-        assert next_allowed_send_at(after_hours, settings).isoformat() == "2026-08-21T08:00:00+00:00"
+        assert next_allowed_send_at(after_hours, settings).isoformat() == "2026-08-21T06:00:00+00:00"
 
     def test_configurable_follow_up_stage_uses_account_delays(self):
         settings = normalize_beta_account_settings(row={
@@ -1645,10 +1646,8 @@ class TestNounesBetaReadinessControls:
             ]
         })
 
-        h12 = configured_follow_up_stage(13, settings)
-        j2 = configured_follow_up_stage(49, settings)
-        assert h12 and h12["stage"] == "h12"
-        assert j2 and j2["stage"] == "j2"
+        assert [(stage["stage"], stage["delay_value"], stage["mode"]) for stage in settings["follow_up_config"]] == [
+            ("follow_up_1", 12, "auto"), ("follow_up_2", 48, "manual")]
 
     def test_cost_cap_raises_when_spend_reaches_cap(self):
         async def fake_settings(user_id):

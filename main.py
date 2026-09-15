@@ -65,6 +65,7 @@ from messaging_providers import (
     is_explicit_opt_out,
     parse_meta_instagram_webhook,
 )
+from follow_up_scheduler import normalize_stages, schedule_stage, next_open_at
 
 load_dotenv()
 config = load_config()
@@ -126,13 +127,16 @@ DEFAULT_BETA_ACCOUNT_SETTINGS = {
     "enabled": True,
     "allowed_send_start": "08:00",
     "allowed_send_end": "22:00",
+    "timezone": "Europe/Paris",
+    "active_messaging_provider": META_PROVIDER,
+    "follow_up_config_version": 1,
     "min_auto_delay_seconds": 0,
     "random_auto_delay_seconds": 0,
     "follow_up_config": [
-        {"stage": "auto_23h", "delay_hours": 23, "mode": "auto"},
-        {"stage": "j3", "delay_hours": 72, "mode": "manual"},
-        {"stage": "j10", "delay_hours": 240, "mode": "manual"},
-        {"stage": "j30", "delay_hours": 720, "mode": "manual"},
+        {"stage": "follow_up_1", "enabled": False, "delay_value": 7, "delay_unit": "hours", "mode": "auto"},
+        {"stage": "follow_up_2", "enabled": False, "delay_value": 3, "delay_unit": "days", "mode": "manual"},
+        {"stage": "follow_up_3", "enabled": False, "delay_value": 10, "delay_unit": "days", "mode": "manual"},
+        {"stage": "follow_up_4", "enabled": False, "delay_value": 30, "delay_unit": "days", "mode": "manual"},
     ],
 }
 
@@ -257,7 +261,6 @@ TRAINING_CENTER_START = "<!-- TRAINING_CENTER_START -->"
 TRAINING_CENTER_END = "<!-- TRAINING_CENTER_END -->"
 TRAINING_CENTER_PROMPT_START = "<!-- TRAINING_CENTER_PROMPT_START -->"
 TRAINING_CENTER_PROMPT_END = "<!-- TRAINING_CENTER_PROMPT_END -->"
-AUTO_FOLLOW_UP_HOURS = 23
 MANUAL_FOLLOW_UP_1_HOURS = 72
 MANUAL_FOLLOW_UP_2_HOURS = 240
 MANUAL_FOLLOW_UP_3_HOURS = 720  # j+30 (30 jours)
@@ -378,13 +381,25 @@ expose_api_docs = os.environ.get("EXPOSE_API_DOCS", "false").strip().lower() == 
 
 @asynccontextmanager
 async def app_lifespan(_: FastAPI):
-    scheduled_reply_task = asyncio.create_task(scheduled_reply_worker())
+    workers_enabled = os.environ.get("BACKEND_WORKERS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    if not workers_enabled:
+        print("[workers] disabled by BACKEND_WORKERS_ENABLED", flush=True)
+        yield
+        return
+    tasks = []
+    if os.environ.get("SCHEDULED_REPLY_WORKER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}:
+        tasks.append(asyncio.create_task(scheduled_reply_worker()))
+    else:
+        print("[scheduled-reply] worker disabled by SCHEDULED_REPLY_WORKER_ENABLED", flush=True)
+    tasks.append(asyncio.create_task(follow_up_worker()))
     try:
         yield
     finally:
-        scheduled_reply_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await scheduled_reply_task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 app = FastAPI(
@@ -393,6 +408,11 @@ app = FastAPI(
     openapi_url="/openapi.json" if expose_api_docs else None,
     lifespan=app_lifespan,
 )
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
 
 def cors_allowed_origins() -> list[str]:
     origins = [
@@ -421,11 +441,13 @@ app.add_middleware(RequestBodyLimitMiddleware)
 
 
 def supabase_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    headers = {
         "apikey": SUPABASE_SERVICE_KEY,
         "Content-Type": "application/json",
     }
+    if not SUPABASE_SERVICE_KEY.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {SUPABASE_SERVICE_KEY}"
+    return headers
 
 
 async def require_secret(x_webhook_secret: Optional[str]) -> str:
@@ -539,6 +561,17 @@ def normalize_beta_account_settings(row: Optional[dict] = None, profile: Optiona
         if isinstance(value, str) and re.match(r"^\d{2}:\d{2}$", value.strip()):
             settings[key] = value.strip()
 
+    tz_name = row.get("timezone") or profile.get("beta_timezone")
+    if isinstance(tz_name, str):
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(tz_name)
+            settings["timezone"] = tz_name
+        except (KeyError, ValueError):
+            pass
+    settings["follow_up_config_version"] = int(row.get("follow_up_config_version") or 1)
+    settings["active_messaging_provider"] = row.get("active_messaging_provider") or META_PROVIDER
+
     for key in ("min_auto_delay_seconds", "random_auto_delay_seconds"):
         value = row.get(key, profile.get(f"beta_{key}"))
         if value is not None:
@@ -546,26 +579,10 @@ def normalize_beta_account_settings(row: Optional[dict] = None, profile: Optiona
 
     follow_up_config = row.get("follow_up_config") or profile.get("beta_follow_up_config")
     if isinstance(follow_up_config, list):
-        normalized = []
-        for index, item in enumerate(follow_up_config[:8]):
-            if not isinstance(item, dict):
-                continue
-            stage = str(item.get("stage") or f"custom_{index + 1}").strip()[:40]
-            mode = str(item.get("mode") or "manual").strip().lower()
-            if mode not in {"auto", "manual", "assisted"}:
-                mode = "manual"
-            try:
-                raw_delay = item.get("delay_hours")
-                if raw_delay is None:
-                    continue
-                delay_hours = float(raw_delay)
-            except (TypeError, ValueError):
-                continue
-            if stage and delay_hours >= 0:
-                normalized.append({"stage": stage, "delay_hours": delay_hours, "mode": "manual" if mode == "assisted" else mode})
-        if normalized:
-            normalized.sort(key=lambda item: item["delay_hours"])
-            settings["follow_up_config"] = normalized
+        try:
+            settings["follow_up_config"] = normalize_stages(follow_up_config)
+        except ValueError:
+            print("[follow-up] invalid_config_using_defaults", flush=True)
 
     return settings
 
@@ -2164,27 +2181,19 @@ def _minutes_since_midnight(value: datetime) -> int:
 
 
 def is_within_allowed_send_window(now: datetime, settings: dict) -> bool:
-    start_h, start_m = parse_hhmm(settings.get("allowed_send_start", "08:00"), "08:00")
-    end_h, end_m = parse_hhmm(settings.get("allowed_send_end", "22:00"), "22:00")
-    start = start_h * 60 + start_m
-    end = end_h * 60 + end_m
-    current = _minutes_since_midnight(now.astimezone(timezone.utc))
-    if start == end:
-        return True
-    if start < end:
-        return start <= current < end
-    return current >= start or current < end
+    return next_open_at(
+        now, settings.get("allowed_send_start", "08:00"),
+        settings.get("allowed_send_end", "22:00"),
+        settings.get("timezone", "Europe/Paris"),
+    ) == now.astimezone(timezone.utc)
 
 
 def next_allowed_send_at(now: datetime, settings: dict) -> datetime:
-    now = now.astimezone(timezone.utc)
-    if is_within_allowed_send_window(now, settings):
-        return now
-    start_h, start_m = parse_hhmm(settings.get("allowed_send_start", "08:00"), "08:00")
-    candidate = now.replace(hour=start_h, minute=start_m, second=0, microsecond=0)
-    if candidate <= now:
-        candidate += timedelta(days=1)
-    return candidate
+    return next_open_at(
+        now, settings.get("allowed_send_start", "08:00"),
+        settings.get("allowed_send_end", "22:00"),
+        settings.get("timezone", "Europe/Paris"),
+    )
 
 
 def auto_reply_delay_seconds(settings: dict, randbelow=secrets.randbelow) -> int:
@@ -2201,22 +2210,6 @@ def auto_reply_delivery_time(now: datetime, settings: dict, randbelow=secrets.ra
     return next_allowed_send_at(delayed_time, settings), delay_seconds
 
 
-def configured_follow_up_stage(hours_since_user: float, settings: dict) -> Optional[dict]:
-    config = settings.get("follow_up_config") or DEFAULT_BETA_ACCOUNT_SETTINGS["follow_up_config"]
-    stages = [item for item in config if isinstance(item, dict) and item.get("stage")]
-    stages.sort(key=lambda item: float(item.get("delay_hours") or 0))
-    for index, item in enumerate(stages):
-        delay = float(item.get("delay_hours") or 0)
-        next_delay = float(stages[index + 1].get("delay_hours") or 10**9) if index + 1 < len(stages) else 10**9
-        if delay <= hours_since_user < next_delay:
-            stage = str(item["stage"])
-            return {
-                "stage": stage,
-                "label": stage.replace("_", " ").upper() if stage != "auto_23h" else "Auto 23 h",
-                "mode": "auto" if item.get("mode") == "auto" else "manual",
-                "sort": index + 1,
-            }
-    return None
 
 
 def strip_message_metadata(messages: list) -> list:
@@ -2411,147 +2404,14 @@ def get_message_time(message: dict) -> Optional[datetime]:
     return parse_iso(message.get("timestamp") or message.get("created_at"))
 
 
-def conversation_activity(conversation: dict) -> dict:
-    history = conversation.get("history") or []
-    last_user_at = None
-    last_agent_at = None
-
-    for message in history:
-        timestamp = get_message_time(message)
-        if message.get("role") == "user" and timestamp:
-            last_user_at = timestamp
-        if message.get("role") == "assistant" and timestamp:
-            last_agent_at = timestamp
-
-    fallback = parse_iso(conversation.get("created_at"))
-    if last_user_at is None:
-        last_user_at = fallback
-
-    return {"last_user_at": last_user_at, "last_agent_at": last_agent_at}
 
 
-def follow_up_schedule_config(
-    auto_hours: int = AUTO_FOLLOW_UP_HOURS,
-    manual1_days: int = 3,
-    manual2_days: int = 10,
-    manual3_days: int = 30,
-) -> dict:
-    auto_hours = max(1, min(23, int(auto_hours)))
-    manual1_days = max(1, min(60, int(manual1_days)))
-    manual2_days = max(manual1_days + 1, min(90, int(manual2_days)))
-    manual3_days = max(manual2_days + 1, min(180, int(manual3_days)))
-    return {
-        "auto_hours": auto_hours,
-        "manual1_hours": manual1_days * 24,
-        "manual2_hours": manual2_days * 24,
-        "manual3_hours": manual3_days * 24,
-        "manual1_days": manual1_days,
-        "manual2_days": manual2_days,
-        "manual3_days": manual3_days,
-    }
 
 
-def get_follow_up_stage(hours_since_user: float, schedule: Optional[dict] = None) -> Optional[dict]:
-    schedule = schedule or follow_up_schedule_config()
-    if schedule["auto_hours"] <= hours_since_user < 24:
-        return {"stage": "auto_23h", "label": f"Auto {schedule['auto_hours']} h", "mode": "auto", "sort": 1}
-    if schedule["manual1_hours"] <= hours_since_user < schedule["manual2_hours"]:
-        return {"stage": "j3", "label": f"J+{schedule['manual1_days']}", "mode": "manual", "sort": 2}
-    if schedule["manual2_hours"] <= hours_since_user < schedule["manual3_hours"]:
-        return {"stage": "j10", "label": f"J+{schedule['manual2_days']}", "mode": "manual", "sort": 3}
-    if hours_since_user >= schedule["manual3_hours"]:
-        return {"stage": "j30", "label": f"J+{schedule['manual3_days']}", "mode": "manual", "sort": 4}
-    return None
 
 
-def has_follow_up_stage(history: list, stage: str) -> bool:
-    return any(message.get("follow_up_stage") == stage for message in history)
 
 
-async def build_follow_up_item(conversation: dict, schedule: Optional[dict] = None) -> Optional[dict]:
-    if not conversation.get("agent_active"):
-        return None
-    if conversation.get("human_takeover") or conversation.get("contact_status") == "opted_out":
-        return None
-    if conversation.get("automation_mode") == "disabled":
-        return None
-    if conversation.get("status") in {"appel_booke", "signe"}:
-        return None
-
-    history = conversation.get("history") or []
-    activity = conversation_activity(conversation)
-    last_user_at = activity["last_user_at"]
-    last_agent_at = activity["last_agent_at"]
-    if not last_user_at:
-        return None
-    if last_agent_at and last_user_at > last_agent_at:
-        return None
-
-    user_id = conversation.get("user_id")
-    settings = await get_beta_cost_settings(user_id) if user_id else dict(DEFAULT_BETA_ACCOUNT_SETTINGS)
-    now = datetime.now(timezone.utc)
-    hours_since_user = (now - last_user_at).total_seconds() / 3600
-    stage = get_follow_up_stage(hours_since_user, schedule) if schedule else (configured_follow_up_stage(hours_since_user, settings) or get_follow_up_stage(hours_since_user))
-    if not stage:
-        return None
-    if has_follow_up_stage(history, stage["stage"]):
-        return None
-
-    delay_seconds = int(settings.get("min_auto_delay_seconds") or 0) + int(settings.get("random_auto_delay_seconds") or 0)
-    eligible_at = last_agent_at + timedelta(seconds=delay_seconds) if last_agent_at and delay_seconds else now
-    if now < eligible_at:
-        return None
-    next_window = next_allowed_send_at(now, settings)
-    if stage["mode"] == "auto" and next_window > now:
-        return {
-            "conversation_id": conversation.get("id"),
-            "id": conversation.get("id"),
-            "created_at": conversation.get("created_at"),
-            "username": conversation.get("username"),
-            "channel": conversation.get("channel") or "instagram",
-            "external_contact_id": conversation.get("external_contact_id") or conversation.get("username"),
-            "phone_e164": conversation.get("phone_e164"),
-            "display_name": conversation.get("display_name"),
-            "message": conversation.get("message"),
-            "status": conversation.get("status"),
-            "agent_active": conversation.get("agent_active"),
-            "automation_mode": conversation.get("automation_mode") or "supervised",
-            "manual_contact_url": manual_contact_url(conversation),
-            "stage": stage["stage"],
-            "stage_label": stage["label"],
-            "mode": stage["mode"],
-            "sort": stage["sort"],
-            "hours_since_user": round(hours_since_user, 1),
-            "last_user_message_at": last_user_at.isoformat(),
-            "last_agent_message_at": last_agent_at.isoformat() if last_agent_at else None,
-            "queued_until": next_window.isoformat(),
-            "send_blocked_reason": "outside_allowed_send_window",
-        }
-
-    return {
-        "conversation_id": conversation.get("id"),
-        "id": conversation.get("id"),
-        "created_at": conversation.get("created_at"),
-        "username": conversation.get("username"),
-        "channel": conversation.get("channel") or "instagram",
-        "external_contact_id": conversation.get("external_contact_id") or conversation.get("username"),
-        "phone_e164": conversation.get("phone_e164"),
-        "display_name": conversation.get("display_name"),
-        "message": conversation.get("message"),
-        "status": conversation.get("status"),
-        "agent_active": conversation.get("agent_active"),
-        "automation_mode": conversation.get("automation_mode") or "supervised",
-        "manual_contact_url": manual_contact_url(conversation),
-        "stage": stage["stage"],
-        "stage_label": stage["label"],
-        "mode": stage["mode"],
-        "sort": stage["sort"],
-        "hours_since_user": round(hours_since_user, 1),
-        "last_user_message_at": last_user_at.isoformat(),
-        "last_agent_message_at": last_agent_at.isoformat() if last_agent_at else None,
-        "queued_until": None,
-        "send_blocked_reason": None,
-    }
 
 
 
@@ -2924,6 +2784,18 @@ def generate_ai_generation(
 
 async def send_manychat_message(subscriber_id: str, text: str) -> dict:
     result = await MANYCHAT_PROVIDER_CLIENT.send_message(recipient_id=subscriber_id, text=text)
+    if int(result.get("status_code") or 500) < 400:
+        try:
+            body = json.loads(result.get("body") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            body = None
+        if isinstance(body, dict) and (
+            str(body.get("status") or "").lower() in {"error", "failed", "failure"} or
+            body.get("error")
+        ):
+            # ManyChat normally returns HTTP 400 for an API error. Protect
+            # delivery state and counters if a gateway returns a 200 error body.
+            result = {**result, "provider_http_status": result["status_code"], "status_code": 400}
     print(f"[manychat] status={result['status_code']} body_len={len(result.get('body') or '')}")
     return result
 
@@ -3118,7 +2990,7 @@ async def resolve_meta_instagram_contact_name(connection: dict, ig_scoped_id: st
     return None
 
 
-async def send_meta_instagram_message(conversation: dict, text: str) -> dict:
+async def send_meta_instagram_message(conversation: dict, text: str, *, at_most_once: bool = False) -> dict:
     if not config.meta_instagram_enabled or not config.meta_instagram_send_enabled:
         return {"status_code": 503, "body": '{"error":"meta_instagram_send_disabled"}'}
     connection_id = conversation.get("messaging_connection_id")
@@ -3140,9 +3012,26 @@ async def send_meta_instagram_message(conversation: dict, text: str) -> dict:
         recipient_id=conversation.get("external_contact_id") or conversation.get("username"),
         text=text,
         access_token=token,
+        **({"max_attempts": 1} if at_most_once else {}),
     )
+    delivery_unverified = False
+    if at_most_once and 200 <= int(result.get("status_code") or 500) < 300:
+        try:
+            delivery = json.loads(result.get("body") or "")
+        except (json.JSONDecodeError, TypeError):
+            delivery = None
+        expected_recipient = str(conversation.get("external_contact_id") or conversation.get("username") or "")
+        message_id = delivery.get("message_id") if isinstance(delivery, dict) else None
+        returned_recipient = delivery.get("recipient_id") if isinstance(delivery, dict) else None
+        if (not isinstance(message_id, str) or not message_id.strip() or
+            (returned_recipient is not None and str(returned_recipient) != expected_recipient)):
+            delivery_unverified = True
+            result = {"status_code": 503,
+                "body": '{"error":"meta_delivery_unverified","action":"reconcile_before_retry"}'}
     emit_messaging_metric(
-        "meta.message.sent" if int(result.get("status_code") or 500) < 400 else "meta.message.failed",
+        ("meta.message.unverified" if delivery_unverified else
+         "meta.message.sent" if int(result.get("status_code") or 500) < 400
+         else "meta.message.failed"),
         tenant_id=conversation.get("user_id"), connection_id=connection["id"],
         conversation_id=conversation.get("id"), provider=META_PROVIDER,
         status=result.get("status_code"),
@@ -3154,7 +3043,7 @@ async def send_meta_instagram_message(conversation: dict, text: str) -> dict:
     return result
 
 
-async def send_channel_message(conversation: dict, text: str) -> dict:
+async def send_channel_message(conversation: dict, text: str, *, at_most_once: bool = False) -> dict:
     channel = conversation.get("channel") or "instagram"
     if channel == "whatsapp":
         phone_e164 = conversation.get("phone_e164") or conversation.get("external_contact_id") or conversation.get("username")
@@ -3165,7 +3054,7 @@ async def send_channel_message(conversation: dict, text: str) -> dict:
     else:
         provider = conversation.get("messaging_provider") or MANYCHAT_PROVIDER
         if provider == META_PROVIDER:
-            result = await send_meta_instagram_message(conversation, text)
+            result = await send_meta_instagram_message(conversation, text, at_most_once=at_most_once)
         elif provider == MANYCHAT_PROVIDER:
             subscriber_id = conversation.get("external_contact_id") or conversation.get("username")
             if not subscriber_id:
@@ -3186,23 +3075,29 @@ async def send_channel_message(conversation: dict, text: str) -> dict:
             )
         except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
             provider_event_id = None
-        await record_usage_ledger_event(
-            user_id=user_id,
-            module="setter",
-            feature="outbound_channel_message",
-            event_type="channel_message_sent",
-            provider=provider,
-            service="messaging",
-            status="accepted",
-            idempotency_key=(f"{provider}:{provider_event_id}" if provider_event_id else f"{provider}:local:{uuid4()}"),
-            provider_event_id=provider_event_id,
-            quantity=1,
-            unit="message",
-            conversation_id=conversation.get("id"),
-            cost_accuracy="unknown",
-            cost_source="provider_cost_unavailable",
-            metadata={"channel": channel},
-        )
+        try:
+            await record_usage_ledger_event(
+                user_id=user_id,
+                module="setter",
+                feature="outbound_channel_message",
+                event_type="channel_message_sent",
+                provider=provider,
+                service="messaging",
+                status="accepted",
+                idempotency_key=(f"{provider}:{provider_event_id}" if provider_event_id else f"{provider}:local:{uuid4()}"),
+                provider_event_id=provider_event_id,
+                quantity=1,
+                unit="message",
+                conversation_id=conversation.get("id"),
+                cost_accuracy="unknown",
+                cost_source="provider_cost_unavailable",
+                metadata={"channel": channel},
+            )
+        except Exception as exc:
+            # Delivery already succeeded. A ledger outage must not turn that
+            # success into an ambiguous retry or hide it from the job status.
+            print(f"[messaging] sent_but_ledger_failed conversation={conversation.get('id')} "
+                  f"error={type(exc).__name__}", flush=True)
     return result
 
 
@@ -3615,13 +3510,7 @@ async def generate_follow_up_result(
 ) -> AiGenerationResult:
     require_configured_provider(select_setter_route(reasoning_level="none"))
 
-    stage_labels = {
-        "auto_23h": "automatic 23-hour follow-up",
-        "j3": "assisted D+3 follow-up",
-        "j10": "assisted D+10 follow-up",
-        "j30": "assisted D+30 follow-up",
-    }
-    stage_label = stage_labels.get(stage, stage)
+    stage_label = stage.replace("_", " ")
     delay_context = f"Configured delay: {follow_up_delay_label}\n" if follow_up_delay_label else ""
     instruction_context = f"AI guidance for this follow-up: {ai_instruction.strip()}\n" if ai_instruction and ai_instruction.strip() else ""
     active_prompt = await get_active_prompt(conversation.get("user_id"))
@@ -4489,6 +4378,8 @@ class BetaSettingsPayload(BaseModel):
     allowed_send_end: str = Field(max_length=5)
     min_auto_delay_seconds: Optional[StrictInt] = None
     random_auto_delay_seconds: Optional[StrictInt] = None
+    timezone: Optional[StrictStr] = Field(default=None, max_length=80)
+    follow_up_config: Optional[list[dict]] = None
 
 
 class RefineMessagePayload(BaseModel):
@@ -7478,6 +7369,8 @@ async def beta_ai_cost_status(user_id: str) -> dict:
         "cap_reached": settings.get("enabled", True) and spent >= cap,
         "allowed_send_start": settings.get("allowed_send_start"),
         "allowed_send_end": settings.get("allowed_send_end"),
+        "timezone": settings.get("timezone"),
+        "follow_up_config_version": settings.get("follow_up_config_version"),
         "min_auto_delay_seconds": settings.get("min_auto_delay_seconds"),
         "random_auto_delay_seconds": settings.get("random_auto_delay_seconds"),
         "follow_up_config": settings.get("follow_up_config"),
@@ -7514,14 +7407,27 @@ async def update_beta_settings(
         "random_auto_delay_seconds",
         int(existing.get("random_auto_delay_seconds") or 0),
     )
+    tz_name = payload.timezone or existing.get("timezone", "Europe/Paris")
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(tz_name)
+    except (KeyError, ValueError):
+        raise HTTPException(status_code=422, detail="Invalid IANA timezone")
+    try:
+        stages = normalize_stages(payload.follow_up_config) if payload.follow_up_config is not None else normalize_stages(existing["follow_up_config"])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if not stages:
+        raise HTTPException(status_code=422, detail="At least one follow-up stage must be configured")
     row = {
         "ai_cost_cap_eur": float(existing.get("cap_eur", DEFAULT_BETA_COST_CAP_EUR)),
         "ai_cost_guardrail_enabled": bool(existing.get("enabled", True)),
         "allowed_send_start": allowed_send_start,
         "allowed_send_end": allowed_send_end,
+        "timezone": tz_name,
         "min_auto_delay_seconds": min_auto_delay_seconds,
         "random_auto_delay_seconds": random_auto_delay_seconds,
-        "follow_up_config": existing.get("follow_up_config") or DEFAULT_BETA_ACCOUNT_SETTINGS["follow_up_config"],
+        "follow_up_config": stages,
         "updated_at": now_iso(),
     }
     await upsert_user_singleton_row(SUPABASE_BETA_ACCOUNT_SETTINGS_URL, user_id, row)
@@ -7530,38 +7436,487 @@ async def update_beta_settings(
 
 # ── Follow-up endpoints ───────────────────────────────────────────────────────
 
+SUPABASE_FOLLOW_UP_JOBS_URL = f"{config.supabase_url}/follow_up_jobs"
+SUPABASE_FOLLOW_UP_QUEUE_URL = f"{config.supabase_url}/follow_up_refresh_queue"
+SUPABASE_RPC_URL = f"{config.supabase_url}/rpc"
+FOLLOW_UP_POLL_SECONDS = max(10, int(os.environ.get("FOLLOW_UP_POLL_SECONDS", "60")))
+
+
+async def get_follow_up_settings_strict(user_id: str) -> dict:
+    """A failed tenant-rule read must stop sending, never silently use defaults."""
+    async with httpx.AsyncClient() as http:
+        res = await http.get(SUPABASE_BETA_ACCOUNT_SETTINGS_URL,
+            headers=supabase_headers(), params={"user_id": f"eq.{user_id}", "select": "*", "limit": "1"},
+            timeout=10.0)
+        res.raise_for_status()
+        rows = res.json()
+    if rows:
+        raw = rows[0].get("follow_up_config")
+        if raw is not None:
+            normalize_stages(raw)
+        from zoneinfo import ZoneInfo
+        ZoneInfo(rows[0].get("timezone") or "Europe/Paris")
+        validate_hhmm(rows[0].get("allowed_send_start") or "08:00", "allowed_send_start")
+        validate_hhmm(rows[0].get("allowed_send_end") or "22:00", "allowed_send_end")
+        settings = normalize_beta_account_settings(row=rows[0])
+    else:
+        settings = normalize_beta_account_settings()
+    from zoneinfo import ZoneInfo
+    ZoneInfo(settings["timezone"])
+    return settings
+
+
+async def patch_follow_up_job(job_id: str, values: dict, *, expected_status: str | None = None) -> bool:
+    params = {"id": f"eq.{job_id}", "select": "id"}
+    if expected_status:
+        params["status"] = f"eq.{expected_status}"
+    async with httpx.AsyncClient() as http:
+        response = await http.patch(
+            SUPABASE_FOLLOW_UP_JOBS_URL,
+            headers={**supabase_headers(), "Prefer": "return=representation"},
+            params=params, json={**values, "updated_at": now_iso()}, timeout=10.0,
+        )
+        response.raise_for_status()
+        return bool(response.json())
+
+
+def next_enabled_follow_up_stage(last_agent_message: dict, settings: dict) -> dict | None:
+    previous_index = 0
+    prior_stage = str(last_agent_message.get("follow_up_stage") or "")
+    if prior_stage.startswith("follow_up_"):
+        try:
+            previous_index = int(prior_stage.rsplit("_", 1)[1])
+        except ValueError:
+            pass
+    return next((stage for stage in normalize_stages(settings["follow_up_config"])
+                 if stage["enabled"] and stage["stage_index"] > previous_index), None)
+
+
+async def reconcile_follow_up_conversation(conversation_id: str, user_id: str) -> None:
+    conversation = await get_conversation_by_id(conversation_id, user_id)
+    if not conversation:
+        return
+    settings = await get_follow_up_settings_strict(user_id)
+    history = conversation.get("history") or []
+    users = [(get_message_time(m), m) for m in history if m.get("role") == "user" and get_message_time(m)]
+    agents = [(get_message_time(m), m) for m in history if m.get("role") == "assistant" and
+              m.get("sent") is not False and not m.get("ignored") and get_message_time(m)]
+    latest_user = max([item[0] for item in users] +
+        ([parse_iso(conversation.get("last_inbound_at"))] if conversation.get("last_inbound_at") else []),
+        default=None)
+    latest_agent = max(agents, key=lambda item: item[0]) if agents else None
+    active = (conversation.get("agent_active") and not conversation.get("human_takeover") and
+              conversation.get("contact_status") != "opted_out" and
+              not conversation.get("opted_out_at") and
+              conversation.get("automation_mode") != "disabled" and
+              conversation.get("status") not in {"appel_booke", "signe"} and latest_agent and
+              (not latest_user or latest_agent[0] > latest_user))
+    async with httpx.AsyncClient() as http:
+        res = await http.get(SUPABASE_FOLLOW_UP_JOBS_URL, headers=supabase_headers(),
+            params={"conversation_id": f"eq.{conversation_id}", "status": "in.(scheduled,processing)",
+                    "select": "id,idempotency_key,status"}, timeout=10.0)
+        res.raise_for_status()
+        existing = res.json()
+
+    desired: set[str] = set()
+    inserts = []
+    if active:
+        anchor_at, last_agent_message = latest_agent
+        stage = next_enabled_follow_up_stage(last_agent_message, settings)
+        if stage:
+            due_at, scheduled_at = schedule_stage(anchor_at, stage, settings)
+            effective_mode = ("auto" if stage["mode"] == "auto" and
+                conversation.get("automation_mode") == "auto" else "manual")
+            manual_reason = None
+            channel = conversation.get("channel") or "instagram"
+            if (effective_mode == "auto" and channel == "instagram" and
+                settings.get("active_messaging_provider", META_PROVIDER) != META_PROVIDER):
+                effective_mode = "manual"
+                manual_reason = "Tenant Instagram/Meta provider is inactive"
+            if effective_mode == "auto" and channel == "instagram" and (
+                conversation.get("messaging_provider") != META_PROVIDER or
+                not conversation.get("messaging_connection_id") or
+                not conversation.get("external_contact_id")
+            ):
+                effective_mode = "manual"
+                manual_reason = "Instagram conversation has no usable Meta connection and recipient"
+            if effective_mode == "auto" and channel in {"instagram", "whatsapp"}:
+                inbound_at = parse_iso(conversation.get("last_inbound_at"))
+                window_hours = (config.meta_instagram_reply_window_hours
+                    if channel == "instagram" else 24)
+                if not inbound_at or scheduled_at > inbound_at + timedelta(hours=window_hours):
+                    effective_mode = "manual"
+                    manual_reason = f"{channel}/Meta automatic messaging window closed at scheduled time"
+            key = (f"{conversation_id}:{anchor_at.isoformat()}:{stage['stage']}:"
+                f"{settings['follow_up_config_version']}:{effective_mode}")
+            desired.add(key)
+            inserts.append({
+                "user_id": user_id, "conversation_id": conversation_id,
+                "stage": stage["stage"], "stage_index": stage["stage_index"],
+                "anchor_at": anchor_at.isoformat(), "due_at": due_at.isoformat(),
+                "scheduled_at": scheduled_at.isoformat(), "mode": effective_mode,
+                "status": "scheduled", "config_version": settings["follow_up_config_version"],
+                "idempotency_key": key, "last_error": manual_reason,
+            })
+    for old in existing:
+        if old["idempotency_key"] not in desired and old["status"] == "scheduled":
+            await patch_follow_up_job(old["id"], {"status": "cancelled", "cancelled_at": now_iso(),
+                "last_error": "Conversation or tenant configuration changed"}, expected_status="scheduled")
+    known = {old["idempotency_key"] for old in existing}
+    new = [row for row in inserts if row["idempotency_key"] not in known]
+    if new:
+        async with httpx.AsyncClient() as http:
+            res = await http.post(SUPABASE_FOLLOW_UP_JOBS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal,resolution=ignore-duplicates"},
+                json=new, timeout=10.0)
+            res.raise_for_status()
+
+
+async def process_follow_up_refresh_queue() -> int:
+    async with httpx.AsyncClient() as http:
+        release = await http.post(f"{SUPABASE_RPC_URL}/release_stale_follow_up_refresh_claims",
+            headers=supabase_headers(), json={}, timeout=10.0)
+        release.raise_for_status()
+        res = await http.get(SUPABASE_FOLLOW_UP_QUEUE_URL, headers=supabase_headers(),
+            params={"claimed_at": "is.null", "order": "queued_at.asc", "limit": "50",
+                    "select": "conversation_id,user_id,queued_at"}, timeout=10.0)
+        res.raise_for_status()
+        rows = res.json()
+    handled = 0
+    for row in rows:
+        claim_time = now_iso()
+        async with httpx.AsyncClient() as http:
+            claim = await http.patch(SUPABASE_FOLLOW_UP_QUEUE_URL,
+                headers={**supabase_headers(), "Prefer": "return=representation"},
+                params={"conversation_id": f"eq.{row['conversation_id']}",
+                        "queued_at": f"eq.{row['queued_at']}", "claimed_at": "is.null",
+                        "select": "conversation_id"},
+                json={"claimed_at": claim_time}, timeout=10.0)
+            claim.raise_for_status()
+        if not claim.json():
+            continue
+        try:
+            await reconcile_follow_up_conversation(row["conversation_id"], row["user_id"])
+        except Exception as exc:
+            print(f"[follow-up] refresh_failed conversation={row['conversation_id']} "
+                  f"error={type(exc).__name__}", flush=True)
+            try:
+                async with httpx.AsyncClient() as http:
+                    reset = await http.patch(SUPABASE_FOLLOW_UP_QUEUE_URL,
+                        headers=supabase_headers(),
+                        params={"conversation_id": f"eq.{row['conversation_id']}",
+                                "claimed_at": f"eq.{claim_time}"},
+                        json={"claimed_at": None}, timeout=10.0)
+                    reset.raise_for_status()
+            except Exception as reset_exc:
+                print(f"[follow-up] refresh_reset_failed conversation={row['conversation_id']} "
+                      f"error={type(reset_exc).__name__}", flush=True)
+            continue
+        async with httpx.AsyncClient() as http:
+            done = await http.delete(SUPABASE_FOLLOW_UP_QUEUE_URL, headers=supabase_headers(),
+                params={"conversation_id": f"eq.{row['conversation_id']}",
+                        "queued_at": f"eq.{row['queued_at']}", "claimed_at": f"eq.{claim_time}"})
+            done.raise_for_status()
+        handled += 1
+    return handled
+
+
+async def reschedule_follow_up_preparation_error(
+    job: dict, exc: Exception, *, now: datetime, use_real_clock: bool,
+) -> str:
+    attempt_count = int(job.get("attempt_count") or 1)
+    if attempt_count < 3:
+        retry_seconds = min(60 * (2 ** (attempt_count - 1)), 900)
+        retry_time = (datetime.now(timezone.utc) if use_real_clock else now) + timedelta(seconds=retry_seconds)
+        await patch_follow_up_job(job["id"], {"status": "scheduled",
+            "next_retry_at": retry_time.isoformat(),
+            "last_error": f"Preparation failed: {type(exc).__name__}; retry {attempt_count + 1}/3 scheduled"},
+            expected_status="processing")
+        print(f"[follow-up] preparation_retry job={job['id']} attempt={attempt_count} "
+              f"error={type(exc).__name__}", flush=True)
+        return "scheduled"
+    await patch_follow_up_job(job["id"], {"status": "failed", "next_retry_at": None,
+        "last_error": f"Preparation failed after 3 attempts: {type(exc).__name__}"},
+        expected_status="processing")
+    print(f"[follow-up] preparation_exhausted job={job['id']} error={type(exc).__name__}", flush=True)
+    return "failed"
+
+
+async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> str:
+    use_real_clock = now is None
+    now = now or datetime.now(timezone.utc)
+    retry_at = parse_iso(job.get("next_retry_at"))
+    if (now < parse_iso(job["due_at"]) or now < parse_iso(job["scheduled_at"]) or
+        (retry_at and now < retry_at)):
+        await patch_follow_up_job(job["id"], {"status": "scheduled"}, expected_status="processing")
+        return "scheduled"
+    try:
+        conversation = await get_conversation_by_id(job["conversation_id"], job["user_id"])
+        settings = await get_follow_up_settings_strict(job["user_id"])
+    except Exception as exc:
+        return await reschedule_follow_up_preparation_error(
+            job, exc, now=now, use_real_clock=use_real_clock,
+        )
+    if not conversation or settings["follow_up_config_version"] != job["config_version"]:
+        await patch_follow_up_job(job["id"], {"status": "cancelled", "cancelled_at": now_iso(),
+            "last_error": "Configuration changed or conversation removed"}, expected_status="processing")
+        return "cancelled"
+    history = conversation.get("history") or []
+    anchor = parse_iso(job["anchor_at"])
+    sent_agents = [(get_message_time(m), m) for m in history if m.get("role") == "assistant" and
+                   m.get("sent") is not False and not m.get("ignored") and get_message_time(m)]
+    latest_agent = max(sent_agents, key=lambda item: item[0]) if sent_agents else None
+    next_stage = next_enabled_follow_up_stage(latest_agent[1], settings) if latest_agent else None
+    if not next_stage or next_stage["stage"] != job["stage"]:
+        await patch_follow_up_job(job["id"], {"status": "cancelled", "cancelled_at": now_iso(),
+            "last_error": "Earlier follow-up stage is unresolved or this stage is superseded"},
+            expected_status="processing")
+        return "cancelled"
+    inbound_at = parse_iso(conversation.get("last_inbound_at"))
+    newer_user = (bool(inbound_at and inbound_at > anchor) or
+        any(m.get("role") == "user" and get_message_time(m) and get_message_time(m) > anchor
+            for m in history))
+    newer_agent = any(m.get("role") == "assistant" and m.get("sent") is not False and
+        not m.get("ignored") and get_message_time(m) and get_message_time(m) > anchor
+        for m in history)
+    if (newer_user or not conversation.get("agent_active") or conversation.get("human_takeover") or
+        newer_agent or conversation.get("contact_status") == "opted_out" or
+        conversation.get("opted_out_at") or
+        conversation.get("status") in {"appel_booke", "signe"} or
+        conversation.get("automation_mode") == "disabled"):
+        await patch_follow_up_job(job["id"], {"status": "cancelled", "cancelled_at": now_iso(),
+            "last_error": "Conversation advanced or automation was disabled"}, expected_status="processing")
+        return "cancelled"
+    if job["mode"] != "auto" or conversation.get("automation_mode") != "auto":
+        await patch_follow_up_job(job["id"], {"status": "manual_required",
+            "last_error": job.get("last_error") or "This stage or conversation is in manual mode"},
+            expected_status="processing")
+        return "manual_required"
+    channel = conversation.get("channel") or "instagram"
+    if channel == "instagram" and settings.get("active_messaging_provider", META_PROVIDER) != META_PROVIDER:
+        await patch_follow_up_job(job["id"], {"status": "manual_required",
+            "last_error": "Tenant Instagram/Meta provider is inactive"},
+            expected_status="processing")
+        return "manual_required"
+    if channel == "instagram" and conversation.get("messaging_provider") != META_PROVIDER:
+        await patch_follow_up_job(job["id"], {"status": "manual_required",
+            "last_error": "Legacy Instagram conversation has no Meta recipient; reconnect through Instagram before sending"},
+            expected_status="processing")
+        return "manual_required"
+    if channel == "instagram" and (not conversation.get("messaging_connection_id") or
+                                    not conversation.get("external_contact_id")):
+        await patch_follow_up_job(job["id"], {"status": "manual_required",
+            "last_error": "Instagram/Meta connection or recipient is missing"},
+            expected_status="processing")
+        return "manual_required"
+    if channel in {"instagram", "whatsapp"}:
+        inbound = parse_iso(conversation.get("last_inbound_at"))
+        window_hours = config.meta_instagram_reply_window_hours if channel == "instagram" else 24
+        if not inbound or now - inbound > timedelta(hours=window_hours):
+            await patch_follow_up_job(job["id"], {"status": "manual_required",
+                "last_error": f"{channel}/Meta automatic messaging window closed"}, expected_status="processing")
+            return "manual_required"
+    next_window = next_allowed_send_at(now, settings)
+    if next_window > now:
+        await patch_follow_up_job(job["id"], {"status": "scheduled",
+            "scheduled_at": next_window.isoformat(), "next_retry_at": None,
+            "last_error": "Messaging hours closed"},
+            expected_status="processing")
+        return "scheduled"
+    stage = next((s for s in normalize_stages(settings["follow_up_config"])
+                  if s["stage"] == job["stage"]), None)
+    if not stage or not stage["enabled"]:
+        await patch_follow_up_job(job["id"], {"status": "cancelled", "cancelled_at": now_iso()},
+                                  expected_status="processing")
+        return "cancelled"
+    external_attempted = False
+    sent = False
+    try:
+        await enforce_ai_cost_cap(job["user_id"])
+        generated = await generate_follow_up_result(conversation, job["stage"],
+            stage.get("ai_instruction"), f"{stage['delay_value']} {stage['delay_unit']}")
+        await record_ai_usage_event(job["user_id"], "follow_up_worker",
+            json.dumps(conversation.get("history") or [], ensure_ascii=False), generated.text,
+            usage=getattr(generated, "usage", None), conversation_id=job["conversation_id"],
+            request_kind="follow_up_worker",
+            idempotency_key=f"{job['idempotency_key']}:ai:{job.get('attempt_count') or 1}")
+        # Check inbound again immediately before the external effect.
+        fresh = await get_conversation_by_id(job["conversation_id"], job["user_id"])
+        fresh_settings = await get_follow_up_settings_strict(job["user_id"])
+        fresh_history = (fresh or {}).get("history") or []
+        fresh_newer_message = any(
+            m.get("role") in {"user", "assistant"} and
+            (m.get("role") == "user" or (m.get("sent") is not False and not m.get("ignored"))) and
+            get_message_time(m) and get_message_time(m) > anchor
+            for m in fresh_history
+        )
+        if (not fresh or fresh_settings["follow_up_config_version"] != job["config_version"] or
+            parse_iso(fresh.get("last_inbound_at")) != parse_iso(conversation.get("last_inbound_at")) or
+            fresh_newer_message or not fresh.get("agent_active") or fresh.get("human_takeover") or
+            fresh.get("contact_status") == "opted_out" or fresh.get("opted_out_at") or
+            fresh.get("status") in {"appel_booke", "signe"} or
+            fresh.get("automation_mode") != "auto" or
+            (fresh.get("channel") or "instagram") != channel or
+            (channel == "instagram" and (
+                fresh.get("messaging_provider") != META_PROVIDER or
+                fresh.get("messaging_connection_id") != conversation.get("messaging_connection_id") or
+                fresh.get("external_contact_id") != conversation.get("external_contact_id")))):
+            await patch_follow_up_job(job["id"], {"status": "cancelled", "cancelled_at": now_iso(),
+                "last_error": "Conversation or configuration changed while follow-up was prepared"},
+                expected_status="processing")
+            return "cancelled"
+        send_time = datetime.now(timezone.utc) if use_real_clock else now
+        if channel in {"instagram", "whatsapp"}:
+            fresh_inbound = parse_iso(fresh.get("last_inbound_at"))
+            window_hours = config.meta_instagram_reply_window_hours if channel == "instagram" else 24
+            if not fresh_inbound or send_time - fresh_inbound > timedelta(hours=window_hours):
+                await patch_follow_up_job(job["id"], {"status": "manual_required",
+                    "last_error": f"{channel}/Meta automatic messaging window closed during preparation"},
+                    expected_status="processing")
+                return "manual_required"
+        next_send_window = next_allowed_send_at(send_time, fresh_settings)
+        if next_send_window > send_time:
+            await patch_follow_up_job(job["id"], {"status": "scheduled",
+                "scheduled_at": next_send_window.isoformat(), "next_retry_at": None,
+                "last_error": "Messaging hours closed during preparation"},
+                expected_status="processing")
+            return "scheduled"
+        external_attempted = True
+        result = await send_channel_message(fresh, generated.text, at_most_once=True)
+        sent = int(result.get("status_code") or 500) < 400
+        if not sent:
+            status = ("manual_required" if (
+                int(result.get("status_code") or 500) >= 500 or
+                is_manychat_pending_delivery_error(result)
+            ) else "blocked")
+            await patch_follow_up_job(job["id"], {"status": status,
+                "last_error": str(result.get("body") or "Provider rejected message")[:500]},
+                expected_status="processing")
+            print(f"[follow-up] provider_failure job={job['id']} status={result.get('status_code')}", flush=True)
+            return status
+        await patch_follow_up_job(job["id"], {"status": "sent", "sent_at": now_iso(),
+            "last_error": None}, expected_status="processing")
+        message = {"role": "assistant", "content": generated.text, "timestamp": now_iso(),
+            "follow_up_stage": job["stage"], "follow_up_mode": "auto", "source": "follow_up_worker",
+            "follow_up_job_id": job["id"], "sent": True}
+        sync_payload = {
+            "p_job_id": job["id"], "p_user_id": job["user_id"],
+            "p_conversation_id": job["conversation_id"], "p_message": message,
+            "p_expected_history": fresh.get("history") or [],
+            "p_expected_inbound_at": fresh.get("last_inbound_at"),
+            "p_response": generated.text,
+        }
+        history_synced = False
+        for sync_attempt in range(3):
+            try:
+                async with httpx.AsyncClient() as http:
+                    update = await http.post(f"{SUPABASE_RPC_URL}/append_sent_follow_up_history",
+                        headers=supabase_headers(), json=sync_payload, timeout=10.0)
+                    update.raise_for_status()
+                    history_synced = update.json() is True
+                if history_synced:
+                    break
+            except Exception as sync_exc:
+                print(f"[follow-up] history_sync_retry job={job['id']} "
+                      f"attempt={sync_attempt + 1} error={type(sync_exc).__name__}", flush=True)
+            if sync_attempt < 2:
+                await asyncio.sleep(0.5 * (sync_attempt + 1))
+        if not history_synced:
+            await patch_follow_up_job(job["id"], {
+                "last_error": "Meta accepted the DM but CRM history sync failed; reconcile delivery"
+            }, expected_status="sent")
+            print(f"[follow-up] sent_but_history_not_appended job={job['id']}", flush=True)
+        print(f"[follow-up] sent job={job['id']} stage={job['stage']}", flush=True)
+        return "sent"
+    except Exception as exc:
+        if sent:
+            try:
+                await patch_follow_up_job(job["id"], {
+                    "last_error": "Provider accepted the DM but CRM sync failed; reconcile delivery"
+                }, expected_status="sent")
+            except Exception:
+                pass
+            print(f"[follow-up] sent_but_sync_failed job={job['id']} error={type(exc).__name__}", flush=True)
+            return "sent"
+        if external_attempted:
+            await patch_follow_up_job(job["id"], {"status": "manual_required",
+                "last_error": f"Ambiguous attempt: {type(exc).__name__}"}, expected_status="processing")
+            print(f"[follow-up] ambiguous_provider_attempt job={job['id']} error={type(exc).__name__}", flush=True)
+            return "manual_required"
+        return await reschedule_follow_up_preparation_error(
+            job, exc, now=now, use_real_clock=use_real_clock,
+        )
+
+
+async def process_due_follow_up_jobs() -> int:
+    async with httpx.AsyncClient() as http:
+        stale = await http.post(f"{SUPABASE_RPC_URL}/reconcile_stale_follow_up_processing",
+            headers=supabase_headers(), json={}, timeout=10.0)
+        stale.raise_for_status()
+        claim = await http.post(f"{SUPABASE_RPC_URL}/claim_due_follow_up_jobs",
+            headers=supabase_headers(), json={"batch_size": 50}, timeout=10.0)
+        claim.raise_for_status()
+        jobs = claim.json()
+    for job in jobs:
+        try:
+            await execute_follow_up_job(job)
+        except Exception as exc:
+            print(f"[follow-up] job_unhandled job={job.get('id')} error={type(exc).__name__}", flush=True)
+    return len(jobs)
+
+
+async def follow_up_worker() -> None:
+    """Cloud backend worker; the dashboard is never used as a scheduler."""
+    print(f"[follow-up] worker_started poll_seconds={FOLLOW_UP_POLL_SECONDS}", flush=True)
+    while True:
+        try:
+            refreshed = await process_follow_up_refresh_queue()
+            claimed = await process_due_follow_up_jobs()
+            if refreshed or claimed:
+                print(f"[follow-up] worker_cycle refreshed={refreshed} claimed={claimed}", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[follow-up] worker_error={type(exc).__name__}", flush=True)
+        await asyncio.sleep(FOLLOW_UP_POLL_SECONDS)
+
 @app.get("/follow-ups/due")
 async def get_due_follow_ups(
     user_id: str = Depends(require_jwt),
-    auto_hours: int = Query(default=AUTO_FOLLOW_UP_HOURS, ge=1, le=23),
-    manual1_days: int = Query(default=3, ge=1, le=60),
-    manual2_days: int = Query(default=10, ge=2, le=90),
-    manual3_days: int = Query(default=30, ge=3, le=180),
 ):
-    schedule = follow_up_schedule_config(auto_hours, manual1_days, manual2_days, manual3_days)
+    # The currently deployed dashboard still requests this route with timing
+    # parameters from localStorage. Keep the page loadable during the
+    # backend-first rollout, but never let that browser state schedule or send
+    # a message. The replacement dashboard reads /follow-ups/jobs.
+    return []
 
+
+@app.get("/follow-ups/jobs")
+async def list_follow_up_jobs(user_id: str = Depends(require_jwt), limit: int = Query(default=200, ge=1, le=500)):
+    settings = await get_follow_up_settings_strict(user_id)
+    select = "id,conversation_id,stage,stage_index,due_at,scheduled_at,next_retry_at,status,mode,attempt_count,last_error,sent_at,cancelled_at,created_at,conversations(id,username,display_name,channel)"
     async with httpx.AsyncClient() as http:
-        res = await http.get(
-            SUPABASE_CONVERSATIONS_URL,
-            headers={**supabase_headers(), "Accept": "application/json"},
-            params={
-                "order": "created_at.desc",
-                "limit": "500",
-                "user_id": f"eq.{user_id}",
-                "select": "id,created_at,user_id,username,display_name,message,status,agent_active,automation_mode,history,conversation_memory,conversation_memory_through_message_count,channel,external_contact_id,phone_e164,last_inbound_at,messaging_provider,messaging_connection_id,human_takeover,contact_status,opted_out_at",
-            },
-            timeout=10.0,
+        active, recent = await asyncio.gather(
+            http.get(SUPABASE_FOLLOW_UP_JOBS_URL, headers=supabase_headers(),
+                params={"user_id": f"eq.{user_id}", "status": "in.(scheduled,processing,manual_required,blocked,failed)",
+                        "order": "scheduled_at.asc", "limit": str(limit), "select": select}, timeout=10.0),
+            http.get(SUPABASE_FOLLOW_UP_JOBS_URL, headers=supabase_headers(),
+                params={"user_id": f"eq.{user_id}", "status": "in.(sent,cancelled)",
+                        "order": "created_at.desc", "limit": str(min(limit, 100)), "select": select}, timeout=10.0),
         )
-        res.raise_for_status()
-        conversations = res.json()
-
-    items = []
-    for conv in conversations:
-        item = await build_follow_up_item(conv, schedule)
-        if item:
-            items.append(item)
-    items.sort(key=lambda item: (item["sort"], -item["hours_since_user"]))
-    return items
+        active.raise_for_status()
+        recent.raise_for_status()
+        jobs = active.json() + recent.json()
+    now = datetime.now(timezone.utc)
+    for job in jobs:
+        job["timezone"] = settings["timezone"]
+        runnable_at = parse_iso(job.get("next_retry_at")) or parse_iso(job["scheduled_at"])
+        if job["status"] == "scheduled" and runnable_at <= now:
+            job["display_status"] = "due"
+        else:
+            job["display_status"] = job["status"]
+        job["deferred_closed"] = parse_iso(job["scheduled_at"]) > parse_iso(job["due_at"])
+    return jobs
 
 
 @app.post("/follow-ups/preview")
@@ -7611,68 +7966,7 @@ async def manychat_auto_23h_follow_up(
     payload: ManyChatFollowUpPayload,
     x_webhook_secret: Optional[str] = Header(default=None),
 ):
-    user_id = await require_secret(x_webhook_secret)
-
-    subscriber_id = payload.subscriber_id.strip()
-    if not subscriber_id:
-        return {"ok": False, "message": "", "reason": "subscriber_id is required"}
-
-    conversation = await get_contact(subscriber_id, user_id)
-    if not conversation:
-        return {"ok": False, "message": "", "reason": "Conversation not found"}
-
-    due_item = await build_follow_up_item(conversation)
-    if not due_item or due_item.get("stage") != "auto_23h":
-        return {"ok": False, "message": "", "reason": "Auto 23h follow-up is not due"}
-    if due_item.get("send_blocked_reason"):
-        return {"ok": False, "message": "", "reason": due_item["send_blocked_reason"], "queued_until": due_item.get("queued_until")}
-
-    try:
-        await enforce_ai_cost_cap(user_id)
-    except (CostCapExceededError, AiSpendUnavailableError) as error:
-        return {"ok": False, "message": "", "reason": cost_cap_error_payload(error)["error_type"]}
-    generation = await generate_follow_up_result(conversation, "auto_23h")
-    message = generation.text
-    await record_ai_usage_event(
-        user_id,
-        "follow_up_manychat_auto_23h",
-        json.dumps(conversation.get("history") or [], ensure_ascii=False),
-        message,
-        usage=generation.usage,
-        conversation_id=conversation.get("id"),
-        request_kind="follow_up_manychat_auto_23h",
-    )
-    history = conversation.get("history") or []
-    new_history = history + [{
-        "role": "assistant",
-        "content": message,
-        "timestamp": now_iso(),
-        "follow_up_stage": "auto_23h",
-        "follow_up_mode": "manychat",
-        "source": "follow_up_manychat",
-    }]
-
-    async with httpx.AsyncClient() as http:
-        res = await http.patch(
-            SUPABASE_CONVERSATIONS_URL,
-            headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"username": f"eq.{subscriber_id}", "user_id": f"eq.{user_id}"},
-            json={
-                "response": message,
-                "history": new_history,
-                "status": "en_cours",
-            },
-            timeout=10.0,
-        )
-        res.raise_for_status()
-
-    return {
-        "ok": True,
-        "message": message,
-        "conversation_id": conversation.get("id"),
-        "stage": "auto_23h",
-        "reason": None,
-    }
+    raise HTTPException(status_code=410, detail="Legacy H+23 route retired; use persistent jobs")
 
 
 @app.post("/follow-ups/{conversation_id}/send-auto-23h")
@@ -7680,96 +7974,11 @@ async def send_auto_23h_follow_up(
     conversation_id: str,
     payload: Optional[FollowUpGenerationPayload] = None,
     user_id: str = Depends(require_jwt),
-    auto_hours: int = Query(default=AUTO_FOLLOW_UP_HOURS, ge=1, le=23),
-    manual1_days: int = Query(default=3, ge=1, le=60),
-    manual2_days: int = Query(default=10, ge=2, le=90),
-    manual3_days: int = Query(default=30, ge=3, le=180),
 ):
-    schedule = follow_up_schedule_config(auto_hours, manual1_days, manual2_days, manual3_days)
-
-    conversation = await get_conversation_by_id(conversation_id, user_id)
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    channel = conversation.get("channel") or "instagram"
-    if channel == "instagram" and not MANYCHAT_API_KEY:
-        raise HTTPException(status_code=500, detail="MANYCHAT_API_KEY is not configured")
-    if channel == "whatsapp" and (not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID):
-        raise HTTPException(status_code=500, detail="WhatsApp API is not configured")
-
-    due_item = await build_follow_up_item(conversation, schedule)
-    if not due_item or due_item.get("stage") != "auto_23h":
-        raise HTTPException(status_code=409, detail="Auto 23h follow-up is not due")
-    if due_item.get("send_blocked_reason"):
-        raise HTTPException(status_code=409, detail={"reason": due_item["send_blocked_reason"], "queued_until": due_item.get("queued_until")})
-
-    try:
-        await enforce_ai_cost_cap(user_id)
-    except (CostCapExceededError, AiSpendUnavailableError) as e:
-        raise HTTPException(status_code=402, detail=cost_cap_error_payload(e))
-    generation = await generate_follow_up_result(
-        conversation,
-        "auto_23h",
-        payload.ai_instruction if payload else None,
-        payload.follow_up_delay_label if payload else None,
-    )
-    message = generation.text
-    await record_ai_usage_event(
-        user_id,
-        "follow_up_auto_23h",
-        json.dumps(conversation.get("history") or [], ensure_ascii=False),
-        message,
-        usage=generation.usage,
-        conversation_id=conversation_id,
-        request_kind="follow_up_auto_23h",
-    )
-    send_result = await send_channel_message(conversation, message)
-    is_pending_delivery = is_manychat_pending_delivery_error(send_result)
-    if send_result["status_code"] >= 400 and not is_pending_delivery:
-        raise HTTPException(status_code=502, detail=f"Send error: {send_result['body']}")
-
-    history = conversation.get("history") or []
-    sent = send_result["status_code"] < 400
-    new_history = history + [{
-        "role": "assistant",
-        "content": message,
-        "timestamp": now_iso(),
-        "follow_up_stage": "auto_23h",
-        "follow_up_mode": "auto",
-        "source": "follow_up_auto",
-        "sent": sent,
-        "pending_delivery": is_pending_delivery,
-        "delivery_failed": is_pending_delivery,
-        "delivery_status": "pending_delivery" if is_pending_delivery else "sent",
-        "send_status_code": send_result.get("status_code"),
-        **({"send_error_body": (send_result.get("body") or "")[:500]} if is_pending_delivery else {}),
-    }]
-
-    async with httpx.AsyncClient() as http:
-        res = await http.patch(
-            SUPABASE_CONVERSATIONS_URL,
-            headers={**supabase_headers(), "Prefer": "return=minimal"},
-            params={"id": f"eq.{conversation_id}", "user_id": f"eq.{user_id}"},
-            json={
-                "response": message,
-                "history": new_history,
-                "status": "pending_delivery" if is_pending_delivery else "en_cours",
-                "pending_message": message if is_pending_delivery else None,
-                "pending_message_at": now_iso() if is_pending_delivery else None,
-            },
-            timeout=10.0,
-        )
-        res.raise_for_status()
-
-    return {
-        "conversation_id": conversation_id,
-        "stage": "auto_23h",
-        "message": message,
-        "sent": sent,
-        "status": "pending_delivery" if is_pending_delivery else "sent",
-    }
+    raise HTTPException(status_code=410, detail="Legacy H+23 route retired; use persistent jobs")
 
 
-# ── Cron auto 23h check (remplace le trigger ManyChat) ───────────────────────
+# ── Legacy cron compatibility route ──────────────────────────────────────────
 
 
 @app.post("/follow-ups/cron-auto-check")
@@ -7777,113 +7986,10 @@ async def cron_auto_follow_up_check(
     x_dashboard_secret: Optional[str] = Header(default=None),
     x_angellos_route_scope: Optional[str] = Header(default=None),
 ):
-    """Cron endpoint: scan all conversations and send auto 23h follow-ups for due ones.
-    Replaces the ManyChat trigger that doesn't fire reliably."""
     require_dashboard_secret(x_dashboard_secret)
     require_route_scope(x_angellos_route_scope, "admin")
-
-    results = {"checked": 0, "auto_sent": 0, "errors": 0, "details": []}
-
-    async with httpx.AsyncClient() as http:
-        res = await http.get(
-            SUPABASE_CONVERSATIONS_URL,
-            headers={**supabase_headers(), "Accept": "application/json"},
-            params={
-                "order": "created_at.desc",
-                "limit": "500",
-                "select": "id,created_at,user_id,username,display_name,message,status,agent_active,automation_mode,history,conversation_memory,conversation_memory_through_message_count,channel,external_contact_id,phone_e164,last_inbound_at,messaging_provider,messaging_connection_id,human_takeover,contact_status,opted_out_at",
-            },
-            timeout=10.0,
-        )
-        res.raise_for_status()
-        conversations = res.json()
-
-    for conv in conversations:
-        due_item = await build_follow_up_item(conv)
-        if not due_item or due_item.get("stage") != "auto_23h":
-            continue
-        if due_item.get("send_blocked_reason"):
-            results["details"].append({
-                "conversation_id": conv["id"],
-                "username": conv.get("username"),
-                "sent": False,
-                "queued_until": due_item.get("queued_until"),
-                "reason": due_item["send_blocked_reason"],
-            })
-            continue
-
-        results["auto_sent"] += 1
-        try:
-            conv_user_id = conv.get("user_id")
-            if conv_user_id:
-                await enforce_ai_cost_cap(conv_user_id)
-            generation = await generate_follow_up_result(conv, "auto_23h")
-            message = generation.text
-            if conv_user_id:
-                await record_ai_usage_event(
-                    conv_user_id,
-                    "follow_up_cron_auto_23h",
-                    json.dumps(conv.get("history") or [], ensure_ascii=False),
-                    message,
-                    usage=generation.usage,
-                    conversation_id=conv.get("id"),
-                    request_kind="follow_up_cron_auto_23h",
-                )
-            send_result = await send_channel_message(conv, message)
-            sent = send_result.get("status_code", 500) < 400
-            is_pending_delivery = is_manychat_pending_delivery_error(send_result)
-            if not sent and not is_pending_delivery:
-                raise HTTPException(status_code=502, detail=f"Send error: {send_result.get('body')}")
-
-            history = conv.get("history") or []
-            new_history = history + [{
-                "role": "assistant",
-                "content": message,
-                "timestamp": now_iso(),
-                "follow_up_stage": "auto_23h",
-                "follow_up_mode": "auto",
-                "source": "follow_up_cron",
-                "sent": sent,
-                "pending_delivery": is_pending_delivery,
-                "delivery_failed": is_pending_delivery,
-                "delivery_status": "pending_delivery" if is_pending_delivery else "sent",
-                "send_status_code": send_result.get("status_code"),
-                **({"send_error_body": (send_result.get("body") or "")[:500]} if is_pending_delivery else {}),
-            }]
-
-            async with httpx.AsyncClient() as http2:
-                await http2.patch(
-                    SUPABASE_CONVERSATIONS_URL,
-                    headers={**supabase_headers(), "Prefer": "return=minimal"},
-                    params={"id": f"eq.{conv['id']}", "user_id": f"eq.{conv_user_id}"},
-                    json={
-                        "response": message,
-                        "history": new_history,
-                        "status": "pending_delivery" if is_pending_delivery else "en_cours",
-                        "pending_message": message if is_pending_delivery else None,
-                        "pending_message_at": now_iso() if is_pending_delivery else None,
-                    },
-                    timeout=10.0,
-                )
-
-            results["details"].append({
-                "conversation_id": conv["id"],
-                "username": conv.get("username"),
-                "sent": sent,
-                "status": "pending_delivery" if is_pending_delivery else "sent",
-                "send_status": send_result.get("status_code"),
-            })
-        except Exception as e:
-            results["errors"] += 1
-            results["details"].append({
-                "conversation_id": conv["id"],
-                "username": conv.get("username"),
-                "sent": False,
-                "error": str(e)[:200],
-            })
-
-    results["checked"] = len(conversations)
-    return results
+    count = await process_due_follow_up_jobs()
+    return {"checked_jobs": count, "legacy_scan": False}
 
 
 # ── Playground endpoint ───────────────────────────────────────────────────────
