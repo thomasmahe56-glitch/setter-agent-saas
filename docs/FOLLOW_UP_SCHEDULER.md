@@ -128,6 +128,17 @@ reconciliation error; an operator must compare the Meta thread with CRM history.
    A rollback must stop the worker before reverting the application; retain
    job records for reconciliation.
 
+The active database currently has one tenant settings row whose stages still
+use `auto_23h`, `j3`, `j10`, and `j30` without an explicit `enabled: true`.
+The new normalizer maps them to generic stages but keeps all four disabled.
+The 92 queued existing conversations therefore cannot begin automatic outreach
+merely because the worker is deployed. After the approved backend/dashboard
+rollout, explicitly save the desired enabled stages (for example +7 hours) in
+the live Training Center and verify the resulting job for a known-safe Meta
+conversation. That conversation's inbound timestamp must also be within the
+allowed Meta window before an automatic send can occur; a newly configured
+delay never overrides the channel gate.
+
 ## Live-project migration incident and validation (2026-09-15)
 
 The migration was applied to the Supabase project named `setter-saas-test`
