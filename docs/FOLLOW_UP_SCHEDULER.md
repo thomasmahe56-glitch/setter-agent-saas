@@ -279,3 +279,22 @@ Never use the publishable/anon key or the JWT signing secret for this worker.
 The workers were paused while the credential was missing; they are now enabled
 on the isolated Railway service. The unrelated scheduled-reply worker remains
 disabled there because the scheduler-specific test database lacks its tables.
+
+After the worker began requiring a Meta connection selector and scoped recipient,
+the minimal isolated schema needed `test_only_meta_delivery_identity.sql`. It
+adds the production-shaped selector column and a synthetic placeholder UUID to
+the two disposable auto conversations. This placeholder is not a real Meta
+connection; the test service has Meta sending disabled. The production schema
+already has the column and its foreign key.
+
+With config version 7 still at `+7h`, `08:00-20:00`, `Europe/Paris`, the
+isolated Synthetic Closed Hours conversation was given a synthetic sent message
+at 14:00 Paris. The cloud worker consumed its refresh item, cancelled the
+previous scheduled job, and created exactly one stage-1 auto job with
+`due_at = 21:00` Paris and `scheduled_at = 08:00` Paris the next day. A real
+browser reload showed both times and “messagerie fermée à l’échéance”; the
+Follow-ups request returned HTTP 200. A synthetic prospect reply was then
+recorded on the other scheduled conversation. The cloud worker consumed that
+refresh item, cancelled its future job, and the browser's scheduled count fell
+from two to one; the closed-hours job stayed visible. Browser console had no
+errors, only Next.js smooth-scroll warnings. No DM was sent in either test.
