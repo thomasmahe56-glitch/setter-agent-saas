@@ -235,6 +235,16 @@ page showed the auto job before its due time and explained that the Meta-limited
 job needs manual action **after** its due time. No provider connection or real
 prospect exists in this test database, and outbound Meta is disabled.
 
+After the sequential-stage change, the isolated browser added and saved
+`follow_up_2` as enabled/auto at `+1 hour` while `follow_up_1` remained
+enabled/auto at `+7 hours`. SQL read configuration version 7 and both stages.
+The new Railway worker processed the refresh queue and persisted only two
+future `follow_up_1` jobs, one for each eligible synthetic conversation;
+there were zero queued conversations and no active `follow_up_2` job. The
+Follow-ups page showed only the two stage-1 jobs, and browser console errors
+were empty. This verifies that a shorter later-stage delay cannot overtake
+the first stage. Both test conversations use a disabled outbound Meta adapter.
+
 Database checks on the isolated project confirmed that the conversation insert
 queued one refresh item, a service-role RPC claimed one fictional due job, a
 second claim returned zero, and rollback left zero persistent jobs. The
