@@ -3038,23 +3038,29 @@ async def send_channel_message(conversation: dict, text: str, *, at_most_once: b
             )
         except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
             provider_event_id = None
-        await record_usage_ledger_event(
-            user_id=user_id,
-            module="setter",
-            feature="outbound_channel_message",
-            event_type="channel_message_sent",
-            provider=provider,
-            service="messaging",
-            status="accepted",
-            idempotency_key=(f"{provider}:{provider_event_id}" if provider_event_id else f"{provider}:local:{uuid4()}"),
-            provider_event_id=provider_event_id,
-            quantity=1,
-            unit="message",
-            conversation_id=conversation.get("id"),
-            cost_accuracy="unknown",
-            cost_source="provider_cost_unavailable",
-            metadata={"channel": channel},
-        )
+        try:
+            await record_usage_ledger_event(
+                user_id=user_id,
+                module="setter",
+                feature="outbound_channel_message",
+                event_type="channel_message_sent",
+                provider=provider,
+                service="messaging",
+                status="accepted",
+                idempotency_key=(f"{provider}:{provider_event_id}" if provider_event_id else f"{provider}:local:{uuid4()}"),
+                provider_event_id=provider_event_id,
+                quantity=1,
+                unit="message",
+                conversation_id=conversation.get("id"),
+                cost_accuracy="unknown",
+                cost_source="provider_cost_unavailable",
+                metadata={"channel": channel},
+            )
+        except Exception as exc:
+            # Delivery already succeeded. A ledger outage must not turn that
+            # success into an ambiguous retry or hide it from the job status.
+            print(f"[messaging] sent_but_ledger_failed conversation={conversation.get('id')} "
+                  f"error={type(exc).__name__}", flush=True)
     return result
 
 

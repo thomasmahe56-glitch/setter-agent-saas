@@ -49,6 +49,9 @@ The existing `/usage/summary` field `follow_ups` counts AI generations
 not a delivery counter. The Follow-ups page's **Sent** group reads
 `follow_up_jobs.status = sent`, which the worker writes only after a successful
 provider response. No separate `auto_sent` field exists in these repositories.
+If the provider accepted a message but usage-ledger recording fails, the
+adapter logs that accounting failure and still returns the successful delivery
+response so the job becomes `sent` instead of an ambiguous retry.
 
 ## Rollout
 

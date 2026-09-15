@@ -66,6 +66,19 @@ def test_server_api_key_headers_support_new_and_legacy_supabase_keys(monkeypatch
     assert legacy_headers["Authorization"] == "Bearer eyJlegacy-test-only"
 
 
+def test_successful_provider_response_survives_usage_ledger_failure(monkeypatch, capsys):
+    provider = AsyncMock(return_value={"status_code": 200, "body": '{"message_id":"accepted-1"}'})
+    monkeypatch.setattr(main, "send_manychat_message", provider)
+    monkeypatch.setattr(main, "record_usage_ledger_event", AsyncMock(side_effect=RuntimeError("ledger offline")))
+    result = asyncio.run(main.send_channel_message({
+        "id": "conversation-1", "user_id": "tenant-1", "channel": "instagram",
+        "messaging_provider": main.MANYCHAT_PROVIDER, "external_contact_id": "synthetic-contact",
+    }, "A short follow-up", at_most_once=True))
+    assert result["status_code"] == 200
+    provider.assert_awaited_once()
+    assert "sent_but_ledger_failed" in capsys.readouterr().out
+
+
 def test_test_service_can_pause_workers_until_credentials_are_configured(monkeypatch):
     monkeypatch.setenv("BACKEND_WORKERS_ENABLED", "false")
     scheduled = AsyncMock()
