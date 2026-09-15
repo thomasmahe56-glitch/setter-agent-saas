@@ -102,6 +102,12 @@ The successful-delivery test follows a due job through one provider attempt,
 `sent` persistence, and a `follow_up_job_id` entry in conversation history;
 timeout and competing-worker tests cover the opposite outcomes. No test
 provider sends to a real account.
+An integrated worker test also runs the refresh queue, creates a future job,
+advances a virtual clock to its due time, claims it, calls a simulated provider
+once, persists `sent` and the conversation history, and confirms that another
+worker pass cannot send it again. Its database and provider adapters are fake;
+the isolated Railway/Supabase checks below separately prove cloud persistence
+and real queue/RPC operation without outbound messaging.
 The initial browser demo used test fixtures and the initial local backend used
 a dummy Supabase URL. The later isolated Railway/Supabase setup verified real
 Training Center save/reload, worker queue processing, and Railway redeployment
