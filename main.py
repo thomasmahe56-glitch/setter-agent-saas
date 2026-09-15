@@ -380,6 +380,11 @@ expose_api_docs = os.environ.get("EXPOSE_API_DOCS", "false").strip().lower() == 
 
 @asynccontextmanager
 async def app_lifespan(_: FastAPI):
+    workers_enabled = os.environ.get("BACKEND_WORKERS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+    if not workers_enabled:
+        print("[workers] disabled by BACKEND_WORKERS_ENABLED", flush=True)
+        yield
+        return
     scheduled_reply_task = asyncio.create_task(scheduled_reply_worker())
     follow_up_task = asyncio.create_task(follow_up_worker())
     try:

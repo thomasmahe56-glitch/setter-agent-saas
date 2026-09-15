@@ -53,6 +53,20 @@ def setup(monkeypatch, *, conv=None, config=None):
     return patch, send
 
 
+def test_test_service_can_pause_workers_until_credentials_are_configured(monkeypatch):
+    monkeypatch.setenv("BACKEND_WORKERS_ENABLED", "false")
+    scheduled = AsyncMock()
+    follow_up = AsyncMock()
+    monkeypatch.setattr(main, "scheduled_reply_worker", scheduled)
+    monkeypatch.setattr(main, "follow_up_worker", follow_up)
+    async def run():
+        async with main.app_lifespan(main.app):
+            pass
+    asyncio.run(run())
+    scheduled.assert_not_awaited()
+    follow_up.assert_not_awaited()
+
+
 def test_prospect_reply_cancels_old_job_before_send(monkeypatch):
     latest = ANCHOR + timedelta(hours=4)
     patch, send = setup(monkeypatch, conv=conversation(last_inbound_at=latest.isoformat(),
