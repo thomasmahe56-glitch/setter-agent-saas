@@ -91,6 +91,7 @@ SUPABASE_CREDIT_RULES_URL = f"{config.supabase_url}/credit_rules"
 SUPABASE_CREDIT_TRANSACTIONS_URL = f"{config.supabase_url}/credit_transactions"
 SUPABASE_COMMERCIAL_CATALOG_STATE_URL = f"{config.supabase_url}/commercial_catalog_state"
 SUPABASE_COMMERCIAL_PLAN_VERSIONS_URL = f"{config.supabase_url}/commercial_plan_versions"
+SUPABASE_COMMERCIAL_LEAD_REQUESTS_URL = f"{config.supabase_url}/commercial_lead_requests"
 SUPABASE_PROSPECTS_URL = f"{config.supabase_url}/prospects"
 SUPABASE_PROCESSED_INBOUND_EVENTS_URL = f"{config.supabase_url}/processed_inbound_events"
 SUPABASE_MESSAGING_CONNECTIONS_URL = f"{config.supabase_url}/messaging_connections"
@@ -6157,6 +6158,83 @@ async def commercial_catalog() -> dict[str, Any]:
         raise
     except (httpx.HTTPError, ValueError, TypeError):
         raise HTTPException(status_code=503, detail="Commercial catalog service unavailable")
+
+
+class CommercialLeadPayload(BaseModel):
+    intent: Literal["interest", "demo", "founding"]
+    locale: Literal["en", "fr"]
+    name: str = Field(min_length=2, max_length=100)
+    email: str = Field(min_length=3, max_length=200)
+    instagram: str = Field(min_length=1, max_length=30)
+    offer: str = Field(min_length=1, max_length=250)
+    need: str = Field(min_length=1, max_length=600)
+    selectedPlan: Optional[Literal["setter", "prospecting", "complete"]] = None
+
+
+def _commercial_lead_ip_hash(request: Request) -> str:
+    client_ip = request.headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
+    if not client_ip and request.client:
+        client_ip = request.client.host
+    return hashlib.sha256((client_ip or "unknown").encode("utf-8")).hexdigest()
+
+
+@app.post("/commercial/leads", status_code=201)
+async def create_commercial_lead(
+    payload: CommercialLeadPayload,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+) -> dict[str, bool]:
+    """Persist an interest/demo request from the marketing server only."""
+    token = config.commercial_lead_server_token
+    if not token:
+        raise HTTPException(status_code=503, detail="Commercial lead intake is unavailable")
+    expected = f"Bearer {token}"
+    if not authorization or not hmac.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="Invalid commercial lead authorization")
+    name = payload.name.strip()
+    email = payload.email.strip().lower()
+    instagram = payload.instagram.strip().removeprefix("@")
+    offer = payload.offer.strip()
+    need = payload.need.strip()
+    if not all((name, email, instagram, offer, need)):
+        raise HTTPException(status_code=422, detail="Commercial lead fields cannot be blank")
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise HTTPException(status_code=422, detail="Invalid commercial lead email")
+    if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", instagram):
+        raise HTTPException(status_code=422, detail="Invalid commercial lead Instagram profile")
+    if payload.selectedPlan is not None and payload.intent != "demo":
+        raise HTTPException(status_code=422, detail="A selected plan requires a demo request")
+    dedupe_material = "\0".join((payload.intent, email, payload.selectedPlan or ""))
+    row = {
+        "intent": payload.intent,
+        "locale": payload.locale,
+        "name": name,
+        "email": email,
+        "email_normalized": email,
+        "instagram": instagram,
+        "offer": offer,
+        "need": need,
+        "selected_plan": payload.selectedPlan,
+        "dedupe_key": hashlib.sha256(dedupe_material.encode("utf-8")).hexdigest(),
+        "source_ip_hash": _commercial_lead_ip_hash(request),
+    }
+    try:
+        async with httpx.AsyncClient() as http:
+            response = await http.post(
+                SUPABASE_COMMERCIAL_LEAD_REQUESTS_URL,
+                headers={**supabase_headers(), "Prefer": "return=minimal"},
+                json=row,
+                timeout=5.0,
+            )
+        if response.status_code in {409, 23505}:
+            raise HTTPException(status_code=409, detail="Commercial lead already received")
+        if response.status_code >= 400:
+            raise HTTPException(status_code=503, detail="Commercial lead intake is unavailable")
+    except HTTPException:
+        raise
+    except httpx.HTTPError:
+        raise HTTPException(status_code=503, detail="Commercial lead intake is unavailable")
+    return {"ok": True}
 
 
 @app.get("/simulator/scenarios")
