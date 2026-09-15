@@ -7517,14 +7517,42 @@ async def process_follow_up_refresh_queue() -> int:
     return handled
 
 
+async def reschedule_follow_up_preparation_error(
+    job: dict, exc: Exception, *, now: datetime, use_real_clock: bool,
+) -> str:
+    attempt_count = int(job.get("attempt_count") or 1)
+    if attempt_count < 3:
+        retry_seconds = min(60 * (2 ** (attempt_count - 1)), 900)
+        retry_time = (datetime.now(timezone.utc) if use_real_clock else now) + timedelta(seconds=retry_seconds)
+        await patch_follow_up_job(job["id"], {"status": "scheduled",
+            "next_retry_at": retry_time.isoformat(),
+            "last_error": f"Preparation failed: {type(exc).__name__}; retry {attempt_count + 1}/3 scheduled"},
+            expected_status="processing")
+        print(f"[follow-up] preparation_retry job={job['id']} attempt={attempt_count} "
+              f"error={type(exc).__name__}", flush=True)
+        return "scheduled"
+    await patch_follow_up_job(job["id"], {"status": "failed", "next_retry_at": None,
+        "last_error": f"Preparation failed after 3 attempts: {type(exc).__name__}"},
+        expected_status="processing")
+    print(f"[follow-up] preparation_exhausted job={job['id']} error={type(exc).__name__}", flush=True)
+    return "failed"
+
+
 async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> str:
     use_real_clock = now is None
     now = now or datetime.now(timezone.utc)
-    if now < parse_iso(job["due_at"]) or now < parse_iso(job["scheduled_at"]):
+    retry_at = parse_iso(job.get("next_retry_at"))
+    if (now < parse_iso(job["due_at"]) or now < parse_iso(job["scheduled_at"]) or
+        (retry_at and now < retry_at)):
         await patch_follow_up_job(job["id"], {"status": "scheduled"}, expected_status="processing")
         return "scheduled"
-    conversation = await get_conversation_by_id(job["conversation_id"], job["user_id"])
-    settings = await get_follow_up_settings_strict(job["user_id"])
+    try:
+        conversation = await get_conversation_by_id(job["conversation_id"], job["user_id"])
+        settings = await get_follow_up_settings_strict(job["user_id"])
+    except Exception as exc:
+        return await reschedule_follow_up_preparation_error(
+            job, exc, now=now, use_real_clock=use_real_clock,
+        )
     if not conversation or settings["follow_up_config_version"] != job["config_version"]:
         await patch_follow_up_job(job["id"], {"status": "cancelled", "cancelled_at": now_iso(),
             "last_error": "Configuration changed or conversation removed"}, expected_status="processing")
@@ -7561,7 +7589,8 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
     next_window = next_allowed_send_at(now, settings)
     if next_window > now:
         await patch_follow_up_job(job["id"], {"status": "scheduled",
-            "scheduled_at": next_window.isoformat(), "last_error": "Messaging hours closed"},
+            "scheduled_at": next_window.isoformat(), "next_retry_at": None,
+            "last_error": "Messaging hours closed"},
             expected_status="processing")
         return "scheduled"
     stage = next((s for s in normalize_stages(settings["follow_up_config"])
@@ -7613,7 +7642,8 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
         next_send_window = next_allowed_send_at(send_time, fresh_settings)
         if next_send_window > send_time:
             await patch_follow_up_job(job["id"], {"status": "scheduled",
-                "scheduled_at": next_send_window.isoformat(), "last_error": "Messaging hours closed during preparation"},
+                "scheduled_at": next_send_window.isoformat(), "next_retry_at": None,
+                "last_error": "Messaging hours closed during preparation"},
                 expected_status="processing")
             return "scheduled"
         external_attempted = True
@@ -7651,12 +7681,14 @@ async def execute_follow_up_job(job: dict, *, now: datetime | None = None) -> st
         if sent:
             print(f"[follow-up] sent_but_sync_failed job={job['id']} error={type(exc).__name__}", flush=True)
             return "sent"
-        status = "manual_required" if external_attempted else "failed"
-        await patch_follow_up_job(job["id"], {"status": status,
-            "last_error": f"{'Ambiguous attempt' if external_attempted else 'Preparation failed'}: {type(exc).__name__}"},
-            expected_status="processing")
-        print(f"[follow-up] worker_failure job={job['id']} error={type(exc).__name__}", flush=True)
-        return status
+        if external_attempted:
+            await patch_follow_up_job(job["id"], {"status": "manual_required",
+                "last_error": f"Ambiguous attempt: {type(exc).__name__}"}, expected_status="processing")
+            print(f"[follow-up] ambiguous_provider_attempt job={job['id']} error={type(exc).__name__}", flush=True)
+            return "manual_required"
+        return await reschedule_follow_up_preparation_error(
+            job, exc, now=now, use_real_clock=use_real_clock,
+        )
 
 
 async def process_due_follow_up_jobs() -> int:
@@ -7703,7 +7735,7 @@ async def get_due_follow_ups(
 @app.get("/follow-ups/jobs")
 async def list_follow_up_jobs(user_id: str = Depends(require_jwt), limit: int = Query(default=200, ge=1, le=500)):
     settings = await get_follow_up_settings_strict(user_id)
-    select = "id,conversation_id,stage,stage_index,due_at,scheduled_at,status,mode,attempt_count,last_error,sent_at,cancelled_at,created_at,conversations(id,username,display_name,channel)"
+    select = "id,conversation_id,stage,stage_index,due_at,scheduled_at,next_retry_at,status,mode,attempt_count,last_error,sent_at,cancelled_at,created_at,conversations(id,username,display_name,channel)"
     async with httpx.AsyncClient() as http:
         active, recent = await asyncio.gather(
             http.get(SUPABASE_FOLLOW_UP_JOBS_URL, headers=supabase_headers(),
@@ -7719,7 +7751,8 @@ async def list_follow_up_jobs(user_id: str = Depends(require_jwt), limit: int = 
     now = datetime.now(timezone.utc)
     for job in jobs:
         job["timezone"] = settings["timezone"]
-        if job["status"] == "scheduled" and parse_iso(job["scheduled_at"]) <= now:
+        runnable_at = parse_iso(job.get("next_retry_at")) or parse_iso(job["scheduled_at"])
+        if job["status"] == "scheduled" and runnable_at <= now:
             job["display_status"] = "due"
         else:
             job["display_status"] = job["status"]

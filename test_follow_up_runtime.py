@@ -368,12 +368,38 @@ def test_ambiguous_provider_timeout_is_never_retried_automatically(monkeypatch):
     assert patch.await_args.args[1]["status"] == "manual_required"
 
 
-def test_ai_preparation_error_is_failed_without_provider_attempt(monkeypatch):
+def test_ai_preparation_error_schedules_bounded_retry_without_provider_attempt(monkeypatch):
     patch, send = setup(monkeypatch)
     main.generate_follow_up_result.side_effect = RuntimeError("No model")
-    assert asyncio.run(main.execute_follow_up_job(job(), now=NOW)) == "failed"
+    assert asyncio.run(main.execute_follow_up_job(job(attempt_count=1), now=NOW)) == "scheduled"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["status"] == "scheduled"
+    assert patch.await_args.args[1]["next_retry_at"] == (NOW + timedelta(minutes=1)).isoformat()
+
+
+def test_read_outage_before_generation_schedules_safe_retry(monkeypatch):
+    patch, send = setup(monkeypatch)
+    main.get_conversation_by_id.side_effect = RuntimeError("Database temporarily unavailable")
+    assert asyncio.run(main.execute_follow_up_job(job(attempt_count=1), now=NOW)) == "scheduled"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["next_retry_at"] == (NOW + timedelta(minutes=1)).isoformat()
+
+
+def test_retry_waits_until_persisted_retry_time(monkeypatch):
+    patch, send = setup(monkeypatch)
+    future = NOW + timedelta(minutes=2)
+    assert asyncio.run(main.execute_follow_up_job(job(next_retry_at=future.isoformat()), now=NOW)) == "scheduled"
+    send.assert_not_awaited()
+    assert patch.await_args.args[1]["status"] == "scheduled"
+
+
+def test_preparation_exhaustion_is_visible_without_provider_attempt(monkeypatch):
+    patch, send = setup(monkeypatch)
+    main.generate_follow_up_result.side_effect = RuntimeError("No model")
+    assert asyncio.run(main.execute_follow_up_job(job(attempt_count=3), now=NOW)) == "failed"
     send.assert_not_awaited()
     assert patch.await_args.args[1]["status"] == "failed"
+    assert "after 3 attempts" in patch.await_args.args[1]["last_error"]
 
 
 def test_worker_loop_is_server_side_and_independent_of_dashboard(monkeypatch):

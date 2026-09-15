@@ -36,6 +36,12 @@ external attempt is ambiguous because Meta/ManyChat do not accept an idempotency
 key in the current provider adapters. Such a job becomes `manual_required` and
 is never retried automatically. This guarantees at-most-once automatic attempts;
 an operator must reconcile ambiguous provider outcomes before a manual action.
+Preparation errors before any provider call are different: the worker stores
+`next_retry_at`, retries at most three preparations with a bounded backoff,
+and exposes the retry time in the dashboard. The original `scheduled_at` stays
+intact for audit. An exhausted preparation becomes visible as `failed`. A
+worker crash while `processing` is still treated conservatively as ambiguous
+because the database cannot know whether an external call had started.
 
 The channel window is checked when planning, before generation, after
 generation, and again by the Meta adapter at send time. If the planned instant already lies beyond the
@@ -57,7 +63,8 @@ response so the job becomes `sent` instead of an ambiguous retry.
 
 1. On the isolated Supabase project, apply
    `migrations/test_only_follow_up_baseline.sql` and
-   `migrations/add_persistent_follow_up_jobs.sql`. Confirm grants, RLS,
+   `migrations/add_persistent_follow_up_jobs.sql`, followed by
+   `migrations/add_follow_up_preparation_retry.sql`. Confirm grants, RLS,
    triggers, PostgREST schema cache, and RPC functions using test queries.
 2. Deploy the backend branch to the isolated Railway project and point a local
    dashboard at that service and the isolated Supabase database. Keep Railway
@@ -70,7 +77,8 @@ response so the job becomes `sent` instead of an ambiguous retry.
    concurrent claim attempts against the test database. Use provider mocks;
    do not contact a real prospect.
 4. Review the test evidence with Thomas. The persistent-jobs migration is
-   already present on the live database; deploy the backend before dashboard
+   already present on the live database; apply the additive preparation-retry
+   migration and deploy the backend before dashboard
    to production only after approval. The old dashboard still calls
    `/follow-ups/due` with browser-supplied delays. During the short interval
    before the dashboard deploy, that legacy route returns an empty list rather
@@ -119,6 +127,13 @@ once, persists `sent` and the conversation history, and confirms that another
 worker pass cannot send it again. Its database and provider adapters are fake;
 the isolated Railway/Supabase checks below separately prove cloud persistence
 and real queue/RPC operation without outbound messaging.
+The integrated test also simulates a first AI-preparation outage: the job stays
+scheduled with a persisted retry instant, cannot be claimed early, and is sent
+once after the virtual clock advances. On the isolated Supabase project, the
+additive retry migration was applied, then a transaction-local synthetic job
+proved the real RPC skips a future retry, claims it once when eligible, and
+cannot claim it a second time. The synthetic row was removed in that same
+transaction, and a follow-up query found zero test-RPC rows.
 The initial browser demo used test fixtures and the initial local backend used
 a dummy Supabase URL. The later isolated Railway/Supabase setup verified real
 Training Center save/reload, worker queue processing, and Railway redeployment

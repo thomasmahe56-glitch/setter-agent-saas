@@ -3,10 +3,13 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 import main
 
 
-def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypatch):
+@pytest.mark.parametrize("preparation_failure", [False, True])
+def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypatch, preparation_failure):
     start = datetime(2026, 9, 15, 14, 59, tzinfo=timezone.utc)
     anchor = start - timedelta(hours=6, minutes=59)
     inbound = anchor - timedelta(minutes=30)
@@ -55,7 +58,8 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
             if url.endswith("claim_due_follow_up_jobs"):
                 claimed = []
                 for row in jobs:
-                    if row["status"] == "scheduled" and datetime.fromisoformat(row["scheduled_at"]) <= clock["now"]:
+                    runnable = row.get("next_retry_at") or row["scheduled_at"]
+                    if row["status"] == "scheduled" and datetime.fromisoformat(runnable) <= clock["now"]:
                         row["status"] = "processing"
                         row["attempt_count"] = row.get("attempt_count", 0) + 1
                         claimed.append(dict(row))
@@ -99,7 +103,11 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
     monkeypatch.setattr(main, "patch_follow_up_job", patch_job)
     monkeypatch.setattr(main, "execute_follow_up_job", execute_at_virtual_time)
     monkeypatch.setattr(main, "enforce_ai_cost_cap", AsyncMock())
-    monkeypatch.setattr(main, "generate_follow_up_result", AsyncMock(return_value=SimpleNamespace(text="Virtual follow-up")))
+    generated = SimpleNamespace(text="Virtual follow-up")
+    monkeypatch.setattr(main, "generate_follow_up_result", AsyncMock(
+        side_effect=[RuntimeError("Temporary AI outage"), generated] if preparation_failure else None,
+        return_value=generated,
+    ))
     monkeypatch.setattr(main, "record_ai_usage_event", AsyncMock())
     monkeypatch.setattr(main, "send_channel_message", provider)
 
@@ -115,6 +123,13 @@ def test_cloud_worker_pipeline_plans_then_sends_once_with_virtual_time(monkeypat
 
         clock["now"] += timedelta(minutes=1)
         assert await main.process_due_follow_up_jobs() == 1
+        if preparation_failure:
+            assert jobs[0]["status"] == "scheduled"
+            assert jobs[0]["next_retry_at"] == (clock["now"] + timedelta(minutes=1)).isoformat()
+            provider.assert_not_awaited()
+            assert await main.process_due_follow_up_jobs() == 0
+            clock["now"] += timedelta(minutes=1)
+            assert await main.process_due_follow_up_jobs() == 1
         assert jobs[0]["status"] == "sent"
         assert conversation["history"][-1]["follow_up_job_id"] == jobs[0]["id"]
         assert conversation["history"][-1]["sent"] is True
