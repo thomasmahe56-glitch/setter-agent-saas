@@ -67,6 +67,9 @@ generation, and again by the Meta adapter at send time. If the planned instant a
 Meta window, the future job is labelled manual and keeps the channel reason;
 it becomes `manual_required` only at its configured time. The configured delay
 is never shortened to fit Meta's window.
+`META_INSTAGRAM_REPLY_WINDOW_HOURS` may make the automatic window stricter,
+but is capped at 24 hours in both server configuration and the Meta send gate.
+The human-agent exception is not used for automatic follow-ups.
 For follow-ups, the Meta adapter makes one HTTP attempt and requires a 2xx
 response with a nonempty `message_id` and, when present, the expected
 `recipient_id`. A 2xx response without this delivery receipt is ambiguous:

@@ -117,6 +117,19 @@ def test_meta_send_eligibility_accepts_recent_user_initiated_conversation():
     assert can_send_meta_message(connection=_connection(), conversation=_conversation()) == (True, "eligible")
 
 
+def test_meta_automatic_window_cannot_be_extended_by_a_server_setting(monkeypatch):
+    from config import load_config
+
+    monkeypatch.setenv("META_INSTAGRAM_REPLY_WINDOW_HOURS", "72")
+    assert load_config().meta_instagram_reply_window_hours == 24
+    now = datetime(2026, 9, 15, 12, tzinfo=timezone.utc)
+    conversation = _conversation(last_inbound_at=(now - timedelta(hours=25)).isoformat())
+    assert can_send_meta_message(
+        connection=_connection(), conversation=conversation,
+        now=now, reply_window_hours=72,
+    ) == (False, "outside_standard_messaging_window")
+
+
 @pytest.mark.parametrize("body,expected_status", [
     ('{"recipient_id":"meta-recipient","message_id":"message-1"}', 200),
     ('{"message_id":"message-1","recipient_id":"different-person"}', 503),

@@ -184,7 +184,10 @@ def can_send_meta_message(
     current = now or datetime.now(timezone.utc)
     if last_interaction.tzinfo is None:
         last_interaction = last_interaction.replace(tzinfo=timezone.utc)
-    if current - last_interaction > timedelta(hours=reply_window_hours):
+    # Automatic messages never use the human-agent exception. A misconfigured
+    # caller cannot enlarge the standard Instagram reply window past 24 hours.
+    standard_window_hours = min(24, max(1, reply_window_hours))
+    if current - last_interaction > timedelta(hours=standard_window_hours):
         return False, "outside_standard_messaging_window"
     return True, "eligible"
 
